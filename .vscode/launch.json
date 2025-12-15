@@ -1,0 +1,17 @@
+{
+  "configurations": [
+    {
+      "name": "Python: Current File",
+      "type": "python",
+      "request": "launch",
+      "program": "navsim/planning/script/run_dataset_caching.py",
+      "console": "integratedTerminal",
+      "args": [
+        "agent=diffusiondrive_agent",
+        "experiment_name=training_diffusiondrive_agent",
+        "train_test_split=navtrain"
+      ],
+      "justMyCode": true
+    },
+  ]
+}

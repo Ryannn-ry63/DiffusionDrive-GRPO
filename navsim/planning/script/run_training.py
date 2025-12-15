@@ -1,6 +1,7 @@
 from typing import Tuple
 from pathlib import Path
 import logging
+import os
 
 import hydra
 from hydra.utils import instantiate
@@ -13,6 +14,9 @@ from navsim.common.dataclasses import SceneFilter
 from navsim.common.dataloader import SceneLoader
 from navsim.planning.training.dataset import CacheOnlyDataset, Dataset
 from navsim.planning.training.agent_lightning_module import AgentLightningModule
+
+from pytorch_lightning.loggers import TensorBoardLogger  #
+from pytorch_lightning.strategies import DDPStrategy 
 
 logger = logging.getLogger(__name__)
 
@@ -128,15 +132,42 @@ def main(cfg: DictConfig) -> None:
     logger.info("Num validation samples: %d", len(val_data))
 
     logger.info("Building Trainer")
-    trainer = pl.Trainer(**cfg.trainer.params, callbacks=agent.get_training_callbacks())
+    trainer = pl.Trainer(
+                        **cfg.trainer.params,
+                        callbacks=agent.get_training_callbacks()
+                        )
+    
+    # 创建TensorBoard Logger - 添加详细日志
+    tensorboard_dir = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/tensorboard_logs"
+    logger.info(f"Creating TensorBoard directory: {tensorboard_dir}")
+    os.makedirs(tensorboard_dir, exist_ok=True)
+    
+    tensorboard_logger = TensorBoardLogger(
+        save_dir=tensorboard_dir,
+        name="diffusiondrive",
+        version=f"experiment_seed_{cfg.seed}",
+        default_hp_metric=False
+    )
+    
+    logger.info(f"=== TensorBoard配置确认 ===")
+    logger.info(f"Save dir: {tensorboard_logger.save_dir}")
+    logger.info(f"Name: {tensorboard_logger.name}") 
+    logger.info(f"Version: {tensorboard_logger.version}")
+    logger.info(f"Final log_dir: {tensorboard_logger.log_dir}")
+    logger.info(f"=== TensorBoard配置结束 ===")
 
+    # 确保日志目录存在
+    final_log_dir = tensorboard_logger.log_dir
+    os.makedirs(final_log_dir, exist_ok=True)
+    logger.info(f"确保日志目录存在: {final_log_dir} - {os.path.exists(final_log_dir)}")
+    
     logger.info("Starting Training")
     trainer.fit(
         model=lightning_module,
         train_dataloaders=train_dataloader,
         val_dataloaders=val_dataloader,
     )
-
+    
 
 if __name__ == "__main__":
     main()
