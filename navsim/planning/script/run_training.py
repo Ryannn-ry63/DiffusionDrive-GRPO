@@ -17,12 +17,37 @@ from navsim.planning.training.agent_lightning_module import AgentLightningModule
 
 from pytorch_lightning.loggers import TensorBoardLogger  #
 from pytorch_lightning.strategies import DDPStrategy 
+import torch
+import torch.nn.utils.rnn as rnn_utils
+from typing import List, Dict
 
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/training"
 CONFIG_NAME = "default_training"
 
+def custom_collate_fn(
+    batch: List[Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], str]]
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    features_list, targets_list, tokens_list = zip(*batch)
+
+    camera_feature = torch.stack([features['camera_feature'] for features in features_list], dim=0).cpu()
+    lidar_feature = torch.stack([features['lidar_feature'] for features in features_list], dim=0).cpu()
+    status_feature = torch.stack([features['status_feature'] for features in features_list], dim=0).cpu()
+
+    trajectory = torch.stack([targets['trajectory'] for targets in targets_list], dim=0).cpu()
+
+
+    features = {
+        'camera_feature': camera_feature,
+        'lidar_feature': lidar_feature,
+        'status_feature': status_feature,
+    }
+    targets = {
+        'trajectory': trajectory
+    }
+
+    return features, targets, tokens_list
 
 def build_datasets(cfg: DictConfig, agent: AbstractAgent) -> Tuple[Dataset, Dataset]:
     """
@@ -126,9 +151,9 @@ def main(cfg: DictConfig) -> None:
         train_data, val_data = build_datasets(cfg, agent)
 
     logger.info("Building Datasets")
-    train_dataloader = DataLoader(train_data, **cfg.dataloader.params, shuffle=True)
+    train_dataloader = DataLoader(train_data, collate_fn=custom_collate_fn,  **cfg.dataloader.params, shuffle=True)
     logger.info("Num training samples: %d", len(train_data))
-    val_dataloader = DataLoader(val_data, **cfg.dataloader.params, shuffle=False)
+    val_dataloader = DataLoader(val_data, collate_fn=custom_collate_fn, **cfg.dataloader.params, shuffle=False)
     logger.info("Num validation samples: %d", len(val_data))
 
     logger.info("Building Trainer")

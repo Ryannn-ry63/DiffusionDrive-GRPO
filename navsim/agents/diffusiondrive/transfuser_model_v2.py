@@ -117,9 +117,17 @@ class V2TransfuserModel(nn.Module):
         self.bev_proj = nn.Sequential(
             *linear_relu_ln(256, 1, 1,320),
         )
+        proposal_sampling = TrajectorySampling(time_horizon=4.0,interval_length=0.1)
+        self.simulator = PDMSimulator(proposal_sampling)
+        scorer_config = PDMScorerConfig(
+                    progress_weight=10.0,
+                    ttc_weight=5.0,
+                    comfortable_weight=2.0
+                    )
+        self.scorer = PDMScorer(proposal_sampling, scorer_config)
         
 
-    def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None) -> Dict[str, torch.Tensor]:
+    def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None, tokens_list=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
 
         camera_feature: torch.Tensor = features["camera_feature"]
@@ -156,7 +164,7 @@ class V2TransfuserModel(nn.Module):
 
         output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map}
 
-        trajectory = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],targets=targets,global_img=None)
+        trajectory = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],targets=targets,global_img=None,tokens_list=tokens_list)
         output.update(trajectory)
 
         agents = self._agent_head(agents_query)
@@ -462,6 +470,16 @@ class TrajectoryHead(nn.Module):
         self.ref_policy = None
 
         self.loss_computer = LossComputer(config)
+        metric_cache_path = Path("/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/metric_cache")
+        self.metric_cache_loader = MetricCacheLoader(metric_cache_path)
+        
+        proposal_sampling = TrajectorySampling(time_horizon=4.0, interval_length=0.1)
+        self.simulator = PDMSimulator(proposal_sampling)
+        scorer_config = PDMScorerConfig(
+            progress_weight=10.0,
+            ttc_weight=5.0,
+            comfortable_weight=2.0)
+        self.scorer = PDMScorer(proposal_sampling, scorer_config)
         
     def set_ref_policy(self, ref_policy):
         """设置参考策略（预训练权重的拷贝）"""
@@ -478,6 +496,7 @@ class TrajectoryHead(nn.Module):
         odo_info_fut_y = 2*(odo_info_fut_y + 20)/46 -1
         odo_info_fut_head = 2*(odo_info_fut_head + 2)/3.9 -1
         return torch.cat([odo_info_fut_x, odo_info_fut_y, odo_info_fut_head], dim=-1)
+    
     def denorm_odo(self, odo_info_fut):
         odo_info_fut_x = odo_info_fut[..., 0:1]
         odo_info_fut_y = odo_info_fut[..., 1:2]
@@ -487,18 +506,20 @@ class TrajectoryHead(nn.Module):
         odo_info_fut_y = (odo_info_fut_y + 1)/2 * 46 - 20
         odo_info_fut_head = (odo_info_fut_head + 1)/2 * 3.9 - 2
         return torch.cat([odo_info_fut_x, odo_info_fut_y, odo_info_fut_head], dim=-1)
-    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None) -> Dict[str, torch.Tensor]:
+    
+    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,tokens_list=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
         if self.training:
-            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img)
+            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img,tokens_list)
         else:
-            return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,global_img)
+            return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,global_img,tokens_list)
 
 
-    def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None) -> Dict[str, torch.Tensor]:
+    def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,tokens_list=None) -> Dict[str, torch.Tensor]:
+        
         bs = ego_query.shape[0]
-        print(f"DEBUG: batch_size (bs) = {bs}")
         device = ego_query.device
+        
         # 1. add truncated noise to the plan anchor
         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
         bs, num_mode, ts, d = plan_anchor.shape
@@ -507,19 +528,8 @@ class TrajectoryHead(nn.Module):
         dist = dist.mean(dim=-1)
         mode_idx = torch.argmin(dist, dim=-1)
         noisy_traj_points = plan_anchor
-        # odo_info_fut = self.norm_odo(plan_anchor)
-        timesteps = torch.randint(
-             0, 50,
-             (bs,), device=device
-        )
-        # noise = torch.randn(odo_info_fut.shape, device=device)
-        # noisy_traj_points = self.diffusion_scheduler.add_noise(
-        #     original_samples=odo_info_fut,
-        #     noise=noise,
-        #     timesteps=timesteps,
-        # ).float()
-        # noisy_traj_points = torch.clamp(noisy_traj_points, min=-1, max=1)
-        # noisy_traj_points = self.denorm_odo(noisy_traj_points)
+
+        timesteps = torch.randint(0, 50, (bs,), device=device)
 
         ego_fut_mode = noisy_traj_points.shape[1]
         # 2. proj noisy_traj_points to the query
@@ -531,99 +541,72 @@ class TrajectoryHead(nn.Module):
         time_embed = self.time_mlp(timesteps)
         time_embed = time_embed.view(bs,1,-1)
 
-
         # 4. begin the stacked decoder
         poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
-        ref_poses_reg_list, ref_poses_cls_list = self.ref_policy(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
         
-        # reward func 计算20条轨迹的reward
+        # 获取最终预测结果
         final_poses_reg = poses_reg_list[-1]  # [bs, num_mode, 8, 3]
-        final_poses_cls = poses_cls_list[-1]  # [batch_size, num_modes]
-        final_ref_poses_cls = ref_poses_cls_list[-1]  # [batch_size, num_modes]
+        final_poses_cls = poses_cls_list[-1]  # [bs, num_modes] 
         num_modes = final_poses_cls.shape[1]  # 比如64
-    
-        # 计算PDM奖励
-        metric_cache_path = Path("/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/metric_cache")
-        self.metric_cache_loader = MetricCacheLoader(metric_cache_path)
-        available_tokens = list(set(self.metric_cache_loader.tokens))
-        if len(available_tokens) < bs:
-            print(f"Warning: Only {len(available_tokens)} tokens available, but batch size is {bs}")
-            # 重复使用或创建虚拟tokens
-            import random
-            selected_tokens = random.choices(available_tokens, k=bs)
-        else:
-            # 随机选择不重复的tokens
-            import random
-            selected_tokens = random.sample(available_tokens, bs)
         
-        print(f"Selected tokens: {selected_tokens[:3]}...")
+        # ========== 计算 PDM 奖励（参考 recogdrive_diffusion_planner.py） ==========
+        rewards = None
+        final_ref_poses_cls = None
         
-        # 加载这些tokens对应的metric cache
-        metric_cache_dict = {}
-        for token in selected_tokens:
-            try:
-                path = self.metric_cache_loader.metric_cache_paths[token]
-                with lzma.open(path, 'rb') as f:
-                    metric_cache_dict[token] = pickle.load(f)
-            except Exception as e:
-                print(f"Warning: Failed to load metric cache for token {token}: {e}")
-                metric_cache_dict[token] = None
-        rewards = self.compute_rewards(final_poses_reg, selected_tokens, metric_cache_dict)
-        
-        print(f"✓ PDM奖励计算完成: shape={rewards.shape}, mean={rewards.mean().item():.4f}")
-       
-        #reward
-        # 计算均值标准差
-        mean_r = rewards.mean(dim=1, keepdim=True)  # [64, 1]
-        std_r = rewards.std(dim=1, keepdim=True) + 1e-8  # [64, 1]
-
-        # 计算优势
-        advantages = ((rewards - mean_r) / std_r)  # [64, 64]
-        # 扁平化
-        advantages = advantages.detach()  # [4096]
-        # 裁剪
-        clip_advantage_lower_quantile = 0.0  
-        clip_advantage_upper_quantile = 1.0  
-
-        adv_min = torch.quantile(advantages, clip_advantage_lower_quantile)
-        adv_max = torch.quantile(advantages, clip_advantage_upper_quantile)
-        advantages = advantages.clamp(min=adv_min, max=adv_max)
-        
-        log_ratios = self.compute_logprob_ratios(
-            current_poses_cls=final_poses_cls,
-            ref_poses_cls=final_ref_poses_cls,
-            num_modes=num_modes
-        )
-        # 6. 计算策略损失
-        # policy_loss = -E[log_ratio * advantage] 对所有轨迹取平均
-        policy_loss = -torch.mean(log_ratios * advantages)
-        print(f"policy_loss = {policy_loss.item():.6f}")
-        
+        if tokens_list is not None and self.ref_policy is not None:
+            # 使用参考策略（冻结的预训练权重）
+            ref_poses_reg_list, ref_poses_cls_list = self.ref_policy(
+                traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, 
+                agents_query, ego_query, time_embed, status_encoding, global_img
+            )
+            final_ref_poses_cls = ref_poses_cls_list[-1]  # [bs, num_modes]
+            
+            # 1. 加载 metric cache（只加载 unique tokens，避免重复 IO）
+            unique_tokens = set(tokens_list)
+            metric_cache = {}
+            for token in unique_tokens:
+                try:
+                    path = self.metric_cache_loader.metric_cache_paths.get(token)
+                    if path is None:
+                        print(f"警告: token {token} 不在 metric_cache_paths 中")
+                        metric_cache[token] = None
+                        continue
+                    with lzma.open(path, 'rb') as f:
+                        metric_cache[token] = pickle.load(f)
+                except Exception as e:
+                    print(f"加载 token {token} 的 metric cache 失败: {e}")
+                    metric_cache[token] = None
+            
+            # 2. 扩展 tokens 列表（每个 token 重复 num_modes 次）
+            tokens_expanded = [tok for tok in tokens_list for _ in range(num_modes)]
+            
+            # 3. 计算 PDM 奖励
+            rewards = self.reward_fn(final_poses_reg, tokens_expanded, metric_cache)
+            # rewards 形状: [bs, num_modes]
+            print(f"✓ PDM奖励计算完成: shape={rewards.shape}, mean={rewards.mean().item():.4f}")
+        # ========== 计算轨迹损失 ==========
         trajectory_loss_dict = {}
         ret_traj_loss = 0
-        for idx, (poses_reg, poses_cls) in enumerate(zip(poses_reg_list, poses_cls_list)):
-            trajectory_loss = self.loss_computer(poses_reg, poses_cls, targets, plan_anchor,mode_idx)
-            trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
-            ret_traj_loss += trajectory_loss
+        # for idx, (poses_reg, poses_cls) in enumerate(zip(poses_reg_list, poses_cls_list)):
+        #     trajectory_loss = self.loss_computer(poses_reg, poses_cls, targets, plan_anchor, mode_idx)
+        #     trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
+        #     ret_traj_loss += trajectory_loss
             
-        # 使用参考decoder（冻结，原始预训练）
-        if self.ref_policy is not None:
-            ref_poses_reg_list, ref_poses_cls_list = self.ref_policy(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
-            # 这些将用于GRPO损失计算
-            ref_output = {
-                'poses_reg': ref_poses_reg_list[-1],
-                'poses_cls': ref_poses_cls_list[-1]
-            }
-        else:
-            ref_output = None
-            
-        #mode_idx = poses_cls_list[-1].argmax(dim=-1)
-        #mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
-        #best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
+        # 选择最佳轨迹
         best_reg = poses_reg_list[-1][torch.arange(bs), mode_idx]  # [bs, 8, 3]
-        return {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict,"policy_loss": policy_loss}
+        
+        return {
+            "trajectory": best_reg,
+            "trajectory_loss": ret_traj_loss,
+            "trajectory_loss_dict": trajectory_loss_dict,
+            "final_poses_cls": final_poses_cls,
+            "final_ref_poses_cls": final_ref_poses_cls,
+            "rewards": rewards,
+            "num_modes": num_modes,
+            "mode_idx": mode_idx
+        }
 
-    def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img) -> Dict[str, torch.Tensor]:
+    def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img,tokens_list=None) -> Dict[str, torch.Tensor]:
         step_num = 2
         bs = ego_query.shape[0]
         device = ego_query.device
@@ -675,86 +658,72 @@ class TrajectoryHead(nn.Module):
                 timestep=k,
                 sample=img
             ).prev_sample
+            
+        # 获取最终预测
+        final_poses_reg = poses_reg  # 已经是最后一个了
+        final_poses_cls = poses_cls
+        num_modes = final_poses_cls.shape[1]
+        
         mode_idx = poses_cls.argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
-        return {"trajectory": best_reg}
+        
+        output_dict = {
+        "trajectory": best_reg,                    # 主输出（必需）
+        "final_poses_cls": final_poses_cls,        # GRPO损失必需
+        "final_ref_poses_cls": final_poses_cls,    # validation时用相同的
+        "rewards": None,                           # validation时不需要奖励
+        "num_modes": num_modes                     # 
+        }
+        #print(f"[TEST] 返回 - rewards: {output_dict['rewards']}, 其他keys: {list(output_dict.keys())}")
+        return output_dict
 
-
-    def compute_rewards(
-        self, 
-        trajectories: torch.Tensor, 
-        selected_tokens: List[str],
-        metric_cache_dict: Dict[str, Any]
-        ) -> torch.Tensor:
+    def reward_fn(
+        self,
+        trajectories: torch.Tensor,
+        tokens_list: List[str],
+        cache_dict: Dict[str, Any],
+    ) -> torch.Tensor:
         """
-        计算PDM奖励- 使用外部传入的tokens和metric cache
+        计算 PDM 奖励 - 参考 recogdrive_diffusion_planner.py 的实现
         
         Args:
-            trajectories: [batch_size, num_mode, 8, 3]
-            selected_tokens: 每个batch样本对应的token,长度为batch_size
-            metric_cache_dict: 已加载的metric cache字典 {token: metric_cache}
+            trajectories: [batch_size, num_mode, 8, 3] 预测的轨迹
+            tokens_list: 扩展后的 token 列表，长度为 batch_size * num_mode
+            cache_dict: 已加载的 metric cache 字典 {token: metric_cache}
             
         Returns:
             奖励张量，形状为 [batch_size, num_mode]
         """
-        proposal_sampling = TrajectorySampling(time_horizon=4.0,interval_length=0.1)
-        self.simulator = PDMSimulator(proposal_sampling)
-        scorer_config = PDMScorerConfig(
-        progress_weight=10.0,
-        ttc_weight=5.0,
-        comfortable_weight=2.0)
-        
-        self.scorer = PDMScorer(proposal_sampling, scorer_config)
         batch_size, num_mode = trajectories.shape[:2]
         
-        # 1. 展平轨迹以便批量处理
-        trajectories_flat = trajectories.reshape(-1, *trajectories.shape[2:])  # [batch_size * num_mode, 8, 3]
+        # 展平轨迹以便批量处理
+        trajectories_flat = trajectories.reshape(-1, 8, 3)  # [batch_size * num_mode, 8, 3]
+        pred_np = trajectories_flat.detach().cpu().numpy()
         
-        # 2. 扩展tokens列表（每个轨迹模式都要有对应的token）
-        tokens_expanded = []
-        for token in selected_tokens:
-            tokens_expanded.extend([token] * num_mode)  # 每个token重复num_mode次
-        
-        # 3. 计算每条轨迹的奖励
-        rewards_list = []
-        
-        for i in range(len(trajectories_flat)):
-            token = tokens_expanded[i]
+        # 计算每条轨迹的奖励
+        rewards = []
+        for i, token in enumerate(tokens_list):
+            metric_cache = cache_dict.get(token)
             
-            # 检查metric cache是否有效
-            if token not in metric_cache_dict or metric_cache_dict[token] is None:
-                print(f"Warning: No valid metric cache for token {token}, using default reward 0.5")
-                rewards_list.append(0.5)
+            # 如果 metric cache 不存在，使用默认奖励
+            if metric_cache is None:
+                rewards.append(0.5)
                 continue
             
-            try:
-                # 将轨迹转换为numpy并创建Trajectory对象
-                trajectory_np = trajectories_flat[i].detach().cpu().numpy()
-                trajectory = Trajectory(trajectory_np)
-                
-                # 获取该token对应的metric cache
-                metric_cache = metric_cache_dict[token]
-                
-                # 计算PDM分数
-                pdm_result = pdm_score(
-                    metric_cache=metric_cache,
-                    model_trajectory=trajectory,
-                    future_sampling=self.simulator.proposal_sampling,
-                    simulator=self.simulator,
-                    scorer=self.scorer,
-                )
-                
-                # 获取总分
-                score = asdict(pdm_result)["score"]
-                rewards_list.append(score)
-                
-            except Exception as e:
-                print(f"Warning: PDM scoring failed for trajectory {i}, token {token}: {e}")
-                rewards_list.append(0.5)  # 失败时的默认奖励
+            # 创建 Trajectory 对象并计算 PDM 分数
+            trajectory = Trajectory(pred_np[i])
+            pdm_result = pdm_score(
+                metric_cache=metric_cache,
+                model_trajectory=trajectory,
+                future_sampling=self.simulator.proposal_sampling,
+                simulator=self.simulator,
+                scorer=self.scorer,
+            )
+            rewards.append(asdict(pdm_result)["score"])
         
-        # 4. 恢复原始形状
-        rewards_tensor = torch.tensor(rewards_list, device=trajectories.device)
+        # 转换为张量并恢复原始形状
+        rewards_tensor = torch.tensor(rewards, device=trajectories.device, dtype=trajectories.dtype).detach()
         return rewards_tensor.view(batch_size, num_mode)
     
     def compute_logprob_ratios(

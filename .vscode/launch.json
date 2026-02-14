@@ -1,17 +1,74 @@
 {
   "configurations": [
     {
-      "name": "Python: Current File",
-      "type": "python",
+      "name": "Metric Caching",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "navsim/planning/script/run_metric_caching.py",
+      "console": "integratedTerminal",
+      "args": [
+        "train_test_split=navtest",
+        "cache.cache_path=/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/metric_cache",
+        "cache.force_feature_computation=false"
+      ],
+      "env": {
+        "NUPLAN_MAP_VERSION": "nuplan-maps-v1.0",
+        "NUPLAN_MAPS_ROOT": "/inspire/hdd/global_public/public_datas/NAVSIM/maps",
+        "NAVSIM_EXP_ROOT": "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp",
+        "OPENSCENE_DATA_ROOT": "/inspire/hdd/global_user/wangcaojun-240208020180/nry/dataset",
+        "PYTHONPATH": "/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive"
+      },
+      "justMyCode": false
+    },
+    {
+      "name": "Dataset Caching",
+      "type": "debugpy",
       "request": "launch",
       "program": "navsim/planning/script/run_dataset_caching.py",
       "console": "integratedTerminal",
       "args": [
         "agent=diffusiondrive_agent",
         "experiment_name=training_diffusiondrive_agent",
-        "train_test_split=navtrain"
+        "train_test_split=navtest",
+        "cache_path=/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_cache",
+        "force_cache_computation=false"
       ],
-      "justMyCode": true
+      "env": {
+        "NUPLAN_MAP_VERSION": "nuplan-maps-v1.0",
+        "NUPLAN_MAPS_ROOT": "/inspire/hdd/global_public/public_datas/NAVSIM/maps",
+        "NAVSIM_EXP_ROOT": "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp",
+        "OPENSCENE_DATA_ROOT": "/inspire/hdd/global_user/wangcaojun-240208020180/nry/dataset",
+        "PYTHONPATH": "/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive"
+      },
+      "justMyCode": false
     },
+    {
+      "name": "Training",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "navsim/planning/script/run_training.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "agent=diffusiondrive_agent",
+        "experiment_name=training_diffusiondrive_agent",
+        "train_test_split=navtest",
+        "split=trainval",
+        "trainer.params.max_epochs=100",
+        "cache_path=/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_cache/",
+        "use_cache_without_dataset=True",
+        "force_cache_computation=False"
+      ],
+      "env": {
+        "NUPLAN_MAP_VERSION": "nuplan-maps-v1.0",
+        "NUPLAN_MAPS_ROOT": "/inspire/hdd/global_public/public_datas/NAVSIM/maps",
+        "NAVSIM_DEVKIT_ROOT": "/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/navsim",
+        "NAVSIM_EXP_ROOT": "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp",
+        "OPENSCENE_DATA_ROOT": "/inspire/hdd/global_user/wangcaojun-240208020180/nry/dataset",
+        "CKPT": "/inspire/hdd/global_user/wangcaojun-240208020180/nry/diffusiondrive_nusc_stage2.pth",
+        "PYTHONPATH": "/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive",
+        "PYTHONWARNINGS": "ignore::UserWarning"
+      }
+    }
   ]
 }

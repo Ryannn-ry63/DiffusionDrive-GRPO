@@ -24,8 +24,8 @@ class AgentLightningModule(pl.LightningModule):
         :param logging_prefix: prefix where to log step
         :return: scalar loss
         """
-        features, targets = batch
-        prediction = self.agent.forward(features, targets)
+        features, targets, tokens_list = batch
+        prediction = self.agent.forward(features,targets,tokens_list)
         # loss = self.agent.compute_loss(features, targets, prediction)
         # self.log(f"{logging_prefix}/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         # return loss
