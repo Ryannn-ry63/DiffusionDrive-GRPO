@@ -17,43 +17,23 @@ def transfuser_loss(
     targets: Dict[str, torch.Tensor], predictions: Dict[str, torch.Tensor], config: TransfuserConfig
 ):
     """
-    Helper function calculating complete loss of Transfuser
+    Helper function calculating complete loss of Transfuser with GRPO
     :param targets: dictionary of name tensor pairings
     :param predictions: dictionary of name tensor pairings
     :param config: global Transfuser config
     :return: combined loss value
     """
-    # # import ipdb; ipdb.set_trace()
-    # if "trajectory_loss" in predictions:
-    #     trajectory_loss = predictions["trajectory_loss"]
-    # else:
-    #     trajectory_loss = F.l1_loss(predictions["trajectory"], targets["trajectory"])
-    # agent_class_loss, agent_box_loss = _agent_loss(targets, predictions, config)
-    # bev_semantic_loss = F.cross_entropy(
-    #     predictions["bev_semantic_map"], targets["bev_semantic_map"].long()
-    # )
-    # if 'diffusion_loss' in predictions:
-    #     diffusion_loss = predictions['diffusion_loss']
-    # else:
-    #     diffusion_loss = 0
     
-    # if 'policy_loss' in predictions:
-    #     policy_loss = predictions['policy_loss']
-    # else:
-    #     policy_loss = 0
-    
-    # ===== 判断 =====
-    #if "rewards" not in predictions or predictions["rewards"] is None:
-    #    return {"loss": torch.tensor(0.0), "grpo_loss": torch.tensor(0.0)}
-    
+    # Validation 阶段：没有 rewards，返回零损失
     if "rewards" not in predictions or predictions["rewards"] is None:
-        # 获取设备（validation时final_poses_cls一定存在）
         device = predictions["final_poses_cls"].device
         return {
-            "loss": torch.tensor(0.0, device=device),      #
-            "grpo_loss": torch.tensor(0.0, device=device)  #
+            "loss": torch.tensor(0.0, device=device),
+            "grpo_loss": torch.tensor(0.0, device=device),
+            "kl_loss": torch.tensor(0.0, device=device)
         }
-        
+    
+    # Training 阶段：计算 GRPO loss
     grpo_loss = compute_grpo_loss3(
         current_poses_cls=predictions["final_poses_cls"],
         ref_poses_cls=predictions["final_ref_poses_cls"],
@@ -64,18 +44,19 @@ def transfuser_loss(
         clip_ratio=0.2
     )
     
-    loss = (
-         config.diff_loss_weight * grpo_loss
-    )
+    # KL divergence 正则化（如果可用）
+    kl_loss = predictions.get("kl_div", torch.tensor(0.0, device=grpo_loss.device))
+    kl_weight = getattr(config, 'kl_loss_weight', 0.01)  # 默认 KL 权重 0.01
+    
+    # 总损失 = GRPO loss + KL loss
+    total_loss = config.diff_loss_weight * grpo_loss + kl_weight * kl_loss
+    
     loss_dict = {
-        'loss': loss,
-        #'trajectory_loss': config.trajectory_weight*trajectory_loss,
-        'grpo_loss': config.diff_loss_weight*grpo_loss,
+        'loss': total_loss,
+        'grpo_loss': config.diff_loss_weight * grpo_loss,
+        'kl_loss': kl_weight * kl_loss,
     }
-    if "trajectory_loss_dict" in predictions:
-        trajectory_loss_dict = predictions["trajectory_loss_dict"]
-        loss_dict.update(trajectory_loss_dict)
-    # import ipdb; ipdb.set_trace()
+    
     return loss_dict
 
 

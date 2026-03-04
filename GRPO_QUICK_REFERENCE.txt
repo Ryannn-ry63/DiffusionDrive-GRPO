@@ -1,0 +1,161 @@
+┌─────────────────────────────────────────────────────────────────┐
+│                    GRPO 训练改造快速参考                         │
+└─────────────────────────────────────────────────────────────────┘
+
+📋 核心改动（5个文件）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1️⃣  transfuser_agent.py (L57-70)
+   ✓ 冻结除 diff_decoder 外所有参数
+   ✓ Deepcopy diff_decoder 作为 ref_policy
+   
+   self._transfuser_model.requires_grad_(False)
+   self._transfuser_model._trajectory_head.diff_decoder.requires_grad_(True)
+   ref_policy = copy.deepcopy(...diff_decoder)
+   ref_policy.requires_grad_(False).eval()
+
+2️⃣  transfuser_model_v2.py - TrajectoryHead.forward_train()
+   ✓ 当前策略推理 → final_poses_cls
+   ✓ 参考策略推理 → final_ref_poses_cls (frozen)
+   ✓ PDM 奖励计算 → rewards
+   ✓ KL 散度计算 → kl_div
+   
+   # Current
+   poses_reg_list, poses_cls_list = self.diff_decoder(...)
+   
+   # Reference (frozen)
+   with torch.no_grad():
+       ref_poses_reg_list, ref_poses_cls_list = self.ref_policy(...)
+   
+   # Reward
+   rewards = self.reward_fn(final_poses_reg, tokens_expanded, metric_cache)
+   
+   # KL
+   kl_div = F.kl_div(F.log_softmax(...), F.softmax(...), ...)
+
+3️⃣  transfuser_loss.py - compute_grpo_loss3()
+   ✓ 组内优势: advantages = (rewards - mean) / std
+   ✓ Log ratio: log(π_θ) - log(π_ref)
+   ✓ GRPO loss: -mean(log_ratios * advantages)
+   
+   mean_r = rewards.mean(dim=1, keepdim=True)
+   std_r = rewards.std(dim=1, keepdim=True)
+   advantages = (rewards - mean_r) / (std_r + 1e-8)
+   
+   current_probs = F.softmax(current_poses_cls, dim=-1)
+   ref_probs = F.softmax(ref_poses_cls, dim=-1)
+   log_ratios = torch.log(current_probs) - torch.log(ref_probs)
+   
+   grpo_loss = -torch.mean(log_ratios * advantages)
+
+4️⃣  transfuser_loss.py - transfuser_loss()
+   ✓ GRPO loss + KL loss
+   ✓ Validation 时返回零损失
+   
+   if rewards is None:  # Validation
+       return {"loss": 0.0, "grpo_loss": 0.0, "kl_loss": 0.0}
+   
+   total_loss = diff_loss_weight * grpo_loss + kl_weight * kl_div
+
+5️⃣  transfuser_config.py (L88)
+   ✓ 新增 kl_loss_weight: float = 0.01
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔑 关键概念
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Trainable Params    : 只有 diff_decoder (DiT block)
+Ref Policy          : 预训练 diff_decoder 的冻结拷贝
+Rewards             : PDM score (progress + TTC + comfort)
+Advantage           : 组内归一化 (rewards - mean) / std
+Log Ratio           : log π_current - log π_ref
+GRPO Loss           : -E[log_ratio × advantage]
+KL Regularization   : KL(π_current || π_ref)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 数据流
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Dataset
+  ↓ (features, targets, tokens_list)
+AgentLightningModule
+  ↓ agent.forward(features, targets, tokens_list)
+V2TransfuserModel
+  ↓ trajectory_head.forward_train(...)
+TrajectoryHead
+  ├─ diff_decoder → poses_cls (current)
+  ├─ ref_policy → ref_poses_cls (frozen)
+  └─ reward_fn → rewards (PDM)
+  ↓
+transfuser_loss
+  ├─ compute_grpo_loss3 → grpo_loss
+  └─ KL divergence → kl_loss
+  ↓
+Total Loss = 20.0 * grpo_loss + 0.01 * kl_loss
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🧪 测试命令
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+python test_grpo_training.py
+
+检查项:
+  ✓ 参数冻结 (backbone=0 trainable, diff_decoder>0)
+  ✓ ref_policy 设置 (frozen + eval)
+  ✓ 前向传播 (返回所有必需字段)
+  ✓ 损失计算 (GRPO + KL)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚙️  关键超参数
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+diff_loss_weight    : 20.0   (GRPO 损失权重)
+kl_loss_weight      : 0.01   (KL 正则化权重)
+num_modes           : 64     (轨迹候选数量)
+num_poses           : 8      (每条轨迹的时间步)
+learning_rate       : 1e-4   (建议初始值)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 训练监控
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+train/grpo_loss     : 策略梯度损失 (应逐渐下降)
+train/kl_loss       : KL 散度 (应保持较小 < 0.1)
+train/loss          : 总损失
+PDM rewards mean    : 平均奖励 (应逐渐提升)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  常见问题
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: rewards = None
+A: 检查 tokens_list 传递，metric_cache 路径
+
+Q: GRPO loss = NaN
+A: 检查 PDM rewards 有效性，使用 compute_grpo_loss3
+
+Q: OOM (内存不足)
+A: 减少 batch_size，检查 torch.no_grad() 使用
+
+Q: Validation 报错
+A: 确保 forward_test 返回 final_poses_cls (即使 rewards=None)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 完整文档
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+GRPO_TRAINING_GUIDE.md          - 完整训练指南
+GRPO_IMPLEMENTATION_SUMMARY.md  - 实现总结
+test_grpo_training.py            - 测试脚本
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ 改造状态: 完成
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

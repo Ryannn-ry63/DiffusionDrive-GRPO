@@ -541,7 +541,7 @@ class TrajectoryHead(nn.Module):
         time_embed = self.time_mlp(timesteps)
         time_embed = time_embed.view(bs,1,-1)
 
-        # 4. begin the stacked decoder
+        # 4. begin the stacked decoder - current policy
         poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
         
         # 获取最终预测结果
@@ -549,17 +549,33 @@ class TrajectoryHead(nn.Module):
         final_poses_cls = poses_cls_list[-1]  # [bs, num_modes] 
         num_modes = final_poses_cls.shape[1]  # 比如64
         
-        # ========== 计算 PDM 奖励（参考 recogdrive_diffusion_planner.py） ==========
+        # ========== 计算 PDM 奖励和 ref policy ==========
         rewards = None
         final_ref_poses_cls = None
+        kl_div = None
         
         if tokens_list is not None and self.ref_policy is not None:
-            # 使用参考策略（冻结的预训练权重）
-            ref_poses_reg_list, ref_poses_cls_list = self.ref_policy(
-                traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, 
-                agents_query, ego_query, time_embed, status_encoding, global_img
+            # 使用参考策略（冻结的预训练权重）推理
+            with torch.no_grad():
+                ref_poses_reg_list, ref_poses_cls_list = self.ref_policy(
+                    traj_feature.detach(), 
+                    noisy_traj_points, 
+                    bev_feature.detach(), 
+                    bev_spatial_shape, 
+                    agents_query.detach(), 
+                    ego_query.detach(), 
+                    time_embed.detach(), 
+                    status_encoding.detach(), 
+                    global_img.detach() if global_img is not None else None
+                )
+                final_ref_poses_cls = ref_poses_cls_list[-1]  # [bs, num_modes]
+            
+            # 计算 KL 散度（正则化项）
+            kl_div = F.kl_div(
+                F.log_softmax(final_poses_cls, dim=-1),
+                F.softmax(final_ref_poses_cls, dim=-1),
+                reduction='batchmean'
             )
-            final_ref_poses_cls = ref_poses_cls_list[-1]  # [bs, num_modes]
             
             # 1. 加载 metric cache（只加载 unique tokens，避免重复 IO）
             unique_tokens = set(tokens_list)
@@ -583,25 +599,16 @@ class TrajectoryHead(nn.Module):
             # 3. 计算 PDM 奖励
             rewards = self.reward_fn(final_poses_reg, tokens_expanded, metric_cache)
             # rewards 形状: [bs, num_modes]
-            print(f"✓ PDM奖励计算完成: shape={rewards.shape}, mean={rewards.mean().item():.4f}")
-        # ========== 计算轨迹损失 ==========
-        trajectory_loss_dict = {}
-        ret_traj_loss = 0
-        # for idx, (poses_reg, poses_cls) in enumerate(zip(poses_reg_list, poses_cls_list)):
-        #     trajectory_loss = self.loss_computer(poses_reg, poses_cls, targets, plan_anchor, mode_idx)
-        #     trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
-        #     ret_traj_loss += trajectory_loss
             
         # 选择最佳轨迹
         best_reg = poses_reg_list[-1][torch.arange(bs), mode_idx]  # [bs, 8, 3]
         
         return {
             "trajectory": best_reg,
-            "trajectory_loss": ret_traj_loss,
-            "trajectory_loss_dict": trajectory_loss_dict,
             "final_poses_cls": final_poses_cls,
             "final_ref_poses_cls": final_ref_poses_cls,
             "rewards": rewards,
+            "kl_div": kl_div,
             "num_modes": num_modes,
             "mode_idx": mode_idx
         }
