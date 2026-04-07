@@ -157,11 +157,11 @@ def test_loss_computation():
     # 模拟预测结果（validation 模式 - 无 rewards）
     predictions_val = {
         'trajectory': torch.randn(2, 8, 3),
-        'final_poses_cls': torch.randn(2, 64),
-        'final_ref_poses_cls': torch.randn(2, 64),
+        'final_poses_cls': torch.randn(2, 20),
+        'final_ref_poses_cls': torch.randn(2, 20),
         'rewards': None,
         'kl_div': None,
-        'num_modes': 64
+        'num_modes': 20
     }
     
     targets = {
