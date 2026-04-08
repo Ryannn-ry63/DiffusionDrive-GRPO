@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Union
 
 import copy
@@ -13,8 +14,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.schedulers import DDIMScheduler
 from torch.nn import TransformerDecoder, TransformerDecoderLayer
-from tqdm import tqdm
-
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 from navsim.agents.diffusiondrive.transfuser_backbone import TransfuserBackbone
 from navsim.agents.diffusiondrive.transfuser_features import BoundingBox2DIndex
@@ -27,7 +26,7 @@ from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
 
 from navsim.common.dataclasses import Trajectory
 from navsim.common.dataloader import MetricCacheLoader
-from navsim.evaluate.pdm_score import pdm_score
+from navsim.evaluate.pdm_score import pdm_score, transform_trajectory, get_trajectory_as_array
 from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
 from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer, PDMScorerConfig
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
@@ -470,31 +469,44 @@ class TrajectoryHead(nn.Module):
         )
         self.scorer = PDMScorer(proposal_sampling, scorer_config)
 
-        ##新修改：在初始化时一次性将所有缓存加载进内存，计算奖励时，优先从内存字典读取（_compute_rewards_from_memory）
-        ##加入grpoloss后运行速度慢猜测：在 forward_train 每次迭代中，都会根据 tokens_list 重新遍历并使用 lzma.open 从硬盘读取解压 .pkl 文件
-        # Load all cache into memory at init to avoid per-step disk IO
-        self._memory_metric_cache: Optional[Dict[str, Any]] = None
+        # Lazy-load metric caches on first use (no long startup). Optionally LRU-evict when metric_cache_lru_max > 0.
+        self.metric_cache_loader: Optional[MetricCacheLoader] = None
+        self._metric_cache_lru_max: int = int(getattr(config, "metric_cache_lru_max", 0))
+        self._lazy_metric_cache: Optional[Union[Dict[str, Any], OrderedDict]] = None
         metric_cache_dir = getattr(config, "metric_cache_path", "")
         if metric_cache_dir and Path(metric_cache_dir).exists():
             self.metric_cache_loader = MetricCacheLoader(Path(metric_cache_dir))
-            self._load_all_metric_caches_to_memory()
+            self._lazy_metric_cache = OrderedDict() if self._metric_cache_lru_max > 0 else {}
+            n_paths = len(self.metric_cache_loader.metric_cache_paths)
+            print(
+                f"Metric cache: lazy load enabled ({n_paths} tokens on disk; "
+                f"loads on demand during training, no startup preload)."
+                + (f" LRU max entries: {self._metric_cache_lru_max}." if self._metric_cache_lru_max > 0 else "")
+            )
 
-    def _load_all_metric_caches_to_memory(self):
-        """Load all metric caches into memory at init to avoid per-step lzma disk IO."""
-        print("Loading all metric caches into memory (one-time cost) ...")
-        self._memory_metric_cache = {}
-        loaded, failed = 0, 0
-        for token, path_str in tqdm(
-            self.metric_cache_loader.metric_cache_paths.items(),
-            desc="Loading metric caches",
-        ):
-            try:
-                with lzma.open(path_str, "rb") as f:
-                    self._memory_metric_cache[token] = pickle.load(f)
-                loaded += 1
-            except Exception:
-                failed += 1
-        print(f"Loaded {loaded} metric caches into memory ({failed} failed).")
+    def _get_metric_cache_lazy(self, token: str) -> Any:
+        """Return metric cache for token, loading from disk on first miss."""
+        assert self._lazy_metric_cache is not None and self.metric_cache_loader is not None
+        store = self._lazy_metric_cache
+        if token in store:
+            if isinstance(store, OrderedDict):
+                store.move_to_end(token)
+            return store[token]
+        path = self.metric_cache_loader.metric_cache_paths.get(token)
+        if path is None:
+            return None
+        try:
+            with lzma.open(path, "rb") as f:
+                obj = pickle.load(f)
+        except Exception:
+            return None
+        store[token] = obj
+        if isinstance(store, OrderedDict):
+            store.move_to_end(token)
+            if self._metric_cache_lru_max > 0:
+                while len(store) > self._metric_cache_lru_max:
+                    store.popitem(last=False)
+        return obj
 
     def set_ref_policy(self, ref_policy):
         self.ref_policy = ref_policy
@@ -586,11 +598,11 @@ class TrajectoryHead(nn.Module):
                 reduction="batchmean",
             )
 
-            if self._memory_metric_cache is not None:
-                rewards = self._compute_rewards_from_memory(
+            if self._lazy_metric_cache is not None:
+                rewards = self._compute_rewards_from_lazy_cache(
                     final_poses_reg, tokens_list, num_modes,
                 )
-            else:
+            elif self.metric_cache_loader is not None:
                 rewards = self._compute_rewards_from_disk(
                     final_poses_reg, tokens_list, num_modes,
                 )
@@ -679,17 +691,15 @@ class TrajectoryHead(nn.Module):
         #print(f"[TEST] 返回 - rewards: {output_dict['rewards']}, 其他keys: {list(output_dict.keys())}")
         return output_dict
 
-    ##新修改：提升效率做的修改尝试：
-    ##直接从初始化时就准备好的 self._memory_metric_cache（全量内存字典）中提取数据
-    def _compute_rewards_from_memory(
+    def _compute_rewards_from_lazy_cache(
         self, trajectories: torch.Tensor, tokens_list, num_modes: int,
     ) -> torch.Tensor:
-        """Compute rewards using in-memory metric caches (no disk IO per step)."""
+        """Compute rewards using lazily loaded metric caches (first hit reads disk, then cached)."""
         cache_dict = {}
         for token in set(tokens_list):
-            cache_dict[token] = self._memory_metric_cache.get(token)
+            cache_dict[token] = self._get_metric_cache_lazy(token)
         return self._reward_fn_with_cache(trajectories, tokens_list, num_modes, cache_dict)
-    ##如果在初始化时没有将数据全部载入内存，它会退回到旧版逻辑——按需读取。
+
     def _compute_rewards_from_disk(
         self, trajectories: torch.Tensor, tokens_list, num_modes: int,
     ) -> torch.Tensor:
@@ -706,7 +716,7 @@ class TrajectoryHead(nn.Module):
             except Exception:
                 cache_dict[token] = None
         return self._reward_fn_with_cache(trajectories, tokens_list, num_modes, cache_dict)
-    ##reward_fn_with_cache：接收已经加载到内存中的 cache_dict（缓存数据）和 trajectories（预测轨迹）
+
     def _reward_fn_with_cache(
         self,
         trajectories: torch.Tensor,
@@ -714,31 +724,67 @@ class TrajectoryHead(nn.Module):
         num_modes: int,
         cache_dict: Dict[str, Any],
     ) -> torch.Tensor:
-        """Shared logic: compute PDM rewards given already-loaded metric caches."""
+        """Batched PDM reward: simulate all modes per token in one call instead of one-by-one."""
         batch_size = trajectories.shape[0]
-        trajectories_flat = trajectories.reshape(-1, 8, 3)
-        pred_np = trajectories_flat.detach().cpu().numpy()
+        pred_np = trajectories.reshape(-1, 8, 3).detach().cpu().numpy()
+        rewards = np.full(batch_size * num_modes, 0.5, dtype=np.float32)
+        future_sampling = self.simulator.proposal_sampling
 
-        tokens_expanded = [tok for tok in tokens_list for _ in range(num_modes)]
-
-        rewards = []
-        for i, token in enumerate(tokens_expanded):
+        for batch_idx, token in enumerate(tokens_list):
             metric_cache = cache_dict.get(token)
             if metric_cache is None:
-                rewards.append(0.5)
                 continue
+
             try:
-                trajectory = Trajectory(pred_np[i])
-                pdm_result = pdm_score(
-                    metric_cache=metric_cache,
-                    model_trajectory=trajectory,
-                    future_sampling=self.simulator.proposal_sampling,
-                    simulator=self.simulator,
-                    scorer=self.scorer,
+                initial_ego_state = metric_cache.ego_state
+
+                # PDM reference (computed once per token, not once per mode)
+                pdm_states = get_trajectory_as_array(
+                    metric_cache.trajectory, future_sampling, initial_ego_state.time_point,
                 )
-                rewards.append(asdict(pdm_result)["score"])
+
+                mode_start = batch_idx * num_modes
+                pred_states_list = []
+                valid_mode_indices = []
+
+                for mode_idx in range(num_modes):
+                    try:
+                        traj_np = pred_np[mode_start + mode_idx]
+                        model_traj = Trajectory(traj_np)
+                        pred_traj = transform_trajectory(model_traj, initial_ego_state)
+                        pred_states = get_trajectory_as_array(
+                            pred_traj, future_sampling, initial_ego_state.time_point,
+                        )
+                        pred_states_list.append(pred_states)
+                        valid_mode_indices.append(mode_idx)
+                    except Exception:
+                        pass
+
+                if not valid_mode_indices:
+                    continue
+
+                # Stack: [1 + valid_count, timesteps, state_dim]
+                all_states = np.concatenate(
+                    [pdm_states[None, ...]] + [s[None, ...] for s in pred_states_list],
+                    axis=0,
+                )
+
+                # Single batched simulate + score call for all modes of this token
+                simulated_states = self.simulator.simulate_proposals(all_states, initial_ego_state)
+                scores = self.scorer.score_proposals(
+                    simulated_states,
+                    metric_cache.observation,
+                    metric_cache.centerline,
+                    metric_cache.route_lane_ids,
+                    metric_cache.drivable_area_map,
+                )
+
+                # scores[0] = pdm reference; scores[1:] = predicted modes
+                for j, mode_idx in enumerate(valid_mode_indices):
+                    rewards[mode_start + mode_idx] = scores[j + 1]
+
             except Exception:
-                rewards.append(0.5)
+                pass
 
         rewards_tensor = torch.tensor(
             rewards, device=trajectories.device, dtype=trajectories.dtype,

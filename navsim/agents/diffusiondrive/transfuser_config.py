@@ -19,7 +19,8 @@ class TransfuserConfig:
     #plan_anchor_path: str = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/anchor_64_kmeans.npy"
     plan_anchor_path: str = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/kmeans_navsim_traj_20.npy"
     metric_cache_path: str = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/metric_cache"
-
+    # Lazy-load metric caches on first use (fast startup). 0 = unlimited entries in RAM; set e.g. 16384 to cap memory.
+    metric_cache_lru_max: int = 0
     latent: bool = False
     latent_rad_thresh: float = 4 * np.pi / 9
 
