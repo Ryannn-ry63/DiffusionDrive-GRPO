@@ -484,6 +484,13 @@ class TrajectoryHead(nn.Module):
                 + (f" LRU max entries: {self._metric_cache_lru_max}." if self._metric_cache_lru_max > 0 else "")
             )
 
+        # Reward skip: only compute PDM rewards every N steps, reuse cached rewards in between.
+        self._reward_compute_interval: int = int(getattr(config, "reward_compute_interval", 1))
+        self._reward_step_counter: int = 0
+        self._cached_rewards: Optional[torch.Tensor] = None
+        if self._reward_compute_interval > 1:
+            print(f"Reward skip: compute PDM rewards every {self._reward_compute_interval} steps, reuse in between.")
+
     def _get_metric_cache_lazy(self, token: str) -> Any:
         """Return metric cache for token, loading from disk on first miss."""
         assert self._lazy_metric_cache is not None and self.metric_cache_loader is not None
@@ -546,15 +553,33 @@ class TrajectoryHead(nn.Module):
         bs = ego_query.shape[0]
         device = ego_query.device
 
+        #plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs, 1, 1, 1)
+        #bs, num_mode, ts, d = plan_anchor.shape
+        #target_traj = targets["trajectory"]
+        #dist = torch.linalg.norm(target_traj.unsqueeze(1)[..., :2] - plan_anchor, dim=-1)
+        #dist = dist.mean(dim=-1)
+        #mode_idx = torch.argmin(dist, dim=-1)
+        #noisy_traj_points = plan_anchor
+
+        #timesteps = torch.randint(0, 50, (bs,), device=device)
+        
         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs, 1, 1, 1)
         bs, num_mode, ts, d = plan_anchor.shape
         target_traj = targets["trajectory"]
         dist = torch.linalg.norm(target_traj.unsqueeze(1)[..., :2] - plan_anchor, dim=-1)
         dist = dist.mean(dim=-1)
         mode_idx = torch.argmin(dist, dim=-1)
-        noisy_traj_points = plan_anchor
 
+        odo_info_fut = self.norm_odo(plan_anchor)
         timesteps = torch.randint(0, 50, (bs,), device=device)
+        noise = torch.randn(odo_info_fut.shape, device=device)
+        noisy_traj_points = self.diffusion_scheduler.add_noise(
+           original_samples=odo_info_fut,
+           noise=noise,
+           timesteps=timesteps,
+        ).float()
+        noisy_traj_points = torch.clamp(noisy_traj_points, min=-1, max=1)
+        noisy_traj_points = self.denorm_odo(noisy_traj_points)
 
         ego_fut_mode = noisy_traj_points.shape[1]
         traj_pos_embed = gen_sineembed_for_position(noisy_traj_points, hidden_dim=64)
@@ -598,14 +623,25 @@ class TrajectoryHead(nn.Module):
                 reduction="batchmean",
             )
 
-            if self._lazy_metric_cache is not None:
-                rewards = self._compute_rewards_from_lazy_cache(
-                    final_poses_reg, tokens_list, num_modes,
-                )
-            elif self.metric_cache_loader is not None:
-                rewards = self._compute_rewards_from_disk(
-                    final_poses_reg, tokens_list, num_modes,
-                )
+            self._reward_step_counter += 1
+            should_compute = (
+                self._cached_rewards is None
+                or self._reward_step_counter % self._reward_compute_interval == 0
+                or self._cached_rewards.shape[0] != bs
+            )
+
+            if should_compute:
+                if self._lazy_metric_cache is not None:
+                    rewards = self._compute_rewards_from_lazy_cache(
+                        final_poses_reg, tokens_list, num_modes,
+                    )
+                elif self.metric_cache_loader is not None:
+                    rewards = self._compute_rewards_from_disk(
+                        final_poses_reg, tokens_list, num_modes,
+                    )
+                self._cached_rewards = rewards
+            else:
+                rewards = self._cached_rewards
 
         best_reg = poses_reg_list[-1][torch.arange(bs), mode_idx]
 

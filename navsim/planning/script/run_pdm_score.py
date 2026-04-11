@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Union, Tuple
+from typing import Any, Dict, List, Union
 from pathlib import Path
 from dataclasses import asdict
 from datetime import datetime
@@ -136,26 +136,54 @@ def main(cfg: DictConfig) -> None:
         }
         for log_file, tokens_list in scene_loader.get_tokens_list_per_log().items()
     ]
-    score_rows: List[Tuple[Dict[str, Any], int, int]] = worker_map(worker, run_pdm_score, data_points)
+    # worker_map returns one list of dicts per data_point; must flatten before DataFrame
+    # or pandas builds columns 0,1,... and KeyError on "valid".
+    score_batches = worker_map(worker, run_pdm_score, data_points)
+    flat_rows: List[Dict[str, Any]] = []
+    for item in score_batches:
+        if isinstance(item, list):
+            flat_rows.extend(item)
+        elif isinstance(item, dict):
+            flat_rows.append(item)
+        else:
+            logger.warning("Unexpected worker_map item type %s, skipped.", type(item))
 
-    pdm_score_df = pd.DataFrame(score_rows)
-    num_sucessful_scenarios = pdm_score_df["valid"].sum()
-    num_failed_scenarios = len(pdm_score_df) - num_sucessful_scenarios
-    average_row = pdm_score_df.drop(columns=["token", "valid"]).mean(skipna=True)
-    average_row["token"] = "average"
-    average_row["valid"] = pdm_score_df["valid"].all()
-    pdm_score_df.loc[len(pdm_score_df)] = average_row
-
+    pdm_score_df = pd.DataFrame(flat_rows)
     save_path = Path(cfg.output_dir)
     timestamp = datetime.now().strftime("%Y.%m.%d.%H.%M.%S")
+
+    if pdm_score_df.empty:
+        logger.warning("No PDM score rows produced; check data paths and metric cache overlap.")
+        save_path.mkdir(parents=True, exist_ok=True)
+        pdm_score_df.to_csv(save_path / f"{timestamp}.csv")
+        logger.info("Evaluation finished with 0 scenarios. CSV written.")
+        return
+
+    if "valid" not in pdm_score_df.columns:
+        pdm_score_df["valid"] = True
+
+    num_sucessful_scenarios = int(pdm_score_df["valid"].sum())
+    num_failed_scenarios = len(pdm_score_df) - num_sucessful_scenarios
+    drop_cols = [c for c in ("token", "valid") if c in pdm_score_df.columns]
+    average_row = pdm_score_df.drop(columns=drop_cols).mean(skipna=True)
+    average_row["token"] = "average"
+    average_row["valid"] = bool(pdm_score_df["valid"].all())
+    pdm_score_df.loc[len(pdm_score_df)] = average_row
+
+    save_path.mkdir(parents=True, exist_ok=True)
     pdm_score_df.to_csv(save_path / f"{timestamp}.csv")
 
+    mean_score = (
+        pdm_score_df["score"].mean()
+        if "score" in pdm_score_df.columns
+        else float("nan")
+    )
     logger.info(
         f"""
         Finished running evaluation.
             Number of successful scenarios: {num_sucessful_scenarios}.
             Number of failed scenarios: {num_failed_scenarios}.
-            Final average score of valid results: {pdm_score_df['score'].mean()}.
+            Final average score of valid results: {mean_score}.
             Results are stored in: {save_path / f"{timestamp}.csv"}.
         """
     )
