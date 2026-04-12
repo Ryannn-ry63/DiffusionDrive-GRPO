@@ -24,7 +24,7 @@ class TransfuserConfig:
     # Lazy-load metric caches on first use (fast startup). 0 = unlimited entries in RAM; set e.g. 16384 to cap memory.
     metric_cache_lru_max: int = 0
     # Only compute PDM rewards every N steps; reuse cached rewards in between. 1 = every step (no skip).
-    reward_compute_interval: int = 2
+    reward_compute_interval: int = 1
     
     latent: bool = False
     latent_rad_thresh: float = 4 * np.pi / 9
@@ -91,8 +91,8 @@ class TransfuserConfig:
     trajectory_cls_weight: float = 10.0
     trajectory_reg_weight: float = 8.0
     diff_loss_weight: float = 20.0
-    policy_loss_weight: float = 1.0  # GRPO policy loss weight
-    kl_loss_weight: float = 0.01  # KL divergence regularization weight
+    policy_loss_weight: float = 1.0  # GRPO policy loss weight (applied to clipped surrogate)
+    kl_loss_weight: float = 1.0  # KL divergence regularization weight
     agent_class_weight: float = 10.0
     agent_box_weight: float = 1.0
     bev_semantic_weight: float = 14.0

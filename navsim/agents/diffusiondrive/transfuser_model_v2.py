@@ -571,7 +571,7 @@ class TrajectoryHead(nn.Module):
         mode_idx = torch.argmin(dist, dim=-1)
 
         odo_info_fut = self.norm_odo(plan_anchor)
-        timesteps = torch.randint(0, 50, (bs,), device=device)
+        timesteps = torch.ones((bs,), device=device, dtype=torch.long) * 8
         noise = torch.randn(odo_info_fut.shape, device=device)
         noisy_traj_points = self.diffusion_scheduler.add_noise(
            original_samples=odo_info_fut,
