@@ -88,11 +88,11 @@ class TransfuserConfig:
 
     # loss weights
     trajectory_weight: float = 12.0
-    trajectory_cls_weight: float = 10.0
+    trajectory_cls_weight: float = 1.0
     trajectory_reg_weight: float = 8.0
     diff_loss_weight: float = 20.0
-    policy_loss_weight: float = 1.0  # GRPO policy loss weight (applied to clipped surrogate)
-    kl_loss_weight: float = 1.0  # KL divergence regularization weight
+    kl_loss_weight: float = 0.1
+    reward_temperature: float = 1.0
     agent_class_weight: float = 10.0
     agent_box_weight: float = 1.0
     bev_semantic_weight: float = 14.0

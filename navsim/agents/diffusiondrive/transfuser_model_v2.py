@@ -648,6 +648,7 @@ class TrajectoryHead(nn.Module):
         return {
             "trajectory": best_reg,
             "final_poses_cls": final_poses_cls,
+            "final_poses_reg": final_poses_reg,
             "final_ref_poses_cls": final_ref_poses_cls,
             "rewards": rewards,
             "kl_div": kl_div,

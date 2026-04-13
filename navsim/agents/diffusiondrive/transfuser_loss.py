@@ -12,46 +12,76 @@ def transfuser_loss(
     targets: Dict[str, torch.Tensor], predictions: Dict[str, torch.Tensor], config: TransfuserConfig
 ):
     """
-    Combined loss: L1 regression (imitation) + GRPO policy gradient + KL regularization.
-    Regression loss is always present to prevent trajectory quality degradation.
-    GRPO + KL are only added during training when rewards are available.
+    Three-part loss:
+      1. GT-matched regression  (imitation baseline, keeps trajectory quality)
+      2. Reward-directed classification  (RL signal – teaches mode selector to
+         favour high-PDM-score modes, enabling improvement beyond human GT)
+      3. KL regularisation  (prevents catastrophic drift from pretrained policy)
+
+    During validation (no rewards), only regression loss is returned so that
+    checkpoint quality can be monitored.
     """
 
     device = predictions["trajectory"].device
+    zero = torch.tensor(0.0, device=device)
+    tau = getattr(config, "reward_temperature", 0.1)
 
-    # --- Regression loss (always computed) ---
+    # ---- 1. GT-matched regression (always) ----
     reg_loss = config.trajectory_reg_weight * F.l1_loss(
         predictions["trajectory"], targets["trajectory"]
     )
 
-    # Validation: no rewards available, return regression loss only
+    # Validation path
     if "rewards" not in predictions or predictions["rewards"] is None:
         return {
             "loss": reg_loss,
             "reg_loss": reg_loss,
-            "grpo_loss": torch.tensor(0.0, device=device),
-            "kl_loss": torch.tensor(0.0, device=device),
+            "reward_cls_loss": zero,
+            "reward_reg_loss": zero,
+            "kl_loss": zero,
         }
 
-    # --- Training: regression + GRPO + KL ---
-    grpo_loss_raw = compute_grpo_loss_clipped(
-        current_poses_cls=predictions["final_poses_cls"],
-        ref_poses_cls=predictions["final_ref_poses_cls"],
-        rewards=predictions["rewards"],
-        clip_ratio=0.2,
+    # ---- Training path (rewards available) ----
+    rewards = predictions["rewards"].float()            # [bs, num_modes]
+    poses_cls = predictions["final_poses_cls"].float()  # [bs, num_modes]
+
+    # ---- 2. Reward-directed classification ----
+    # Convert PDM rewards into a soft target distribution; the classifier
+    # learns to assign high probability to modes with high driving scores.
+    reward_target = F.softmax(rewards / tau, dim=-1).detach()
+    log_probs = F.log_softmax(poses_cls, dim=-1)
+    reward_cls_loss = config.trajectory_cls_weight * (
+        -torch.mean(torch.sum(reward_target * log_probs, dim=-1))
     )
 
-    kl_loss_raw = predictions.get("kl_div", torch.tensor(0.0, device=device))
+    # ---- 3. Reward-weighted all-mode regression ----
+    # High-reward modes also receive regression supervision so that their
+    # trajectory outputs stay accurate.  This complements (1) which only
+    # trains the single GT-closest mode.
+    reward_reg_loss = zero
+    final_poses_reg = predictions.get("final_poses_reg")
+    if final_poses_reg is not None:
+        gt_traj = targets["trajectory"]                        # [bs, 8, 3]
+        gt_expanded = gt_traj.unsqueeze(1).expand_as(final_poses_reg)
+        per_mode_l1 = F.l1_loss(
+            final_poses_reg, gt_expanded, reduction="none"
+        ).mean(dim=(-1, -2))                                   # [bs, num_modes]
+        reward_weights = F.softmax(rewards / tau, dim=-1).detach()
+        reward_reg_loss = config.trajectory_reg_weight * (
+            (reward_weights * per_mode_l1).sum(dim=-1).mean()
+        )
 
-    weighted_grpo = config.policy_loss_weight * grpo_loss_raw
+    # ---- 4. KL regularisation ----
+    kl_loss_raw = predictions.get("kl_div", zero)
     weighted_kl = config.kl_loss_weight * kl_loss_raw
 
-    total_loss = reg_loss + weighted_grpo + weighted_kl
+    total_loss = reg_loss + reward_cls_loss + reward_reg_loss + weighted_kl
 
     return {
         "loss": total_loss,
         "reg_loss": reg_loss,
-        "grpo_loss": weighted_grpo,
+        "reward_cls_loss": reward_cls_loss,
+        "reward_reg_loss": reward_reg_loss,
         "kl_loss": weighted_kl,
     }
 
@@ -171,47 +201,3 @@ def _get_src_permutation_idx(indices):
     batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
     src_idx = torch.cat([src for (src, _) in indices])
     return batch_idx, src_idx
-
-def compute_grpo_loss_clipped(
-    current_poses_cls: torch.Tensor,
-    ref_poses_cls: torch.Tensor,
-    rewards: torch.Tensor,
-    clip_ratio: float = 0.2,
-) -> torch.Tensor:
-    """
-    GRPO loss with PPO-style clipping on the probability ratio.
-
-    Args:
-        current_poses_cls: current policy logits  [bs, num_modes]
-        ref_poses_cls:     reference policy logits [bs, num_modes]
-        rewards:           per-mode PDM rewards    [bs, num_modes]
-        clip_ratio:        PPO clip epsilon
-    Returns:
-        scalar policy loss
-    """
-    rewards = torch.nan_to_num(rewards, nan=0.0).float()
-    current_poses_cls = torch.nan_to_num(current_poses_cls, nan=0.0).float()
-    ref_poses_cls = torch.nan_to_num(ref_poses_cls, nan=0.0).float()
-
-    # --- advantages (per-sample normalisation) ---
-    mean_r = rewards.mean(dim=1, keepdim=True)
-    std_r = rewards.std(dim=1, keepdim=True).clamp(min=0.01)
-    advantages = ((rewards - mean_r) / std_r).detach()
-    advantages = advantages.clamp(-5.0, 5.0)
-
-    # --- probability ratio with PPO clipping ---
-    eps = 1e-8
-    current_probs = F.softmax(current_poses_cls, dim=-1).clamp(min=eps)
-    ref_probs = F.softmax(ref_poses_cls, dim=-1).clamp(min=eps)
-
-    ratio = current_probs / ref_probs                                    # π_θ / π_ref
-    clipped_ratio = ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio)
-
-    surr1 = ratio * advantages
-    surr2 = clipped_ratio * advantages
-    policy_loss = -torch.mean(torch.min(surr1, surr2))
-
-    if torch.isnan(policy_loss) or torch.isinf(policy_loss):
-        policy_loss = torch.tensor(0.0, device=current_poses_cls.device)
-
-    return policy_loss
