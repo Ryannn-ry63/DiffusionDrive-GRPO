@@ -16,7 +16,8 @@ class TransfuserConfig:
     image_architecture: str = "resnet34"
     lidar_architecture: str = "resnet34"
     bkb_path: str = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/pytorch_model.bin"
-    plan_anchor_path: str = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/anchor_64_kmeans.npy"
+    #plan_anchor_path: str = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/anchor_64_kmeans.npy"
+    plan_anchor_path: str = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/kmeans_navsim_traj_20.npy"
 
     latent: bool = False
     latent_rad_thresh: float = 4 * np.pi / 9
@@ -83,7 +84,6 @@ class TransfuserConfig:
     trajectory_cls_weight: float = 10.0
     trajectory_reg_weight: float = 8.0
     diff_loss_weight: float = 20.0
-    policy_loss_weight: float = 1.0  # GRPO policy loss weight
     agent_class_weight: float = 10.0
     agent_box_weight: float = 1.0
     bev_semantic_weight: float = 14.0

@@ -121,44 +121,43 @@ class LossComputer(nn.Module):
         # self.focal_loss = FocalLoss(use_sigmoid=True, gamma=2.0, alpha=0.25, reduction='mean', loss_weight=1.0, activated=False)
         self.cls_loss_weight = config.trajectory_cls_weight
         self.reg_loss_weight = config.trajectory_reg_weight
-    def forward(self, poses_reg, poses_cls, targets, plan_anchor,mode_idx):
+    def forward(self, poses_reg, poses_cls, targets, plan_anchor):
         """
         pred_traj: (bs, 20, 8, 3)
         pred_cls: (bs, 20)
         plan_anchor: (bs,20, 8, 2)
         targets['trajectory']: (bs, 8, 3)
         """
-        #bs, num_mode, ts, d = poses_reg.shape
+        bs, num_mode, ts, d = poses_reg.shape
         target_traj = targets["trajectory"]
-        # dist = torch.linalg.norm(target_traj.unsqueeze(1)[...,:2] - plan_anchor, dim=-1)
-        # dist = dist.mean(dim=-1)
-        # mode_idx = torch.argmin(dist, dim=-1)
-        # cls_target = mode_idx
-        # mode_idx = mode_idx[...,None,None,None].repeat(1,1,ts,d)
-        best_reg = poses_reg[torch.arange(poses_reg.shape[0]), mode_idx]  # [bs, 8, 3]
+        dist = torch.linalg.norm(target_traj.unsqueeze(1)[...,:2] - plan_anchor, dim=-1)
+        dist = dist.mean(dim=-1)
+        mode_idx = torch.argmin(dist, dim=-1)
+        cls_target = mode_idx
+        mode_idx = mode_idx[...,None,None,None].repeat(1,1,ts,d)
+        best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
         # import ipdb; ipdb.set_trace()
         # Calculate cls loss using focal loss
-        # target_classes_onehot = torch.zeros([bs, num_mode],
-        #                                     dtype=poses_cls.dtype,
-        #                                     layout=poses_cls.layout,
-        #                                     device=poses_cls.device)
-        # target_classes_onehot.scatter_(1, cls_target.unsqueeze(1), 1)
+        target_classes_onehot = torch.zeros([bs, num_mode],
+                                            dtype=poses_cls.dtype,
+                                            layout=poses_cls.layout,
+                                            device=poses_cls.device)
+        target_classes_onehot.scatter_(1, cls_target.unsqueeze(1), 1)
 
-        # # Use py_sigmoid_focal_loss function for focal loss calculation
-        # loss_cls = self.cls_loss_weight * py_sigmoid_focal_loss(
-        #     poses_cls,
-        #     target_classes_onehot,
-        #     weight=None,
-        #     gamma=2.0,
-        #     alpha=0.25,
-        #     reduction='mean',
-        #     avg_factor=None
-        # )
+        # Use py_sigmoid_focal_loss function for focal loss calculation
+        loss_cls = self.cls_loss_weight * py_sigmoid_focal_loss(
+            poses_cls,
+            target_classes_onehot,
+            weight=None,
+            gamma=2.0,
+            alpha=0.25,
+            reduction='mean',
+            avg_factor=None
+        )
 
         # Calculate regression loss
         reg_loss = self.reg_loss_weight * F.l1_loss(best_reg, target_traj)
         # import ipdb; ipdb.set_trace()
         # Combine classification and regression losses
-        #ret_loss = loss_cls + reg_loss
-        ret_loss = reg_loss
+        ret_loss = loss_cls + reg_loss
         return ret_loss
