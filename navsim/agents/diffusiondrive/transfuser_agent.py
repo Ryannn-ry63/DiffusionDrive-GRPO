@@ -37,7 +37,9 @@ class TransfuserAgent(AbstractAgent):
         self,
         config: TransfuserConfig,
         lr: float,
-        checkpoint_path: Optional[str] = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2025.11.30.10.06.04/lightning_logs/version_0/checkpoints/model.ckpt",
+        checkpoint_path: Optional[str] = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2026.04.14.11.33.28/lightning_logs/version_0/checkpoints/eval_model"
+        #checkpoint_path: Optional[str] = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2026.04.14.06.57.53/lightning_logs/version_0/checkpoints/eval_model"
+        #checkpoint_path: Optional[str] = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2025.11.30.10.06.04/lightning_logs/version_0/checkpoints/model.ckpt",
     ):
         """
         Initializes TransFuser agent.

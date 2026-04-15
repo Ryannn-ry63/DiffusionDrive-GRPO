@@ -17,47 +17,44 @@ def transfuser_loss(
     targets: Dict[str, torch.Tensor], predictions: Dict[str, torch.Tensor], config: TransfuserConfig
 ):
     """
-    Helper function calculating complete loss of Transfuser with GRPO
-    :param targets: dictionary of name tensor pairings
-    :param predictions: dictionary of name tensor pairings
-    :param config: global Transfuser config
-    :return: combined loss value
+    Combined loss: IL regression (anchors trajectory quality) + GRPO (nudges mode selection) + KL.
     """
-    
-    # Validation 阶段：没有 rewards，返回零损失
+    device = predictions["trajectory"].device
+    reg_weight = getattr(config, 'trajectory_reg_weight', 8.0)
+    grpo_weight = getattr(config, 'policy_loss_weight', 0.1)
+    kl_weight = getattr(config, 'kl_loss_weight', 0.1)
+
+    # IL regression loss: always computed, protects trajectory quality through shared features
+    reg_loss = F.l1_loss(predictions["trajectory"], targets["trajectory"])
+
     if "rewards" not in predictions or predictions["rewards"] is None:
-        device = predictions["final_poses_cls"].device
+        # Validation: only regression loss (now we have a real validation signal)
         return {
-            "loss": torch.tensor(0.0, device=device),
+            "loss": reg_weight * reg_loss,
             "grpo_loss": torch.tensor(0.0, device=device),
-            "kl_loss": torch.tensor(0.0, device=device)
+            "kl_loss": torch.tensor(0.0, device=device),
+            "reg_loss": reg_weight * reg_loss,
         }
-    
-    # Training 阶段：计算 GRPO loss
+
+    # GRPO policy gradient loss
     grpo_loss = compute_grpo_loss3(
         current_poses_cls=predictions["final_poses_cls"],
         ref_poses_cls=predictions["final_ref_poses_cls"],
         rewards=predictions["rewards"],
-        num_modes=predictions.get("num_modes", 64),
-        clip_advantage_lower_quantile=0.0,
-        clip_advantage_upper_quantile=1.0,
-        clip_ratio=0.2
+        num_modes=predictions.get("num_modes", 20),
+        clip_ratio=0.2,
     )
-    
-    # KL divergence 正则化（如果可用）
-    kl_loss = predictions.get("kl_div", torch.tensor(0.0, device=grpo_loss.device))
-    kl_weight = getattr(config, 'kl_loss_weight', 0.01)  # 默认 KL 权重 0.01
-    
-    # 总损失 = GRPO loss + KL loss
-    total_loss = config.diff_loss_weight * grpo_loss + kl_weight * kl_loss
-    
-    loss_dict = {
+
+    kl_loss = predictions.get("kl_div", torch.tensor(0.0, device=device))
+
+    total_loss = reg_weight * reg_loss + grpo_weight * grpo_loss + kl_weight * kl_loss
+
+    return {
         'loss': total_loss,
-        'grpo_loss': config.diff_loss_weight * grpo_loss,
+        'grpo_loss': grpo_weight * grpo_loss,
         'kl_loss': kl_weight * kl_loss,
+        'reg_loss': reg_weight * reg_loss,
     }
-    
-    return loss_dict
 
 
 def _agent_loss(
@@ -329,48 +326,24 @@ def compute_grpo_loss3(
     clip_ratio: float = 0.2
 ) -> torch.Tensor:
     """
-    计算GRPO损失 - 最小干预版本
+    GRPO loss with PPO-style probability ratio clipping.
     """
-    batch_size = current_poses_cls.shape[0]
-    # 1. 只清理NaN，不裁剪数值
-    rewards = torch.nan_to_num(rewards, nan=0.0)
-    current_poses_cls = torch.nan_to_num(current_poses_cls, nan=0.0)
-    ref_poses_cls = torch.nan_to_num(ref_poses_cls, nan=0.0)
-    
-    rewards = rewards.float()
-    current_poses_cls = current_poses_cls.float()
-    ref_poses_cls = ref_poses_cls.float()
-    
-    # 2. 计算优势（只添加极小保护）
+    rewards = torch.nan_to_num(rewards, nan=0.0).float()
+    current_poses_cls = torch.nan_to_num(current_poses_cls, nan=0.0).float()
+    ref_poses_cls = torch.nan_to_num(ref_poses_cls, nan=0.0).float()
+
     mean_r = rewards.mean(dim=1, keepdim=True)
-    std_r = rewards.std(dim=1, keepdim=True)
-    
-    # 仅防止除零
-    std_r = torch.where(std_r < 1e-4, torch.ones_like(std_r) * 1e-4, std_r)
-    
-    advantages = (rewards - mean_r) / (std_r + 1e-8)
-    
-    # 3. 只处理极端优势值（99.9%分位数外）
-    if advantages.numel() > 100:
-        abs_adv = advantages.abs()
-        abs_adv = abs_adv.float()
-        extreme_threshold = torch.quantile(abs_adv, 0.999)
-        if extreme_threshold > 10.0:  # 只有真正极端时才裁剪
-            advantages = torch.clamp(advantages, -extreme_threshold, extreme_threshold)
-    
-    # 4. 概率保护（最小干预）
-    current_probs = F.softmax(current_poses_cls, dim=-1)
-    ref_probs = F.softmax(ref_poses_cls, dim=-1)
-    
-    # 只在检测到接近0时才clamp
-    if (current_probs < 1e-12).any() or (ref_probs < 1e-12).any():
-        eps = 1e-12
-        current_probs = current_probs.clamp(min=eps)
-        ref_probs = ref_probs.clamp(min=eps)
-    
-    log_ratios = torch.log(current_probs) - torch.log(ref_probs)
-    
-    # 5. 计算损失
-    policy_loss = -torch.mean(log_ratios * advantages)
-    
+    std_r = rewards.std(dim=1, keepdim=True).clamp(min=0.01)
+    advantages = ((rewards - mean_r) / std_r).detach()
+
+    current_log_probs = F.log_softmax(current_poses_cls, dim=-1)
+    ref_log_probs = F.log_softmax(ref_poses_cls.detach(), dim=-1)
+
+    log_ratios = current_log_probs - ref_log_probs
+    ratios = torch.exp(log_ratios)
+
+    surr1 = ratios * advantages
+    surr2 = torch.clamp(ratios, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages
+    policy_loss = -torch.mean(torch.min(surr1, surr2))
+
     return policy_loss
