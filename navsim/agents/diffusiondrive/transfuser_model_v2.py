@@ -1,5 +1,5 @@
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import copy
 import lzma
@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.schedulers import DDIMScheduler
+from diffusers.utils.torch_utils import randn_tensor
 from torch.nn import TransformerDecoder, TransformerDecoderLayer
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 from navsim.agents.diffusiondrive.transfuser_backbone import TransfuserBackbone
@@ -30,6 +31,110 @@ from navsim.evaluate.pdm_score import pdm_score, transform_trajectory, get_traje
 from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
 from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer, PDMScorerConfig
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
+
+
+class DDIMScheduler_with_logprob(DDIMScheduler):
+    """DDIMScheduler extended to return log_prob of prev_sample under the Gaussian transition."""
+
+    def step(
+        self,
+        model_output: torch.Tensor,
+        timestep: int,
+        sample: torch.Tensor,
+        eta: float = 1.0,
+        use_clipped_model_output: bool = False,
+        generator=None,
+        variance_noise: Optional[torch.Tensor] = None,
+        prev_sample: Optional[torch.FloatTensor] = None,
+        return_dict: bool = True,
+    ) -> Union[Tuple, None]:
+        if self.num_inference_steps is None:
+            raise ValueError(
+                "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
+            )
+
+        prev_timestep = (
+            timestep - self.config.num_train_timesteps // self.num_inference_steps
+        )
+
+        alpha_prod_t = self.alphas_cumprod[timestep]
+        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
+        beta_prod_t = 1 - alpha_prod_t
+
+        if self.config.prediction_type == "epsilon":
+            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            pred_epsilon = model_output
+        elif self.config.prediction_type == "sample":
+            pred_original_sample = model_output
+            pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
+        elif self.config.prediction_type == "v_prediction":
+            pred_original_sample = (alpha_prod_t ** 0.5) * sample - (beta_prod_t ** 0.5) * model_output
+            pred_epsilon = (alpha_prod_t ** 0.5) * model_output + (beta_prod_t ** 0.5) * sample
+        else:
+            raise ValueError(
+                f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`, or"
+                " `v_prediction`"
+            )
+
+        if self.config.thresholding:
+            pred_original_sample = self._threshold_sample(pred_original_sample)
+        elif self.config.clip_sample:
+            pred_original_sample = pred_original_sample.clamp(
+                -self.config.clip_sample_range, self.config.clip_sample_range
+            )
+
+        variance = self._get_variance(timestep, prev_timestep)
+        std_dev_t = (eta * variance ** (0.5)).clamp_(min=1e-10)
+
+        if use_clipped_model_output:
+            pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
+
+        pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t ** 2).clamp_(min=0) ** (0.5) * pred_epsilon
+        prev_sample_mean = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
+
+        if prev_sample is None:
+            if eta > 0:
+                std_dev_t_mul = torch.clip(std_dev_t, min=0.04)
+            else:
+                std_dev_t_mul = torch.tensor(0.0).to(std_dev_t.device)
+
+            variance_noise_horizon = randn_tensor(
+                [model_output.shape[0], model_output.shape[1], 1, 1],
+                generator=generator, device=model_output.device, dtype=model_output.dtype,
+            ) * std_dev_t_mul + 1.0
+            variance_noise_vert = randn_tensor(
+                [model_output.shape[0], model_output.shape[1], 1, 1],
+                generator=generator, device=model_output.device, dtype=model_output.dtype,
+            ) * std_dev_t_mul + 1.0
+
+            variance_noise_mul = torch.cat((variance_noise_horizon, variance_noise_vert), dim=-1)
+            variance_noise_mul = variance_noise_mul.repeat(1, 1, model_output.shape[2], 1)
+
+            variance_noise_x = randn_tensor(
+                [model_output.shape[0], model_output.shape[1], 1, 1],
+                generator=generator, device=model_output.device, dtype=model_output.dtype,
+            )
+            variance_noise_y = randn_tensor(
+                [model_output.shape[0], model_output.shape[1], 1, 1],
+                generator=generator, device=model_output.device, dtype=model_output.dtype,
+            )
+            variance_noise_add = torch.cat((variance_noise_x, variance_noise_y), dim=-1)
+            variance_noise_add = variance_noise_add.repeat(1, 1, model_output.shape[2], 1)
+
+            std_dev_t_add = torch.tensor(0.0).to(std_dev_t.device)
+            prev_sample = prev_sample_mean * variance_noise_mul + std_dev_t_add * variance_noise_add
+
+        std_dev_t_mul = torch.clip(std_dev_t, min=0.1)
+        log_prob = (
+            -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std_dev_t_mul ** 2))
+            - torch.log(std_dev_t_mul)
+            - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+        )
+        log_prob = log_prob.sum(dim=(-2, -1))
+
+        return prev_sample.type(sample.dtype), log_prob, prev_sample_mean.type(sample.dtype)
+
+
 class V2TransfuserModel(nn.Module):
     """Torch module for Transfuser."""
 
@@ -153,7 +258,26 @@ class V2TransfuserModel(nn.Module):
 
         output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map}
 
-        trajectory = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],targets=targets,global_img=None,tokens_list=tokens_list)
+        if self.training:
+            with torch.no_grad():
+                old_pred = self._trajectory_head(
+                    trajectory_query, agents_query, cross_bev_feature, bev_spatial_shape,
+                    status_encoding[:, None], targets=targets, global_img=None,
+                    tokens_list=tokens_list, old_pred=None,
+                )
+            trajectory = self._trajectory_head(
+                trajectory_query, agents_query, cross_bev_feature, bev_spatial_shape,
+                status_encoding[:, None], targets=targets, global_img=None,
+                tokens_list=tokens_list, old_pred=old_pred,
+            )
+            if 'reward' not in trajectory:
+                trajectory['reward'] = old_pred.get('reward')
+        else:
+            trajectory = self._trajectory_head(
+                trajectory_query, agents_query, cross_bev_feature, bev_spatial_shape,
+                status_encoding[:, None], targets=targets, global_img=None,
+                tokens_list=tokens_list,
+            )
         output.update(trajectory)
 
         agents = self._agent_head(agents_query)
@@ -430,6 +554,11 @@ class TrajectoryHead(nn.Module):
             prediction_type="sample",
         )
 
+        self.diffusionrl_scheduler = DDIMScheduler_with_logprob(
+            num_train_timesteps=1000,
+            beta_schedule="scaled_linear",
+            prediction_type="sample",
+        )
 
         plan_anchor = np.load(plan_anchor_path)
 
@@ -540,119 +669,103 @@ class TrajectoryHead(nn.Module):
         odo_info_fut_head = (odo_info_fut_head + 1)/2 * 3.9 - 2
         return torch.cat([odo_info_fut_x, odo_info_fut_y, odo_info_fut_head], dim=-1)
     
-    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,tokens_list=None) -> Dict[str, torch.Tensor]:
+    def forward(self, ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, targets=None, global_img=None, tokens_list=None, old_pred=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
         if self.training:
-            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img,tokens_list)
+            if old_pred is not None:
+                return self.get_rlloss(ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, targets, global_img, old_pred)
+            else:
+                return self.forward_train_rl(ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, targets, global_img, tokens_list)
         else:
-            return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,global_img,tokens_list)
+            return self.forward_test(ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, global_img, tokens_list)
 
 
-    def forward_train(self, ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, targets=None, global_img=None, tokens_list=None) -> Dict[str, torch.Tensor]:
-
+    def forward_train_rl(self, ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, targets=None, global_img=None, tokens_list=None) -> Dict[str, torch.Tensor]:
+        """Pass 1 (no_grad): run full denoising chain, collect chain states, compute rewards & advantages."""
+        step_num = 10
         bs = ego_query.shape[0]
         device = ego_query.device
+        self.diffusionrl_scheduler.set_timesteps(1000, device)
+        step_ratio = 20 / step_num
+        roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
+        roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
 
-        #plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs, 1, 1, 1)
-        #bs, num_mode, ts, d = plan_anchor.shape
-        #target_traj = targets["trajectory"]
-        #dist = torch.linalg.norm(target_traj.unsqueeze(1)[..., :2] - plan_anchor, dim=-1)
-        #dist = dist.mean(dim=-1)
-        #mode_idx = torch.argmin(dist, dim=-1)
-        #noisy_traj_points = plan_anchor
-
-        #timesteps = torch.randint(0, 50, (bs,), device=device)
-        
         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs, 1, 1, 1)
-        bs, num_mode, ts, d = plan_anchor.shape
-        target_traj = targets["trajectory"]
-        dist = torch.linalg.norm(target_traj.unsqueeze(1)[..., :2] - plan_anchor, dim=-1)
-        dist = dist.mean(dim=-1)
-        mode_idx = torch.argmin(dist, dim=-1)
+        diffusion_output = self.norm_odo(plan_anchor)
 
-        odo_info_fut = self.norm_odo(plan_anchor)
-        timesteps = torch.randint(0, 50, (bs,), device=device)
-        noise = torch.randn(odo_info_fut.shape, device=device)
-        noisy_traj_points = self.diffusion_scheduler.add_noise(
-           original_samples=odo_info_fut,
-           noise=noise,
-           timesteps=timesteps,
-        ).float()
-        noisy_traj_points = torch.clamp(noisy_traj_points, min=-1, max=1)
-        noisy_traj_points = self.denorm_odo(noisy_traj_points)
-
-        ego_fut_mode = noisy_traj_points.shape[1]
-        traj_pos_embed = gen_sineembed_for_position(noisy_traj_points, hidden_dim=64)
-        traj_pos_embed = traj_pos_embed.flatten(-2)
-        traj_feature = self.plan_anchor_encoder(traj_pos_embed)
-        traj_feature = traj_feature.view(bs, ego_fut_mode, -1)
-        time_embed = self.time_mlp(timesteps)
-        time_embed = time_embed.view(bs, 1, -1)
-
-        poses_reg_list, poses_cls_list = self.diff_decoder(
-            traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape,
-            agents_query, ego_query, time_embed, status_encoding, global_img,
+        noise = torch.randn(diffusion_output.shape, device=device)
+        trunc_timesteps = torch.ones((bs,), device=device, dtype=torch.long) * 8
+        diffusion_output = self.diffusionrl_scheduler.add_noise(
+            original_samples=diffusion_output, noise=noise, timesteps=trunc_timesteps,
         )
 
-        final_poses_reg = poses_reg_list[-1]
-        final_poses_cls = poses_cls_list[-1]
-        num_modes = final_poses_cls.shape[1]
+        all_log_probs = []
+        all_diffusion_output = [diffusion_output]
+        ego_fut_mode = diffusion_output.shape[1]
+
+        for i, k in enumerate(roll_timesteps):
+            x_boxes = torch.clamp(diffusion_output, min=-1, max=1)
+            noisy_traj_points = self.denorm_odo(x_boxes)
+
+            traj_pos_embed = gen_sineembed_for_position(noisy_traj_points, hidden_dim=64)
+            traj_pos_embed = traj_pos_embed.flatten(-2)
+            traj_feature = self.plan_anchor_encoder(traj_pos_embed)
+            traj_feature = traj_feature.view(bs, ego_fut_mode, -1)
+
+            timesteps = k.expand(bs)
+            time_embed = self.time_mlp(timesteps).view(bs, 1, -1)
+
+            poses_reg_list, poses_cls_list = self.diff_decoder(
+                traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape,
+                agents_query, ego_query, time_embed, status_encoding, global_img,
+            )
+            poses_reg = poses_reg_list[-1]
+            x_start = poses_reg[..., :2]
+            x_start = self.norm_odo(x_start)
+
+            prev_sample, log_prob, _ = self.diffusionrl_scheduler.step(
+                model_output=x_start, timestep=k, sample=diffusion_output, eta=1.0,
+            )
+            diffusion_output = prev_sample
+            all_log_probs.append(log_prob)
+            all_diffusion_output.append(prev_sample)
+
+        all_log_probs = torch.stack(all_log_probs, dim=-1)
+        all_diffusion_output = torch.stack(all_diffusion_output, dim=-1)
+
+        final_traj = poses_reg
+        num_modes = ego_fut_mode
 
         rewards = None
-        final_ref_poses_cls = None
-        kl_div = None
+        if tokens_list is not None:
+            if self._lazy_metric_cache is not None:
+                rewards = self._compute_rewards_from_lazy_cache(final_traj, tokens_list, num_modes)
+            elif self.metric_cache_loader is not None:
+                rewards = self._compute_rewards_from_disk(final_traj, tokens_list, num_modes)
 
-        if tokens_list is not None and self.ref_policy is not None:
-            with torch.no_grad():
-                ref_poses_reg_list, ref_poses_cls_list = self.ref_policy(
-                    traj_feature.detach(),
-                    noisy_traj_points,
-                    bev_feature.detach(),
-                    bev_spatial_shape,
-                    agents_query.detach(),
-                    ego_query.detach(),
-                    time_embed.detach(),
-                    status_encoding.detach(),
-                    global_img.detach() if global_img is not None else None,
-                )
-                final_ref_poses_cls = ref_poses_cls_list[-1]
+        advantages = None
+        reward_mean = None
+        if rewards is not None:
+            mean_r = rewards.mean(dim=1, keepdim=True)
+            std_r = rewards.std(dim=1, keepdim=True).clamp(min=1e-4)
+            advantages = ((rewards - mean_r) / std_r).detach()
+            advantages = advantages.unsqueeze(-1).repeat(1, 1, step_num)
+            discount = torch.tensor(
+                [0.8 ** (step_num - i - 1) for i in range(step_num)]
+            ).to(device)
+            advantages = advantages * discount
+            reward_mean = rewards.mean()
 
-            kl_div = F.kl_div(
-                F.log_softmax(final_poses_cls, dim=-1),
-                F.softmax(final_ref_poses_cls, dim=-1),
-                reduction="batchmean",
-            )
-
-            self._reward_step_counter += 1
-            should_compute = (
-                self._cached_rewards is None
-                or self._reward_step_counter % self._reward_compute_interval == 0
-                or self._cached_rewards.shape[0] != bs
-            )
-
-            if should_compute:
-                if self._lazy_metric_cache is not None:
-                    rewards = self._compute_rewards_from_lazy_cache(
-                        final_poses_reg, tokens_list, num_modes,
-                    )
-                elif self.metric_cache_loader is not None:
-                    rewards = self._compute_rewards_from_disk(
-                        final_poses_reg, tokens_list, num_modes,
-                    )
-                self._cached_rewards = rewards
-            else:
-                rewards = self._cached_rewards
-
-        best_reg = poses_reg_list[-1][torch.arange(bs), mode_idx]
+        target_traj = targets["trajectory"]
+        dist = torch.linalg.norm(target_traj.unsqueeze(1)[..., :2] - self.plan_anchor.unsqueeze(0), dim=-1)
+        mode_idx = torch.argmin(dist.mean(dim=-1), dim=-1)
+        best_reg = poses_reg[torch.arange(bs), mode_idx]
 
         return {
+            "all_diffusion_output": all_diffusion_output,
+            "advantages": advantages,
+            "reward": reward_mean,
             "trajectory": best_reg,
-            "final_poses_cls": final_poses_cls,
-            "final_ref_poses_cls": final_ref_poses_cls,
-            "rewards": rewards,
-            "kl_div": kl_div,
-            "num_modes": num_modes,
-            "mode_idx": mode_idx,
         }
 
     def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img,tokens_list=None) -> Dict[str, torch.Tensor]:
@@ -724,8 +837,101 @@ class TrajectoryHead(nn.Module):
         "rewards": None,                           # validation时不需要奖励
         "num_modes": num_modes                     # 
         }
-        #print(f"[TEST] 返回 - rewards: {output_dict['rewards']}, 其他keys: {list(output_dict.keys())}")
         return output_dict
+
+    def get_rlloss(self, ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, targets, global_img, old_pred) -> Dict[str, torch.Tensor]:
+        """Pass 2 (with_grad): replay chain with current policy, compute log_prob, GRPO loss + IL loss."""
+        old_diffusion_output = old_pred['all_diffusion_output']
+        advantages = old_pred['advantages']
+
+        chains = old_diffusion_output[..., :-1]
+        chains_prev = old_diffusion_output[..., 1:]
+
+        step_num = chains.shape[-1]
+        bs = chains.shape[0]
+        device = chains.device
+        self.diffusionrl_scheduler.set_timesteps(1000, device)
+        step_ratio = 20 / step_num
+        roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
+        roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
+
+        all_log_probs = []
+        poses_reg_steps_list = []
+
+        for i, k in enumerate(roll_timesteps):
+            diffusion_input = chains[..., i]
+            ego_fut_mode = diffusion_input.shape[1]
+            x_boxes = torch.clamp(diffusion_input, min=-1, max=1)
+            noisy_traj_points = self.denorm_odo(x_boxes)
+
+            traj_pos_embed = gen_sineembed_for_position(noisy_traj_points, hidden_dim=64)
+            traj_pos_embed = traj_pos_embed.flatten(-2)
+            traj_feature = self.plan_anchor_encoder(traj_pos_embed)
+            traj_feature = traj_feature.view(bs, ego_fut_mode, -1)
+
+            timesteps = k.expand(bs)
+            time_embed = self.time_mlp(timesteps).view(bs, 1, -1)
+
+            poses_reg_list, poses_cls_list = self.diff_decoder(
+                traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape,
+                agents_query, ego_query, time_embed, status_encoding, global_img,
+            )
+            poses_reg_steps_list.append(poses_reg_list)
+            poses_reg = poses_reg_list[-1]
+            x_start = poses_reg[..., :2]
+            x_start = self.norm_odo(x_start)
+
+            _, log_prob, _ = self.diffusionrl_scheduler.step(
+                model_output=x_start,
+                timestep=k,
+                sample=diffusion_input,
+                eta=1.0,
+                prev_sample=chains_prev[..., i],
+            )
+            all_log_probs.append(log_prob)
+
+        all_log_probs = torch.stack(all_log_probs, dim=-1)
+        per_token_logps = all_log_probs
+
+        if advantages is not None:
+            per_token_loss = -torch.exp(per_token_logps - per_token_logps.detach()) * advantages
+            mask_nz = per_token_loss != 0
+            RL_loss_b = (per_token_loss * mask_nz).sum(dim=1) / mask_nz.sum(dim=1).clamp_min(1)
+            RL_loss_b = RL_loss_b.mean(dim=-1)
+        else:
+            RL_loss_b = torch.zeros(bs, device=device)
+
+        IL_loss_b = torch.zeros_like(RL_loss_b)
+        target_traj = targets['trajectory'].unsqueeze(1).repeat(1, ego_fut_mode, 1, 1)
+        for reg_list in poses_reg_steps_list:
+            for poses_reg_layer in reg_list:
+                traj_l1 = F.l1_loss(poses_reg_layer[..., :2], target_traj[..., :2], reduction='none')
+                IL_loss_b = IL_loss_b + traj_l1.mean(dim=(1, 2, 3))
+        IL_loss_b = IL_loss_b / (len(poses_reg_steps_list) * len(poses_reg_steps_list[0]))
+
+        has_positive = (
+            (advantages > 0).any(dim=2).any(dim=1)
+            if advantages is not None
+            else torch.zeros(bs, dtype=torch.bool, device=device)
+        )
+        il_weight = torch.where(
+            has_positive,
+            torch.tensor(0.1, device=device),
+            torch.tensor(1.0, device=device),
+        )
+        loss_b = RL_loss_b + il_weight * IL_loss_b
+        loss = loss_b.mean()
+
+        last_poses_cls = poses_cls_list[-1]
+        mode_idx = last_poses_cls.argmax(dim=-1)
+        best_reg = poses_reg_list[-1][torch.arange(bs), mode_idx]
+
+        return {
+            "loss": loss,
+            "rl_loss": RL_loss_b.mean().detach(),
+            "il_loss": IL_loss_b.mean().detach(),
+            "trajectory": best_reg,
+        }
 
     def _compute_rewards_from_lazy_cache(
         self, trajectories: torch.Tensor, tokens_list, num_modes: int,

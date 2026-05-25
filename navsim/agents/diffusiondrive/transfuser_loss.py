@@ -8,53 +8,25 @@ from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 from navsim.agents.diffusiondrive.transfuser_features import BoundingBox2DIndex
 
 
-# TODO: 通读一下，其实compute loss被调用了两次：一次在_trajectory_head，其实是对每一个轨迹，都计算了loss，但没有真正用于梯度回传；
-# 一次是在navsim/planning/training/agent_lightning_module.py L32里面，最终计算得到的loss dict才会用于下游计算。
-# TODO: 在 _trajectory_head 里的compute loss可以注释了，其实不对下游训练产生影响；记得把计算grpo loss的逻辑，从_trajectory_head 的forward中，搬到这里来
-# 记住我们只finetune _trajectory_head 
-
 def transfuser_loss(
     targets: Dict[str, torch.Tensor], predictions: Dict[str, torch.Tensor], config: TransfuserConfig
 ):
     """
-    Combined loss: IL regression (anchors trajectory quality) + GRPO (nudges mode selection) + KL.
+    Loss routing: during training the RL loss (GRPO + IL) is pre-computed inside
+    TrajectoryHead.get_rlloss and passed through here. During validation only a
+    simple regression metric is returned.
     """
     device = predictions["trajectory"].device
-    reg_weight = getattr(config, 'trajectory_reg_weight', 8.0)
-    grpo_weight = getattr(config, 'policy_loss_weight', 0.1)
-    kl_weight = getattr(config, 'kl_loss_weight', 0.1)
 
-    # IL regression loss: always computed, protects trajectory quality through shared features
+    if "loss" in predictions and predictions["loss"] is not None:
+        result = {"loss": predictions["loss"]}
+        for key in ("rl_loss", "il_loss", "reward"):
+            if key in predictions and predictions[key] is not None:
+                result[key] = predictions[key]
+        return result
+
     reg_loss = F.l1_loss(predictions["trajectory"], targets["trajectory"])
-
-    if "rewards" not in predictions or predictions["rewards"] is None:
-        # Validation: only regression loss (now we have a real validation signal)
-        return {
-            "loss": reg_weight * reg_loss,
-            "grpo_loss": torch.tensor(0.0, device=device),
-            "kl_loss": torch.tensor(0.0, device=device),
-            "reg_loss": reg_weight * reg_loss,
-        }
-
-    # GRPO policy gradient loss
-    grpo_loss = compute_grpo_loss3(
-        current_poses_cls=predictions["final_poses_cls"],
-        ref_poses_cls=predictions["final_ref_poses_cls"],
-        rewards=predictions["rewards"],
-        num_modes=predictions.get("num_modes", 20),
-        clip_ratio=0.2,
-    )
-
-    kl_loss = predictions.get("kl_div", torch.tensor(0.0, device=device))
-
-    total_loss = reg_weight * reg_loss + grpo_weight * grpo_loss + kl_weight * kl_loss
-
-    return {
-        'loss': total_loss,
-        'grpo_loss': grpo_weight * grpo_loss,
-        'kl_loss': kl_weight * kl_loss,
-        'reg_loss': reg_weight * reg_loss,
-    }
+    return {"loss": reg_loss}
 
 
 def _agent_loss(

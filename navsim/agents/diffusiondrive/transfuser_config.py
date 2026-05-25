@@ -25,7 +25,14 @@ class TransfuserConfig:
     metric_cache_lru_max: int = 0
     # Only compute PDM rewards every N steps; reuse cached rewards in between. 1 = every step (no skip).
     reward_compute_interval: int = 1
-    
+
+    # RL (denoising-chain GRPO) hyper-parameters
+    rl_step_num: int = 10
+    rl_eta: float = 1.0
+    rl_gamma_denoising: float = 0.8
+    rl_il_weight: float = 0.1
+    rl_il_weight_no_pos: float = 1.0
+
     latent: bool = False
     latent_rad_thresh: float = 4 * np.pi / 9
 
@@ -91,7 +98,7 @@ class TransfuserConfig:
     trajectory_cls_weight: float = 10.0
     trajectory_reg_weight: float = 8.0
     diff_loss_weight: float = 20.0
-    policy_loss_weight: float = 0.5  # GRPO policy loss weight
+    policy_loss_weight: float = 0.1  # GRPO policy loss weight (gentle nudge, not dominant)
     kl_loss_weight: float = 0.1  # KL divergence regularization weight
     agent_class_weight: float = 10.0
     agent_box_weight: float = 1.0

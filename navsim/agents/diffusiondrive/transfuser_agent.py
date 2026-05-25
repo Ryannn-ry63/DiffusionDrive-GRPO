@@ -1,6 +1,5 @@
 from typing import Any, List, Dict, Optional, Union
 
-import copy
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
@@ -37,9 +36,7 @@ class TransfuserAgent(AbstractAgent):
         self,
         config: TransfuserConfig,
         lr: float,
-        checkpoint_path: Optional[str] = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2026.04.14.11.33.28/lightning_logs/version_0/checkpoints/eval_model"
-        #checkpoint_path: Optional[str] = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2026.04.14.06.57.53/lightning_logs/version_0/checkpoints/eval_model"
-        #checkpoint_path: Optional[str] = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2025.11.30.10.06.04/lightning_logs/version_0/checkpoints/model.ckpt",
+        checkpoint_path: Optional[str] = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2025.11.30.10.06.04/lightning_logs/version_0/checkpoints/model.ckpt",
     ):
         """
         Initializes TransFuser agent.
@@ -56,21 +53,10 @@ class TransfuserAgent(AbstractAgent):
         self._transfuser_model = TransfuserModel(config)
         self.init_from_pretrained()
 
-        # 1. 冻结整个模型
         self._transfuser_model.requires_grad_(False)
 
-        # 2. 只解冻diff_decoder
         self._transfuser_model._trajectory_head.diff_decoder.requires_grad_(True)
-        print("✓ 参数冻结完成:只训练diff_decoder")
-
-        ref_policy = copy.deepcopy(self._transfuser_model._trajectory_head.diff_decoder)
-        ref_policy.requires_grad_(False)
-        ref_policy.eval()  # 确保参考策略在评估模式下运行（禁用dropout等）
-
-        # 3. 设置到TrajectoryHead中
-        self._transfuser_model._trajectory_head.set_ref_policy(ref_policy)
-
-        print("✓ 参考策略创建完成（预训练权重的冻结拷贝）")
+        print("Frozen all parameters except diff_decoder (trainable for RL)")
         
     def init_from_pretrained(self):
         # import ipdb; ipdb.set_trace()
