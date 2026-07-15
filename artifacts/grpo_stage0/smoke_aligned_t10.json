@@ -1,0 +1,123 @@
+{
+  "summary": {
+    "checkpoint": "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2026.04.14.03.49.58/lightning_logs/version_0/checkpoints/eval_model",
+    "num_tokens": 8,
+    "schedule": {
+      "truncation_timestep": 10,
+      "roll_timesteps": [
+        10,
+        0
+      ],
+      "scheduler_num_inference_steps": 100,
+      "scheduler_step_stride": 10,
+      "transitions": [
+        [
+          10,
+          0
+        ],
+        [
+          0,
+          -10
+        ]
+      ]
+    },
+    "selected_reward": 0.8616169095039368,
+    "oracle_reward": 0.9203246980905533,
+    "selection_regret": 0.058707788586616516,
+    "candidate_reward": 0.6721421759575605,
+    "oracle_hit_rate": 0.0,
+    "classification_entropy": 1.9350131005048752,
+    "trajectory_diversity": 2.199326977133751,
+    "reward_logit_spearman": 0.44097135697039536
+  },
+  "records": [
+    {
+      "token": "0028fbfad1395a73",
+      "selected_reward": 0.7919347882270813,
+      "oracle_reward": 0.8705570101737976,
+      "regret": 0.07862222194671631,
+      "candidate_reward": 0.794509768486023,
+      "oracle_hit": 0.0,
+      "entropy": 2.2740445137023926,
+      "diversity": 1.2111302614212036,
+      "reward_logit_spearman": 0.1819548872180451
+    },
+    {
+      "token": "0033d230eeb35a13",
+      "selected_reward": 0.8282517194747925,
+      "oracle_reward": 0.8630411624908447,
+      "regret": 0.034789443016052246,
+      "candidate_reward": 0.7794029712677002,
+      "oracle_hit": 0.0,
+      "entropy": 2.2852461338043213,
+      "diversity": 1.3301231861114502,
+      "reward_logit_spearman": 0.7187969924812029
+    },
+    {
+      "token": "0056aeea266451d3",
+      "selected_reward": 0.9043785333633423,
+      "oracle_reward": 0.937727689743042,
+      "regret": 0.03334915637969971,
+      "candidate_reward": 0.4611065983772278,
+      "oracle_hit": 0.0,
+      "entropy": 1.702854871749878,
+      "diversity": 2.916498899459839,
+      "reward_logit_spearman": 0.807200553447908
+    },
+    {
+      "token": "006da25fcf285924",
+      "selected_reward": 0.9461022615432739,
+      "oracle_reward": 1.0,
+      "regret": 0.053897738456726074,
+      "candidate_reward": 0.8650795817375183,
+      "oracle_hit": 0.0,
+      "entropy": 2.0070109367370605,
+      "diversity": 1.6474947929382324,
+      "reward_logit_spearman": 0.77593984962406
+    },
+    {
+      "token": "00927131b88a5880",
+      "selected_reward": 0.7940350770950317,
+      "oracle_reward": 0.8628714084625244,
+      "regret": 0.06883633136749268,
+      "candidate_reward": 0.7302668690681458,
+      "oracle_hit": 0.0,
+      "entropy": 2.0692763328552246,
+      "diversity": 2.826977252960205,
+      "reward_logit_spearman": -0.13233082706766916
+    },
+    {
+      "token": "00ac934b58495a75",
+      "selected_reward": 0.7833576798439026,
+      "oracle_reward": 0.8726638555526733,
+      "regret": 0.08930617570877075,
+      "candidate_reward": 0.7209665179252625,
+      "oracle_hit": 0.0,
+      "entropy": 1.7237881422042847,
+      "diversity": 2.0753982067108154,
+      "reward_logit_spearman": -0.2113576682000104
+    },
+    {
+      "token": "0105098aa7b95444",
+      "selected_reward": 0.9025909304618835,
+      "oracle_reward": 0.9557364583015442,
+      "regret": 0.053145527839660645,
+      "candidate_reward": 0.21792380511760712,
+      "oracle_hit": 0.0,
+      "entropy": 1.4282441139221191,
+      "diversity": 4.117643356323242,
+      "reward_logit_spearman": 0.7529806020942127
+    },
+    {
+      "token": "01a034fc1d465243",
+      "selected_reward": 0.9422842860221863,
+      "oracle_reward": 1.0,
+      "regret": 0.05771571397781372,
+      "candidate_reward": 0.8078812956809998,
+      "oracle_hit": 0.0,
+      "entropy": 1.9896397590637207,
+      "diversity": 1.4693498611450195,
+      "reward_logit_spearman": 0.6345864661654135
+    }
+  ]
+}

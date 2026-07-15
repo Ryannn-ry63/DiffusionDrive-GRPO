@@ -43,14 +43,17 @@ def compute_grpo_objective(
     valid_mask: torch.Tensor,
     clip_ratio: float = 0.2,
     advantage_eps: float = 1e-3,
+    temperature: float = 1.0,
 ):
     """Exact categorical, group-relative clipped policy objective over all modes."""
     if not (current_logits.shape == old_logits.shape == reference_logits.shape == rewards.shape):
         raise ValueError("policy logits and rewards must have identical [batch, num_modes] shapes")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
 
-    current_logits = current_logits.float()
-    old_logits = old_logits.detach().float()
-    reference_logits = reference_logits.detach().float()
+    current_logits = current_logits.float() / temperature
+    old_logits = old_logits.detach().float() / temperature
+    reference_logits = reference_logits.detach().float() / temperature
     advantages, valid_mask, group_valid, reward_mean, reward_std = (
         compute_group_relative_advantages(rewards, valid_mask, advantage_eps)
     )
@@ -110,6 +113,7 @@ def compute_grpo_objective(
     return {
         "policy_loss": policy_loss,
         "kl_loss": kl_loss,
+        "entropy_for_loss": entropy,
         "entropy": entropy.detach(),
         "reward_mean": reward_mean.mean().detach(),
         "reward_std": reward_std.mean().detach(),
@@ -124,13 +128,66 @@ def compute_grpo_objective(
         "clip_fraction": clip_fraction.detach(),
     }
 
+
+def compute_generation_grpo_objective(
+    current_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    generation_kl: torch.Tensor,
+    rewards: torch.Tensor,
+    valid_mask: torch.Tensor,
+    clip_ratio: float = 0.2,
+    advantage_eps: float = 1e-3,
+):
+    """Clipped group-relative objective over sampled denoising actions."""
+    if current_log_probs.shape != old_log_probs.shape:
+        raise ValueError("current and old generation log-probs must have identical shapes")
+    if current_log_probs.ndim != 3 or current_log_probs.shape[:2] != rewards.shape:
+        raise ValueError("generation log-probs must have shape [batch, mode, step]")
+    if generation_kl.shape != current_log_probs.shape:
+        raise ValueError("generation KL must match generation log-prob shape")
+
+    advantages, valid_mask, group_valid, _, _ = compute_group_relative_advantages(
+        rewards, valid_mask, advantage_eps
+    )
+    log_ratio = (current_log_probs - old_log_probs.detach()).clamp(-20.0, 20.0)
+    ratio = log_ratio.exp()
+    step_advantages = advantages.unsqueeze(-1)
+    surrogate = torch.minimum(
+        ratio * step_advantages,
+        ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * step_advantages,
+    )
+    optimize_mask = (
+        valid_mask
+        & group_valid.unsqueeze(-1)
+    ).unsqueeze(-1).expand_as(surrogate)
+    policy_loss = (
+        -surrogate[optimize_mask].mean()
+        if optimize_mask.any()
+        else current_log_probs.sum() * 0.0
+    )
+    kl_mask = valid_mask.unsqueeze(-1).expand_as(generation_kl)
+    kl_loss = (
+        generation_kl[kl_mask].mean()
+        if kl_mask.any()
+        else generation_kl.sum() * 0.0
+    )
+    clipped = (ratio < 1.0 - clip_ratio) | (ratio > 1.0 + clip_ratio)
+    return {
+        "policy_loss": policy_loss,
+        "kl_loss": kl_loss,
+        "ratio_mean": ratio[kl_mask].mean().detach(),
+        "clip_fraction": clipped[kl_mask].float().mean().detach(),
+    }
+
+
 def transfuser_loss(
     targets: Dict[str, torch.Tensor], predictions: Dict[str, torch.Tensor], config: TransfuserConfig
 ):
-    """Pure classification GRPO objective; intentionally contains no imitation loss."""
+    """Pure GRPO objective for selection, generation, or their joint policy."""
     current_logits = predictions["final_poses_cls"]
     grpo_weight = getattr(config, "policy_loss_weight", 1.0)
     kl_weight = getattr(config, "kl_loss_weight", 0.01)
+    entropy_weight = getattr(config, "selection_entropy_weight", 0.0)
 
     if "rewards" not in predictions or predictions["rewards"] is None:
         zero = current_logits.sum() * 0.0
@@ -155,15 +212,69 @@ def transfuser_loss(
         ),
         clip_ratio=getattr(config, "grpo_clip_ratio", 0.2),
         advantage_eps=getattr(config, "grpo_advantage_eps", 1e-3),
+        temperature=getattr(config, "selection_temperature", 1.0),
     )
 
-    total_loss = grpo_weight * objective["policy_loss"] + kl_weight * objective["kl_loss"]
-    return {
+    training_mode = getattr(config, "grpo_training_mode", "classification_shared")
+    selection_weight = 0.0 if training_mode == "generation" else grpo_weight
+    total_loss = (
+        selection_weight * objective["policy_loss"]
+        + kl_weight * objective["kl_loss"]
+        - entropy_weight * objective["entropy_for_loss"]
+    )
+
+    generation_objective = None
+    if (
+        training_mode in {"generation", "joint"}
+        and predictions.get("generation_current_log_probs") is not None
+    ):
+        required = (
+            "generation_current_log_probs",
+            "generation_old_log_probs",
+            "generation_kl",
+        )
+        missing = [key for key in required if predictions.get(key) is None]
+        if missing:
+            raise ValueError(f"Missing generation GRPO tensors: {missing}")
+        generation_objective = compute_generation_grpo_objective(
+            current_log_probs=predictions["generation_current_log_probs"],
+            old_log_probs=predictions["generation_old_log_probs"],
+            generation_kl=predictions["generation_kl"],
+            rewards=predictions["rewards"],
+            valid_mask=predictions.get(
+                "reward_valid_mask",
+                torch.ones_like(predictions["rewards"], dtype=torch.bool),
+            ),
+            clip_ratio=getattr(config, "grpo_clip_ratio", 0.2),
+            advantage_eps=getattr(config, "grpo_advantage_eps", 1e-3),
+        )
+        total_loss = (
+            total_loss
+            + getattr(config, "generation_policy_loss_weight", 1.0)
+            * generation_objective["policy_loss"]
+            + getattr(config, "generation_kl_loss_weight", 0.1)
+            * generation_objective["kl_loss"]
+        )
+
+    result = {
         "loss": total_loss,
-        "grpo_loss": objective["policy_loss"],
+        "grpo_loss": selection_weight * objective["policy_loss"],
         "kl_loss": objective["kl_loss"],
-        **{key: value for key, value in objective.items() if key not in {"policy_loss", "kl_loss"}},
+        **{
+            key: value for key, value in objective.items()
+            if key not in {"policy_loss", "kl_loss", "entropy_for_loss"}
+        },
     }
+    if generation_objective is not None:
+        result.update(
+            {
+                "generation_grpo_loss": generation_objective["policy_loss"],
+                "generation_kl_loss": generation_objective["kl_loss"],
+                "generation_ratio_mean": generation_objective["ratio_mean"],
+                "generation_clip_fraction": generation_objective["clip_fraction"],
+            }
+        )
+    return result
 
 
 def _agent_loss(

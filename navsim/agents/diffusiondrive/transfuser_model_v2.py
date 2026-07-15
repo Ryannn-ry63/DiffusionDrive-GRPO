@@ -24,6 +24,7 @@ from navsim.agents.diffusiondrive.modules.blocks import (
     linear_relu_ln, bias_init_with_prob, gen_sineembed_for_position, GridSampleCrossBEVAttention,
 )
 from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
+from navsim.agents.diffusiondrive.diffusion_grpo import collect_generation_trace
 
 from navsim.common.dataclasses import Trajectory
 from navsim.common.dataloader import MetricCacheLoader
@@ -460,6 +461,20 @@ class TrajectoryHead(nn.Module):
         self.old_policy = None
         self._old_policy_sync_steps = int(getattr(config, "grpo_old_policy_sync_steps", 32))
         self._policy_forward_steps = 0
+        self._truncation_timestep = int(
+            getattr(config, "diffusion_truncation_timestep", 8)
+        )
+        self._roll_timesteps = tuple(
+            int(t) for t in getattr(config, "diffusion_roll_timesteps", (8, 0))
+        )
+        self._scheduler_num_inference_steps = int(
+            getattr(config, "diffusion_scheduler_num_inference_steps", 125)
+        )
+        self._grpo_training_mode = getattr(config, "grpo_training_mode", "classification_shared")
+        self._generation_ddim_eta = float(getattr(config, "generation_ddim_eta", 1.0))
+        self._generation_final_std = float(getattr(config, "generation_final_std", 0.05))
+        self._generation_sigma_min = float(getattr(config, "generation_sigma_min", 1e-4))
+        self._validate_roll_schedule()
 
         self.loss_computer = LossComputer(config)
 
@@ -525,6 +540,36 @@ class TrajectoryHead(nn.Module):
         self.old_policy = old_policy
         print("TrajectoryHead: Old policy set (periodically synchronized snapshot)")
 
+    def _validate_roll_schedule(self) -> None:
+        """Fail early for invalid or ambiguous truncated-DDIM schedules."""
+        num_train_timesteps = self.diffusion_scheduler.config.num_train_timesteps
+        if not self._roll_timesteps:
+            raise ValueError("diffusion_roll_timesteps must contain at least one timestep")
+        if any(t < 0 or t >= num_train_timesteps for t in self._roll_timesteps):
+            raise ValueError(
+                "diffusion_roll_timesteps must be within the scheduler training range"
+            )
+        if any(a <= b for a, b in zip(self._roll_timesteps, self._roll_timesteps[1:])):
+            raise ValueError("diffusion_roll_timesteps must be strictly decreasing")
+        if self._truncation_timestep < 0:
+            raise ValueError("diffusion_truncation_timestep must be non-negative")
+        if self._scheduler_num_inference_steps <= 0:
+            raise ValueError("diffusion_scheduler_num_inference_steps must be positive")
+
+    def get_roll_schedule(self):
+        """Return the explicit schedule used by training and evaluation."""
+        step_stride = (
+            self.diffusion_scheduler.config.num_train_timesteps
+            // self._scheduler_num_inference_steps
+        )
+        return {
+            "truncation_timestep": self._truncation_timestep,
+            "roll_timesteps": self._roll_timesteps,
+            "scheduler_num_inference_steps": self._scheduler_num_inference_steps,
+            "scheduler_step_stride": step_stride,
+            "transitions": tuple((t, t - step_stride) for t in self._roll_timesteps),
+        }
+
     @torch.no_grad()
     def maybe_sync_old_policy(self):
         if self.old_policy is None:
@@ -570,8 +615,12 @@ class TrajectoryHead(nn.Module):
         """Run the same two-step truncated DDIM chain used at inference."""
         bs = initial_sample.shape[0]
         device = initial_sample.device
-        self.diffusion_scheduler.set_timesteps(1000, device)
-        roll_timesteps = torch.tensor([10, 0], device=device, dtype=torch.long)
+        self.diffusion_scheduler.set_timesteps(
+            self._scheduler_num_inference_steps, device
+        )
+        roll_timesteps = torch.tensor(
+            self._roll_timesteps, device=device, dtype=torch.long
+        )
         sample = initial_sample
 
         for timestep in roll_timesteps:
@@ -611,28 +660,57 @@ class TrajectoryHead(nn.Module):
         device = ego_query.device
         plan_anchor = self.plan_anchor.unsqueeze(0).expand(bs, -1, -1, -1)
         normalized_anchor = self.norm_odo(plan_anchor)
-        trunc_timesteps = torch.full((bs,), 8, device=device, dtype=torch.long)
+        trunc_timesteps = torch.full(
+            (bs,), self._truncation_timestep, device=device, dtype=torch.long
+        )
         initial_sample = self.diffusion_scheduler.add_noise(
             original_samples=normalized_anchor,
             noise=torch.randn_like(normalized_anchor),
             timesteps=trunc_timesteps,
         )
 
-        final_poses_reg, final_poses_cls = self._run_policy_rollout(
-            self.diff_decoder, initial_sample, ego_query, agents_query, bev_feature,
-            bev_spatial_shape, status_encoding, global_img,
-        )
-        with torch.no_grad():
-            _, final_old_poses_cls = self._run_policy_rollout(
-                self.old_policy, initial_sample.detach(), ego_query.detach(),
-                agents_query.detach(), bev_feature.detach(), bev_spatial_shape,
-                status_encoding.detach(), global_img.detach() if global_img is not None else None,
+        generation_outputs = {}
+        if self._grpo_training_mode in {"generation", "joint"}:
+            trace = collect_generation_trace(
+                self,
+                initial_sample,
+                ego_query,
+                agents_query,
+                bev_feature,
+                bev_spatial_shape,
+                status_encoding,
+                global_img,
             )
-            _, final_ref_poses_cls = self._run_policy_rollout(
-                self.ref_policy, initial_sample.detach(), ego_query.detach(),
-                agents_query.detach(), bev_feature.detach(), bev_spatial_shape,
-                status_encoding.detach(), global_img.detach() if global_img is not None else None,
+            final_poses_reg = trace["trajectories"]
+            final_poses_cls = (
+                trace["current_cls"]
+                if self._grpo_training_mode == "joint"
+                else trace["reference_cls"]
             )
+            final_old_poses_cls = trace["old_cls"]
+            final_ref_poses_cls = trace["reference_cls"]
+            generation_outputs = {
+                "generation_current_log_probs": trace["current_log_probs"],
+                "generation_old_log_probs": trace["old_log_probs"],
+                "generation_reference_log_probs": trace["reference_log_probs"],
+                "generation_kl": trace["generation_kl"],
+            }
+        else:
+            final_poses_reg, final_poses_cls = self._run_policy_rollout(
+                self.diff_decoder, initial_sample, ego_query, agents_query, bev_feature,
+                bev_spatial_shape, status_encoding, global_img,
+            )
+            with torch.no_grad():
+                _, final_old_poses_cls = self._run_policy_rollout(
+                    self.old_policy, initial_sample.detach(), ego_query.detach(),
+                    agents_query.detach(), bev_feature.detach(), bev_spatial_shape,
+                    status_encoding.detach(), global_img.detach() if global_img is not None else None,
+                )
+                _, final_ref_poses_cls = self._run_policy_rollout(
+                    self.ref_policy, initial_sample.detach(), ego_query.detach(),
+                    agents_query.detach(), bev_feature.detach(), bev_spatial_shape,
+                    status_encoding.detach(), global_img.detach() if global_img is not None else None,
+                )
 
         rewards = None
         reward_valid_mask = None
@@ -674,6 +752,7 @@ class TrajectoryHead(nn.Module):
             "reward_valid_mask": reward_valid_mask,
             "num_modes": num_modes,
             "mode_idx": mode_idx,
+            **generation_outputs,
         }
 
     def forward_train(self, ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, targets=None, global_img=None, tokens_list=None) -> Dict[str, torch.Tensor]:
@@ -800,21 +879,23 @@ class TrajectoryHead(nn.Module):
         return torch.stack(samples, dim=0)
 
     def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img,tokens_list=None) -> Dict[str, torch.Tensor]:
-        step_num = 2
         bs = ego_query.shape[0]
         device = ego_query.device
-        self.diffusion_scheduler.set_timesteps(1000, device)
-        step_ratio = 20 / step_num
-        #step_ratio = 64 / step_num
-        roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
-        roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
+        self.diffusion_scheduler.set_timesteps(
+            self._scheduler_num_inference_steps, device
+        )
+        roll_timesteps = torch.tensor(
+            self._roll_timesteps, device=device, dtype=torch.long
+        )
 
 
         # 1. add truncated noise to the plan anchor
         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
         img = self.norm_odo(plan_anchor)
         noise = self._sample_evaluation_noise(img, tokens_list)
-        trunc_timesteps = torch.ones((bs,), device=device, dtype=torch.long) * 8
+        trunc_timesteps = torch.full(
+            (bs,), self._truncation_timestep, device=device, dtype=torch.long
+        )
         img = self.diffusion_scheduler.add_noise(original_samples=img, noise=noise, timesteps=trunc_timesteps)
         initial_sample = img.detach().clone()
         noisy_trajs = self.denorm_odo(img)
@@ -892,6 +973,7 @@ class TrajectoryHead(nn.Module):
 
         output_dict = {
         "trajectory": best_reg,                    # 主输出（必需）
+        "final_poses_reg": final_poses_reg,
         "final_poses_cls": final_poses_cls,        # GRPO损失必需
         "final_ref_poses_cls": final_ref_poses_cls,
         "final_old_poses_cls": final_poses_cls,

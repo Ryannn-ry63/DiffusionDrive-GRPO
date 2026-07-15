@@ -61,17 +61,37 @@ class AgentLightningModule(pl.LightningModule):
         decoder = getattr(trajectory_head, "diff_decoder", None)
         if decoder is None:
             return
-        squared_norm = torch.zeros((), device=self.device)
-        for parameter in decoder.parameters():
-            if parameter.grad is not None:
-                squared_norm = squared_norm + parameter.grad.detach().float().square().sum()
-        grad_norm = squared_norm.sqrt()
-        if not torch.isfinite(grad_norm):
+        squared_norms = {
+            "shared": torch.zeros((), device=self.device),
+            "regression": torch.zeros((), device=self.device),
+            "classification": torch.zeros((), device=self.device),
+        }
+        for name, parameter in decoder.named_parameters():
+            if parameter.grad is None:
+                continue
+            if "plan_reg_branch" in name:
+                group = "regression"
+            elif "plan_cls_branch" in name:
+                group = "classification"
+            else:
+                group = "shared"
+            squared_norms[group] = (
+                squared_norms[group] + parameter.grad.detach().float().square().sum()
+            )
+
+        grad_norms = {name: value.sqrt() for name, value in squared_norms.items()}
+        total_grad_norm = sum(squared_norms.values()).sqrt()
+        if not all(torch.isfinite(value) for value in (*grad_norms.values(), total_grad_norm)):
             raise FloatingPointError("Non-finite diff_decoder gradient norm")
         self.log(
-            "train/diff_decoder_grad_norm", grad_norm,
+            "train/diff_decoder_grad_norm", total_grad_norm,
             on_step=True, on_epoch=True, prog_bar=True, sync_dist=True,
         )
+        for group, grad_norm in grad_norms.items():
+            self.log(
+                f"train/{group}_grad_norm", grad_norm,
+                on_step=True, on_epoch=True, prog_bar=False, sync_dist=True,
+            )
 
     def configure_optimizers(self):
         """Inherited, see superclass."""

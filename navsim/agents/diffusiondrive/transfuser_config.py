@@ -99,6 +99,18 @@ class TransfuserConfig:
     grpo_clip_ratio: float = 0.2
     grpo_advantage_eps: float = 1e-3
     grpo_old_policy_sync_steps: int = 32
+    grpo_training_mode: str = "classification_shared"
+    selection_temperature: float = 1.0
+    selection_entropy_weight: float = 0.0
+    generation_policy_loss_weight: float = 1.0
+    generation_kl_loss_weight: float = 0.1
+    generation_ddim_eta: float = 1.0
+    generation_final_std: float = 0.05
+    generation_sigma_min: float = 1e-4
+    # Stage-0 audited schedule: the noise timestep matches the first DDIM step.
+    diffusion_truncation_timestep: int = 8
+    diffusion_roll_timesteps: Tuple[int, ...] = (8, 0)
+    diffusion_scheduler_num_inference_steps: int = 125
     agent_class_weight: float = 10.0
     agent_box_weight: float = 1.0
     bev_semantic_weight: float = 14.0

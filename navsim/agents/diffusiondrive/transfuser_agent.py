@@ -72,9 +72,32 @@ class TransfuserAgent(AbstractAgent):
         # 1. 冻结整个模型
         self._transfuser_model.requires_grad_(False)
 
-        # 2. 只解冻diff_decoder
-        self._transfuser_model._trajectory_head.diff_decoder.requires_grad_(True)
-        print("✓ 参数冻结完成:只训练diff_decoder")
+        # 2. Choose shared-feature training or a fixed-generator baseline.
+        training_mode = getattr(config, "grpo_training_mode", "classification_shared")
+        trajectory_head = self._transfuser_model._trajectory_head
+        if training_mode == "classification_shared":
+            trajectory_head.diff_decoder.requires_grad_(True)
+        elif training_mode == "classification_head":
+            trajectory_head.diff_decoder.layers[-1].task_decoder.plan_cls_branch.requires_grad_(
+                True
+            )
+        elif training_mode in {"generation", "joint"}:
+            trajectory_head.diff_decoder.requires_grad_(True)
+            if training_mode == "generation":
+                for layer in trajectory_head.diff_decoder.layers:
+                    layer.task_decoder.plan_cls_branch.requires_grad_(False)
+        else:
+            raise ValueError(
+                "grpo_training_mode must be one of "
+                "{'classification_shared', 'classification_head', 'generation', 'joint'}; "
+                f"got {training_mode!r}"
+            )
+        trainable_params = sum(
+            parameter.numel()
+            for parameter in self._transfuser_model.parameters()
+            if parameter.requires_grad
+        )
+        print(f"✓ GRPO train mode={training_mode}; trainable parameters={trainable_params:,}")
 
         ref_policy = copy.deepcopy(self._transfuser_model._trajectory_head.diff_decoder)
         reference_checkpoint = torch.load(self._reference_checkpoint_path, map_location="cpu")

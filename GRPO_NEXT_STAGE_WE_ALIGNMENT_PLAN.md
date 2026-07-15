@@ -227,3 +227,69 @@ Stage 0 不通过时不训练。
 6. 依次运行 B、D、E 的 smoke 和门控短训；所有 Python 均使用 `navsim` 环境。
 
 在这六步完成前，不建议直接延长现有分类 GRPO 的 epoch，也不建议先跑完整 navtest。
+## 9. 2026-07-15 执行记录
+
+### 9.1 Schedule 与纯选择对照
+
+固定、排序后的 1024-token common holdout 结果：
+
+| 配置 | selected | oracle | regret | candidate mean |
+|---|---:|---:|---:|---:|
+| 历史不一致 schedule：t8 + [10,0] / 1000 | 0.744300 | 0.920899 | 0.176600 | 0.547196 |
+| 合法 t10 + [10,0] / 100 | 0.756833 | 0.915626 | 0.158794 | 0.665828 |
+| 合法 t8 + [8,0] / 125（采用） | **0.757878** | **0.917801** | 0.159923 | 0.660489 |
+
+评测代码已去除 forward_test 中初始 timestep 的硬编码，之后 summary 中的
+truncation timestep 与实际加噪 timestep 一致。当前 D/E 实验均使用未受该问题影响的
+t8 + [8,0] / 125。
+
+Stage 1 只训练最后 classification branch（132,865 个参数），三个配置在相同 1024
+holdout 上的 selected 分别为 0.755853、0.755975、0.755958，均低于
+0.757878 base。纯分类方案 B 因此停止扩训。
+
+### 9.2 生成与联合策略闭环
+
+已完成：
+
+- stochastic DDIM behavior action；
+- old/current/reference 在同一 state/action trace 上重算 log-prob；
+- 两步 generation PPO clip 与 fixed-reference Gaussian KL；
+- generation、joint 显式训练模式；
+- 无 imitation loss、无 GT trajectory regression loss；
+- 感知全冻结，只解冻 DiT planning decoder；
+- 12 个 schedule/objective/probability 单测全部通过。
+
+真实一 batch 梯度审计：
+
+| 模式 | shared grad | regression grad | classification grad |
+|---|---:|---:|---:|
+| generation-only D | 6.807 | 26.217 | **0.000** |
+| joint E | 7.204 | 26.217 | 1.255 |
+
+这证明生成 reward 对 regression branch 有直接非零梯度，D 的 selector 同时保持严格冻结。
+
+### 9.3 128-token 门控短训与严格 1024 结果
+
+两组均训练 2 epoch、每 epoch 128 step，LR 1e-6：
+
+| checkpoint | selected | 相对 base | oracle | 相对 base | candidate mean |
+|---|---:|---:|---:|---:|---:|
+| base t8 | 0.757878 | — | 0.917801 | — | 0.660489 |
+| D epoch0 / 128 step | **0.761178** | **+0.003299** | 0.918610 | +0.000809 | 0.660757 |
+| E epoch0 / 128 step | 0.759181 | +0.001302 | 0.918590 | +0.000789 | 0.660731 |
+| D epoch1 / 256 step | 0.757323 | -0.000555 | **0.919837** | **+0.002036** | **0.661787** |
+| E epoch1 / 256 step | 0.756787 | -0.001091 | 0.919126 | +0.001325 | 0.661690 |
+
+D epoch1 的 oracle 配对 bootstrap 95% CI 为 [+0.000181, +0.004502]，首次得到
+候选上限的正向信号；但 selected 未过 +0.005 门槛。D epoch0 的 selected 最好，
+而继续训练提高 oracle、降低 selected，说明生成分布逐渐与 selector 失配，不能直接延长 epoch。
+
+### 9.4 下一决策
+
+当前不进入完整 navtest。下一小阶段优先级：
+
+1. 保留 D epoch0 为当前 best common checkpoint；
+2. 建立固定 rare/common token 清单与 failure-aware sampling；
+3. 以 128 step 早停为中心，仅小网格 generation LR / final action std / KL；
+4. joint selector 降低 LR 或延迟启用，先让 generation 获得稳定 oracle 增益，再做短程 selector 对齐；
+5. 只有 fixed common selected >= +0.005、rare selected >= +0.02 且两个 seed 同向，才进入 512/full/navtest。

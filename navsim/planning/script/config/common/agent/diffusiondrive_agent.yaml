@@ -13,6 +13,19 @@ config:
 
   latent: False
 
+  grpo_training_mode: classification_shared
+  selection_temperature: 1.0
+  selection_entropy_weight: 0.0
+  generation_policy_loss_weight: 1.0
+  generation_kl_loss_weight: 0.1
+  generation_ddim_eta: 1.0
+  generation_final_std: 0.05
+  generation_sigma_min: 1e-4
+  kl_loss_weight: 0.01
+  diffusion_truncation_timestep: 8
+  diffusion_roll_timesteps: [8, 0]
+  diffusion_scheduler_num_inference_steps: 125
+
 checkpoint_path: /inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2026.04.14.03.49.58/lightning_logs/version_0/checkpoints/eval_model
 reference_checkpoint_path: /inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2026.04.14.03.49.58/lightning_logs/version_0/checkpoints/eval_model
 lr: 1e-5
