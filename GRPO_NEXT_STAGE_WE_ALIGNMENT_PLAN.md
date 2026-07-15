@@ -293,3 +293,29 @@ D epoch1 的 oracle 配对 bootstrap 95% CI 为 [+0.000181, +0.004502]，首次�
 3. 以 128 step 早停为中心，仅小网格 generation LR / final action std / KL；
 4. joint selector 降低 LR 或延迟启用，先让 generation 获得稳定 oracle 增益，再做短程 selector 对齐；
 5. 只有 fixed common selected >= +0.005、rare selected >= +0.02 且两个 seed 同向，才进入 512/full/navtest。
+### 9.5 Common-only generation 小网格与停止结论
+
+在 D epoch0 周围追加 128-step generation-only 小网格：
+
+| 配置 | selected | 相对 base | oracle | 相对 base |
+|---|---:|---:|---:|---:|
+| LR 2e-6 / final std .05 | 0.760274 | +0.002396 | 0.919161 | +0.001360 |
+| LR 3e-6 / final std .05 | 0.759107 | +0.001228 | 0.920028 | +0.002226 |
+| LR 2e-6 / final std .10 | 0.760559 | +0.002681 | 0.918346 | +0.000545 |
+
+更强更新继续体现“oracle 上升、selected 跟不上”的趋势，没有超过 LR 1e-6 的 D epoch0。
+
+随后从 best D epoch0 出发，只训练 132K classification 参数做 sequential selector alignment：
+
+| 配置 | selected | 相对 base |
+|---|---:|---:|
+| S1：temp 1.0 / entropy 0 / LR 3e-6 | 0.760423 | +0.002545 |
+| S2：temp 1.5 / entropy .01 / LR 1e-5 | 0.759229 | +0.001351 |
+| S3：temp 1.5 / entropy .005 / LR 3e-6 | 0.760391 | +0.002513 |
+
+三组都没有超过未做 selector alignment 的 D epoch0。best D epoch0 的 selected 配对
+bootstrap 95% CI 为 [+0.000782, +0.006601]，说明 common proxy 上方向可信；但
++0.003299 仍低于 +0.005 工程门槛，也不能外推为 navtest 0.848746 已提升。
+
+因此停止 common-only 超参搜索。下一次实验必须先完成 rare/failure-aware token
+构建与固定 rare holdout；在此之前不跑完整 navtest，也不继续堆 classification 超参。
