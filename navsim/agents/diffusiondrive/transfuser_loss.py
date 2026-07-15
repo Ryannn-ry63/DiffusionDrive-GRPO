@@ -8,52 +8,161 @@ from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 from navsim.agents.diffusiondrive.transfuser_features import BoundingBox2DIndex
 
 
-# TODO: 通读一下，其实compute loss被调用了两次：一次在_trajectory_head，其实是对每一个轨迹，都计算了loss，但没有真正用于梯度回传；
-# 一次是在navsim/planning/training/agent_lightning_module.py L32里面，最终计算得到的loss dict才会用于下游计算。
-# TODO: 在 _trajectory_head 里的compute loss可以注释了，其实不对下游训练产生影响；记得把计算grpo loss的逻辑，从_trajectory_head 的forward中，搬到这里来
-# 记住我们只finetune _trajectory_head 
+def compute_group_relative_advantages(
+    rewards: torch.Tensor,
+    valid_mask: torch.Tensor,
+    eps: float = 1e-3,
+):
+    """Normalize rewards within each scene while excluding invalid modes."""
+    if rewards.ndim != 2 or valid_mask.shape != rewards.shape:
+        raise ValueError("rewards and valid_mask must both have shape [batch, num_modes]")
+
+    rewards = rewards.float()
+    valid_mask = valid_mask.bool() & torch.isfinite(rewards)
+    clean_rewards = torch.where(valid_mask, rewards, torch.zeros_like(rewards))
+    counts = valid_mask.sum(dim=-1, keepdim=True)
+    safe_counts = counts.clamp_min(1)
+    means = clean_rewards.sum(dim=-1, keepdim=True) / safe_counts
+    centered = torch.where(valid_mask, clean_rewards - means, torch.zeros_like(rewards))
+    variances = centered.square().sum(dim=-1, keepdim=True) / safe_counts
+    stds = variances.sqrt()
+    group_valid = (counts.squeeze(-1) >= 2) & (stds.squeeze(-1) >= eps)
+
+    advantages = centered / stds.clamp_min(eps)
+    advantages = torch.where(
+        valid_mask & group_valid.unsqueeze(-1), advantages, torch.zeros_like(advantages)
+    ).detach()
+    return advantages, valid_mask, group_valid, means.squeeze(-1), stds.squeeze(-1)
+
+
+def compute_grpo_objective(
+    current_logits: torch.Tensor,
+    old_logits: torch.Tensor,
+    reference_logits: torch.Tensor,
+    rewards: torch.Tensor,
+    valid_mask: torch.Tensor,
+    clip_ratio: float = 0.2,
+    advantage_eps: float = 1e-3,
+):
+    """Exact categorical, group-relative clipped policy objective over all modes."""
+    if not (current_logits.shape == old_logits.shape == reference_logits.shape == rewards.shape):
+        raise ValueError("policy logits and rewards must have identical [batch, num_modes] shapes")
+
+    current_logits = current_logits.float()
+    old_logits = old_logits.detach().float()
+    reference_logits = reference_logits.detach().float()
+    advantages, valid_mask, group_valid, reward_mean, reward_std = (
+        compute_group_relative_advantages(rewards, valid_mask, advantage_eps)
+    )
+
+    current_log_probs = F.log_softmax(current_logits, dim=-1)
+    old_log_probs = F.log_softmax(old_logits, dim=-1)
+    reference_log_probs = F.log_softmax(reference_logits, dim=-1)
+    old_weights = old_log_probs.exp() * valid_mask.float()
+    old_weights = old_weights / old_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    log_ratio = (current_log_probs - old_log_probs).clamp(min=-20.0, max=20.0)
+    ratio = log_ratio.exp()
+    surrogate = torch.minimum(
+        ratio * advantages,
+        ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * advantages,
+    )
+    per_scene_policy_loss = -(old_weights * surrogate).sum(dim=-1)
+    policy_loss = (
+        per_scene_policy_loss[group_valid].mean()
+        if group_valid.any()
+        else current_logits.sum() * 0.0
+    )
+
+    current_probs = current_log_probs.exp()
+    kl_loss = (current_probs * (current_log_probs - reference_log_probs)).sum(dim=-1).mean()
+    entropy = -(current_probs * current_log_probs).sum(dim=-1).mean()
+
+    selected_idx = current_logits.argmax(dim=-1)
+    clean_rewards = torch.nan_to_num(rewards.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    selected_reward_by_scene = clean_rewards.gather(1, selected_idx.unsqueeze(-1)).squeeze(-1)
+    oracle_reward_by_scene = clean_rewards.masked_fill(~valid_mask, float("-inf")).max(dim=-1).values
+    has_valid = valid_mask.any(dim=-1)
+    selected_is_valid = valid_mask.gather(1, selected_idx.unsqueeze(-1)).squeeze(-1)
+    metric_valid = has_valid & selected_is_valid
+    selected_reward = (
+        selected_reward_by_scene[metric_valid].mean()
+        if metric_valid.any() else rewards.new_zeros(())
+    )
+    oracle_reward = (
+        oracle_reward_by_scene[metric_valid].mean()
+        if metric_valid.any() else rewards.new_zeros(())
+    )
+
+    clipped = (ratio < 1.0 - clip_ratio) | (ratio > 1.0 + clip_ratio)
+    oracle_idx = clean_rewards.masked_fill(~valid_mask, float("-inf")).argmax(dim=-1)
+    oracle_hit_rate = (
+        (selected_idx[metric_valid] == oracle_idx[metric_valid]).float().mean()
+        if metric_valid.any() else rewards.new_zeros(())
+    )
+    clip_fraction_per_scene = (old_weights * clipped.float()).sum(dim=-1)
+    clip_fraction = (
+        clip_fraction_per_scene[group_valid].mean()
+        if group_valid.any()
+        else rewards.new_zeros(())
+    )
+
+    return {
+        "policy_loss": policy_loss,
+        "kl_loss": kl_loss,
+        "entropy": entropy.detach(),
+        "reward_mean": reward_mean.mean().detach(),
+        "reward_std": reward_std.mean().detach(),
+        "selected_reward": selected_reward.detach(),
+        "oracle_reward": oracle_reward.detach(),
+        "selection_regret": (oracle_reward - selected_reward).detach(),
+        "oracle_hit_rate": oracle_hit_rate.detach(),
+        "valid_mode_fraction": valid_mask.float().mean().detach(),
+        "valid_group_fraction": group_valid.float().mean().detach(),
+        "zero_advantage_fraction": (1.0 - group_valid.float().mean()).detach(),
+        "ratio_mean": (old_weights * ratio).sum(dim=-1).mean().detach(),
+        "clip_fraction": clip_fraction.detach(),
+    }
 
 def transfuser_loss(
     targets: Dict[str, torch.Tensor], predictions: Dict[str, torch.Tensor], config: TransfuserConfig
 ):
-    """
-    Combined loss: IL regression (anchors trajectory quality) + GRPO (nudges mode selection) + KL.
-    """
-    device = predictions["trajectory"].device
-    reg_weight = getattr(config, 'trajectory_reg_weight', 8.0)
-    grpo_weight = getattr(config, 'policy_loss_weight', 0.1)
-    kl_weight = getattr(config, 'kl_loss_weight', 0.1)
-
-    # IL regression loss: always computed, protects trajectory quality through shared features
-    reg_loss = F.l1_loss(predictions["trajectory"], targets["trajectory"])
+    """Pure classification GRPO objective; intentionally contains no imitation loss."""
+    current_logits = predictions["final_poses_cls"]
+    grpo_weight = getattr(config, "policy_loss_weight", 1.0)
+    kl_weight = getattr(config, "kl_loss_weight", 0.01)
 
     if "rewards" not in predictions or predictions["rewards"] is None:
-        # Validation: only regression loss (now we have a real validation signal)
+        zero = current_logits.sum() * 0.0
         return {
-            "loss": reg_weight * reg_loss,
-            "grpo_loss": torch.tensor(0.0, device=device),
-            "kl_loss": torch.tensor(0.0, device=device),
-            "reg_loss": reg_weight * reg_loss,
+            "loss": zero,
+            "grpo_loss": zero.detach(),
+            "kl_loss": zero.detach(),
         }
 
-    # GRPO policy gradient loss
-    grpo_loss = compute_grpo_loss3(
-        current_poses_cls=predictions["final_poses_cls"],
-        ref_poses_cls=predictions["final_ref_poses_cls"],
+    if predictions.get("final_old_poses_cls") is None:
+        raise ValueError("GRPO training requires final_old_poses_cls")
+    if predictions.get("final_ref_poses_cls") is None:
+        raise ValueError("GRPO training requires final_ref_poses_cls")
+
+    objective = compute_grpo_objective(
+        current_logits=current_logits,
+        old_logits=predictions["final_old_poses_cls"],
+        reference_logits=predictions["final_ref_poses_cls"],
         rewards=predictions["rewards"],
-        num_modes=predictions.get("num_modes", 20),
-        clip_ratio=0.2,
+        valid_mask=predictions.get(
+            "reward_valid_mask", torch.ones_like(predictions["rewards"], dtype=torch.bool)
+        ),
+        clip_ratio=getattr(config, "grpo_clip_ratio", 0.2),
+        advantage_eps=getattr(config, "grpo_advantage_eps", 1e-3),
     )
 
-    kl_loss = predictions.get("kl_div", torch.tensor(0.0, device=device))
-
-    total_loss = reg_weight * reg_loss + grpo_weight * grpo_loss + kl_weight * kl_loss
-
+    total_loss = grpo_weight * objective["policy_loss"] + kl_weight * objective["kl_loss"]
     return {
-        'loss': total_loss,
-        'grpo_loss': grpo_weight * grpo_loss,
-        'kl_loss': kl_weight * kl_loss,
-        'reg_loss': reg_weight * reg_loss,
+        "loss": total_loss,
+        "grpo_loss": objective["policy_loss"],
+        "kl_loss": objective["kl_loss"],
+        **{key: value for key, value in objective.items() if key not in {"policy_loss", "kl_loss"}},
     }
 
 

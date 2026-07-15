@@ -1,4 +1,5 @@
 from typing import Any, List, Dict, Optional, Union
+from pathlib import Path
 
 import copy
 import torch
@@ -6,6 +7,7 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
@@ -37,9 +39,8 @@ class TransfuserAgent(AbstractAgent):
         self,
         config: TransfuserConfig,
         lr: float,
-        checkpoint_path: Optional[str] = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2026.04.14.11.33.28/lightning_logs/version_0/checkpoints/eval_model"
-        #checkpoint_path: Optional[str] = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2026.04.14.06.57.53/lightning_logs/version_0/checkpoints/eval_model"
-        #checkpoint_path: Optional[str] = "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2025.11.30.10.06.04/lightning_logs/version_0/checkpoints/model.ckpt",
+        checkpoint_path: Optional[str] = None,
+        reference_checkpoint_path: Optional[str] = None,
     ):
         """
         Initializes TransFuser agent.
@@ -51,8 +52,20 @@ class TransfuserAgent(AbstractAgent):
 
         self._config = config
         self._lr = lr
+        self._evaluation_token: Optional[str] = None
 
+        if not checkpoint_path:
+            raise ValueError("A pretrained DiffusionDrive checkpoint is required for GRPO training.")
+        if not Path(checkpoint_path).is_file():
+            raise FileNotFoundError(f"DiffusionDrive checkpoint does not exist: {checkpoint_path}")
+
+        reference_checkpoint_path = reference_checkpoint_path or checkpoint_path
+        if not Path(reference_checkpoint_path).is_file():
+            raise FileNotFoundError(
+                f"DiffusionDrive reference checkpoint does not exist: {reference_checkpoint_path}"
+            )
         self._checkpoint_path = checkpoint_path
+        self._reference_checkpoint_path = reference_checkpoint_path
         self._transfuser_model = TransfuserModel(config)
         self.init_from_pretrained()
 
@@ -64,36 +77,71 @@ class TransfuserAgent(AbstractAgent):
         print("✓ 参数冻结完成:只训练diff_decoder")
 
         ref_policy = copy.deepcopy(self._transfuser_model._trajectory_head.diff_decoder)
+        reference_checkpoint = torch.load(self._reference_checkpoint_path, map_location="cpu")
+        if "state_dict" not in reference_checkpoint:
+            raise KeyError(f"Reference checkpoint has no state_dict: {self._reference_checkpoint_path}")
+        normalized_reference_state = {
+            (key[len("agent."):] if key.startswith("agent.") else key): value
+            for key, value in reference_checkpoint["state_dict"].items()
+        }
+        decoder_prefix = "_transfuser_model._trajectory_head.diff_decoder."
+        reference_decoder_state = {
+            key[len(decoder_prefix):]: value
+            for key, value in normalized_reference_state.items()
+            if key.startswith(decoder_prefix)
+        }
+        if not reference_decoder_state:
+            raise RuntimeError(
+                f"Reference checkpoint has no diff_decoder weights: {self._reference_checkpoint_path}"
+            )
+        ref_policy.load_state_dict(reference_decoder_state, strict=True)
         ref_policy.requires_grad_(False)
-        ref_policy.eval()  # 确保参考策略在评估模式下运行（禁用dropout等）
+        ref_policy.eval()
+
+        old_policy = copy.deepcopy(self._transfuser_model._trajectory_head.diff_decoder)
+        old_policy.requires_grad_(False)
+        old_policy.eval()
 
         # 3. 设置到TrajectoryHead中
         self._transfuser_model._trajectory_head.set_ref_policy(ref_policy)
+        self._transfuser_model._trajectory_head.set_old_policy(old_policy)
 
-        print("✓ 参考策略创建完成（预训练权重的冻结拷贝）")
+        print(
+            "✓ Reference policy loaded from "
+            f"{self._reference_checkpoint_path}; old policy copied from current checkpoint"
+        )
         
     def init_from_pretrained(self):
-        # import ipdb; ipdb.set_trace()
-        if self._checkpoint_path:
-            if torch.cuda.is_available():
-                checkpoint = torch.load(self._checkpoint_path)
-            else:
-                checkpoint = torch.load(self._checkpoint_path, map_location=torch.device('cpu'))
-            
-            state_dict = checkpoint['state_dict']
-            
-            # Remove 'agent.' prefix from keys if present
-            state_dict = {k.replace('agent.', ''): v for k, v in state_dict.items()}
-            
-            # Load state dict and get info about missing and unexpected keys
-            missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
-            
-            if missing_keys:
-                print(f"Missing keys when loading pretrained weights: {missing_keys}")
-            if unexpected_keys:
-                print(f"Unexpected keys when loading pretrained weights: {unexpected_keys}")
-        else:
-            print("No checkpoint path provided. Initializing from scratch.")
+        checkpoint = torch.load(self._checkpoint_path, map_location="cpu")
+        if "state_dict" not in checkpoint:
+            raise KeyError(f"Checkpoint has no state_dict: {self._checkpoint_path}")
+
+        state_dict = {
+            (key[len("agent."):] if key.startswith("agent.") else key): value
+            for key, value in checkpoint["state_dict"].items()
+        }
+        missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
+        policy_snapshot_prefixes = (
+            "_transfuser_model._trajectory_head.ref_policy.",
+            "_transfuser_model._trajectory_head.old_policy.",
+        )
+        unexpected_keys = [key for key in unexpected_keys if not key.startswith(policy_snapshot_prefixes)]
+
+        critical_prefixes = (
+            "_transfuser_model._backbone.",
+            "_transfuser_model._trajectory_head.diff_decoder.",
+        )
+        critical_missing = [key for key in missing_keys if key.startswith(critical_prefixes)]
+        if critical_missing:
+            raise RuntimeError(
+                "Checkpoint is missing critical pretrained weights: "
+                + ", ".join(critical_missing[:20])
+            )
+        if missing_keys:
+            print(f"Non-critical missing keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"Unexpected checkpoint keys: {unexpected_keys}")
+        print(f"✓ Loaded pretrained checkpoint: {self._checkpoint_path}")
     def name(self) -> str:
         """Inherited, see superclass."""
         return self.__class__.__name__
@@ -121,8 +169,39 @@ class TransfuserAgent(AbstractAgent):
         """Inherited, see superclass."""
         return [TransfuserFeatureBuilder(config=self._config)]
 
+    def _enforce_frozen_eval_mode(self) -> None:
+        """Keep frozen perception/planning context deterministic during GRPO."""
+        model = self._transfuser_model
+        frozen_modules = (
+            model._backbone,
+            model._tf_decoder,
+            model._agent_head,
+            model._bev_semantic_head,
+            model._bev_downscale,
+            model._status_encoding,
+            model._keyval_embedding,
+            model._query_embedding,
+            model.bev_proj,
+            model._trajectory_head.plan_anchor_encoder,
+            model._trajectory_head.time_mlp,
+        )
+        for module in frozen_modules:
+            module.eval()
+        model._trajectory_head.diff_decoder.eval()
+        if model._trajectory_head.ref_policy is not None:
+            model._trajectory_head.ref_policy.eval()
+        if model._trajectory_head.old_policy is not None:
+            model._trajectory_head.old_policy.eval()
+
+    def set_evaluation_token(self, token: str) -> None:
+        """Provide the scenario identity used for deterministic diffusion noise."""
+        self._evaluation_token = str(token)
+
     def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None, tokens_list=None) -> Dict[str, torch.Tensor]:
         """Inherited, see superclass."""
+        self._enforce_frozen_eval_mode()
+        if tokens_list is None and not self.training and self._evaluation_token is not None:
+            tokens_list = (self._evaluation_token,)
         return self._transfuser_model(features, targets=targets, tokens_list=tokens_list)
         
     def compute_loss(
@@ -139,7 +218,10 @@ class TransfuserAgent(AbstractAgent):
         return self.get_coslr_optimizers()
 
     def get_step_lr_optimizers(self):
-        optimizer = torch.optim.Adam(self._transfuser_model.parameters(), lr=self._lr, weight_decay=self._config.weight_decay)
+        optimizer = torch.optim.Adam(
+            [p for p in self._transfuser_model.parameters() if p.requires_grad],
+            lr=self._lr, weight_decay=self._config.weight_decay,
+        )
         scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=self._config.lr_steps, gamma=0.1)
         return {'optimizer': optimizer, 'lr_scheduler': scheduler}
 
@@ -166,6 +248,8 @@ class TransfuserAgent(AbstractAgent):
             pgs = [[] for _ in paramwise_cfg['name']]
 
             for k, v in self._transfuser_model.named_parameters():
+                if not v.requires_grad:
+                    continue
                 in_param_group = True
                 for i, (pattern, pg_cfg) in enumerate(paramwise_cfg['name'].items()):
                     if pattern in k:
@@ -174,7 +258,7 @@ class TransfuserAgent(AbstractAgent):
                 if in_param_group:
                     params.append(v)
         else:
-            params = self._transfuser_model.parameters()
+            params = [p for p in self._transfuser_model.parameters() if p.requires_grad]
         
         optimizer = build_from_configs(optim, optimizer_cfg, params=params)
         # import ipdb; ipdb.set_trace()
@@ -201,4 +285,15 @@ class TransfuserAgent(AbstractAgent):
 
     def get_training_callbacks(self) -> List[pl.Callback]:
         """Inherited, see superclass."""
-        return [TransfuserCallback(self._config)]
+        selection_checkpoint = ModelCheckpoint(
+            filename="grpo-{epoch:02d}-{step}",
+            monitor="val/selected_reward_epoch",
+            mode="max",
+            save_top_k=2,
+            save_last=True,
+            auto_insert_metric_name=False,
+        )
+        return [
+            TransfuserCallback(self._config),
+            selection_checkpoint,
+        ]

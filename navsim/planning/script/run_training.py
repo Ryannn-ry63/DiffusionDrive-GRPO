@@ -11,7 +11,7 @@ import pytorch_lightning as pl
 
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import SceneFilter
-from navsim.common.dataloader import SceneLoader
+from navsim.common.dataloader import MetricCacheLoader, SceneLoader
 from navsim.planning.training.dataset import CacheOnlyDataset, Dataset
 from navsim.planning.training.agent_lightning_module import AgentLightningModule
 
@@ -149,6 +149,21 @@ def main(cfg: DictConfig) -> None:
     else:
         logger.info("Building SceneLoader")
         train_data, val_data = build_datasets(cfg, agent)
+
+    agent_config = getattr(agent, "_config", None)
+    if getattr(agent_config, "filter_training_by_metric_cache", False):
+        metric_cache_path = Path(agent_config.metric_cache_path)
+        assert metric_cache_path.is_dir(), f"Metric cache path {metric_cache_path} does not exist!"
+        metric_tokens = set(MetricCacheLoader(metric_cache_path).tokens)
+        num_train_before, num_val_before = len(train_data), len(val_data)
+        train_data.tokens = [token for token in train_data.tokens if token in metric_tokens]
+        val_data.tokens = [token for token in val_data.tokens if token in metric_tokens]
+        logger.info(
+            "Filtered datasets to rewardable metric-cache tokens: train %d/%d, val %d/%d",
+            len(train_data), num_train_before, len(val_data), num_val_before,
+        )
+        assert len(train_data) > 0, "No training token overlaps metric_cache_path!"
+        assert len(val_data) > 0, "No validation token overlaps metric_cache_path!"
 
     logger.info("Building Datasets")
     train_dataloader = DataLoader(train_data, collate_fn=custom_collate_fn,  **cfg.dataloader.params, shuffle=True)

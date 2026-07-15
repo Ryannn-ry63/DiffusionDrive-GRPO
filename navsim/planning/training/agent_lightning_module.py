@@ -1,4 +1,5 @@
 import pytorch_lightning as pl
+import torch
 
 from torch import Tensor
 from typing import Dict, Tuple
@@ -52,6 +53,25 @@ class AgentLightningModule(pl.LightningModule):
         :return: scalar loss
         """
         return self._step(batch, "val")
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        """Log the trainable planning decoder gradient norm for GRPO diagnostics."""
+        model = getattr(self.agent, "_transfuser_model", None)
+        trajectory_head = getattr(model, "_trajectory_head", None)
+        decoder = getattr(trajectory_head, "diff_decoder", None)
+        if decoder is None:
+            return
+        squared_norm = torch.zeros((), device=self.device)
+        for parameter in decoder.parameters():
+            if parameter.grad is not None:
+                squared_norm = squared_norm + parameter.grad.detach().float().square().sum()
+        grad_norm = squared_norm.sqrt()
+        if not torch.isfinite(grad_norm):
+            raise FloatingPointError("Non-finite diff_decoder gradient norm")
+        self.log(
+            "train/diff_decoder_grad_norm", grad_norm,
+            on_step=True, on_epoch=True, prog_bar=True, sync_dist=True,
+        )
 
     def configure_optimizers(self):
         """Inherited, see superclass."""

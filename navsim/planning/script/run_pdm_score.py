@@ -77,6 +77,8 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[D
                 metric_cache: MetricCache = pickle.load(f)
 
             agent_input = scene_loader.get_agent_input_from_token(token)
+            if hasattr(agent, "set_evaluation_token"):
+                agent.set_evaluation_token(token)
             if agent.requires_scene:
                 scene = scene_loader.get_scene_from_token(token)
                 trajectory = agent.compute_trajectory(agent_input, scene)

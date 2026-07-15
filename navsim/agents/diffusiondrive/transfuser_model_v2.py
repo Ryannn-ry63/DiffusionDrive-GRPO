@@ -2,6 +2,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Union
 
 import copy
+import hashlib
 import lzma
 import math
 import pickle
@@ -455,8 +456,10 @@ class TrajectoryHead(nn.Module):
             config=config,
         )
         self.diff_decoder = CustomTransformerDecoder(diff_decoder_layer, 2)
-        #self。ref decoder = CustomTransformerDecoder(diff_decoder_layer, 2)
         self.ref_policy = None
+        self.old_policy = None
+        self._old_policy_sync_steps = int(getattr(config, "grpo_old_policy_sync_steps", 32))
+        self._policy_forward_steps = 0
 
         self.loss_computer = LossComputer(config)
 
@@ -484,12 +487,11 @@ class TrajectoryHead(nn.Module):
                 + (f" LRU max entries: {self._metric_cache_lru_max}." if self._metric_cache_lru_max > 0 else "")
             )
 
-        # Reward skip: only compute PDM rewards every N steps, reuse cached rewards in between.
         self._reward_compute_interval: int = int(getattr(config, "reward_compute_interval", 1))
-        self._reward_step_counter: int = 0
-        self._cached_rewards: Optional[torch.Tensor] = None
-        if self._reward_compute_interval > 1:
-            print(f"Reward skip: compute PDM rewards every {self._reward_compute_interval} steps, reuse in between.")
+        if self._reward_compute_interval != 1:
+            raise ValueError(
+                "reward_compute_interval must be 1 because rewards depend on current trajectories"
+            )
 
     def _get_metric_cache_lazy(self, token: str) -> Any:
         """Return metric cache for token, loading from disk on first miss."""
@@ -518,6 +520,19 @@ class TrajectoryHead(nn.Module):
     def set_ref_policy(self, ref_policy):
         self.ref_policy = ref_policy
         print("TrajectoryHead: Reference policy set (frozen pretrained weights)")    
+
+    def set_old_policy(self, old_policy):
+        self.old_policy = old_policy
+        print("TrajectoryHead: Old policy set (periodically synchronized snapshot)")
+
+    @torch.no_grad()
+    def maybe_sync_old_policy(self):
+        if self.old_policy is None:
+            return
+        if self._policy_forward_steps % self._old_policy_sync_steps == 0:
+            self.old_policy.load_state_dict(self.diff_decoder.state_dict())
+            self.old_policy.eval()
+        self._policy_forward_steps += 1
     
     
     def norm_odo(self, odo_info_fut):
@@ -543,10 +558,123 @@ class TrajectoryHead(nn.Module):
     def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,tokens_list=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
         if self.training:
-            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img,tokens_list)
+            return self.forward_train_grpo(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img,tokens_list)
         else:
             return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,global_img,tokens_list)
 
+
+    def _run_policy_rollout(
+        self, policy, initial_sample, ego_query, agents_query, bev_feature,
+        bev_spatial_shape, status_encoding, global_img,
+    ):
+        """Run the same two-step truncated DDIM chain used at inference."""
+        bs = initial_sample.shape[0]
+        device = initial_sample.device
+        self.diffusion_scheduler.set_timesteps(1000, device)
+        roll_timesteps = torch.tensor([10, 0], device=device, dtype=torch.long)
+        sample = initial_sample
+
+        for timestep in roll_timesteps:
+            noisy_traj_points = self.denorm_odo(sample.clamp(min=-1, max=1))
+            traj_pos_embed = gen_sineembed_for_position(noisy_traj_points, hidden_dim=64)
+            traj_feature = self.plan_anchor_encoder(traj_pos_embed.flatten(-2))
+            traj_feature = traj_feature.view(bs, noisy_traj_points.shape[1], -1)
+            time_embed = self.time_mlp(timestep.expand(bs)).view(bs, 1, -1)
+            poses_reg_list, poses_cls_list = policy(
+                traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape,
+                agents_query, ego_query, time_embed, status_encoding, global_img,
+            )
+            poses_reg = poses_reg_list[-1]
+            poses_cls = poses_cls_list[-1]
+            sample = self.diffusion_scheduler.step(
+                model_output=self.norm_odo(poses_reg[..., :2]),
+                timestep=timestep,
+                sample=sample,
+            ).prev_sample
+
+        return poses_reg, poses_cls
+
+    def forward_train_grpo(
+        self, ego_query, agents_query, bev_feature, bev_spatial_shape,
+        status_encoding, targets=None, global_img=None, tokens_list=None,
+    ) -> Dict[str, torch.Tensor]:
+        """Two-step mode-selection rollout with current, old and reference policies."""
+        if self.ref_policy is None or self.old_policy is None:
+            raise RuntimeError("GRPO requires both reference and old policies")
+
+        self.maybe_sync_old_policy()
+        self.diff_decoder.eval()
+        self.ref_policy.eval()
+        self.old_policy.eval()
+
+        bs = ego_query.shape[0]
+        device = ego_query.device
+        plan_anchor = self.plan_anchor.unsqueeze(0).expand(bs, -1, -1, -1)
+        normalized_anchor = self.norm_odo(plan_anchor)
+        trunc_timesteps = torch.full((bs,), 8, device=device, dtype=torch.long)
+        initial_sample = self.diffusion_scheduler.add_noise(
+            original_samples=normalized_anchor,
+            noise=torch.randn_like(normalized_anchor),
+            timesteps=trunc_timesteps,
+        )
+
+        final_poses_reg, final_poses_cls = self._run_policy_rollout(
+            self.diff_decoder, initial_sample, ego_query, agents_query, bev_feature,
+            bev_spatial_shape, status_encoding, global_img,
+        )
+        with torch.no_grad():
+            _, final_old_poses_cls = self._run_policy_rollout(
+                self.old_policy, initial_sample.detach(), ego_query.detach(),
+                agents_query.detach(), bev_feature.detach(), bev_spatial_shape,
+                status_encoding.detach(), global_img.detach() if global_img is not None else None,
+            )
+            _, final_ref_poses_cls = self._run_policy_rollout(
+                self.ref_policy, initial_sample.detach(), ego_query.detach(),
+                agents_query.detach(), bev_feature.detach(), bev_spatial_shape,
+                status_encoding.detach(), global_img.detach() if global_img is not None else None,
+            )
+
+        rewards = None
+        reward_valid_mask = None
+        num_modes = final_poses_cls.shape[-1]
+        if tokens_list is not None:
+            if self._lazy_metric_cache is not None:
+                reward_result = self._compute_rewards_from_lazy_cache(
+                    final_poses_reg, tokens_list, num_modes,
+                )
+            elif self.metric_cache_loader is not None:
+                reward_result = self._compute_rewards_from_disk(
+                    final_poses_reg, tokens_list, num_modes,
+                )
+            else:
+                reward_result = None
+            if reward_result is not None:
+                if isinstance(reward_result, tuple):
+                    rewards, reward_valid_mask = reward_result
+                else:
+                    rewards = reward_result
+                    reward_valid_mask = torch.isfinite(rewards)
+        if rewards is None or reward_valid_mask is None:
+            raise RuntimeError(
+                "GRPO training requires PDM rewards and scene tokens for every batch"
+            )
+        if not reward_valid_mask.any():
+            raise RuntimeError(
+                f"No valid PDM reward in batch; tokens={list(tokens_list or [])}"
+            )
+
+        mode_idx = final_poses_cls.argmax(dim=-1)
+        best_reg = final_poses_reg[torch.arange(bs, device=device), mode_idx]
+        return {
+            "trajectory": best_reg,
+            "final_poses_cls": final_poses_cls,
+            "final_old_poses_cls": final_old_poses_cls,
+            "final_ref_poses_cls": final_ref_poses_cls,
+            "rewards": rewards,
+            "reward_valid_mask": reward_valid_mask,
+            "num_modes": num_modes,
+            "mode_idx": mode_idx,
+        }
 
     def forward_train(self, ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, targets=None, global_img=None, tokens_list=None) -> Dict[str, torch.Tensor]:
 
@@ -655,6 +783,22 @@ class TrajectoryHead(nn.Module):
             "mode_idx": mode_idx,
         }
 
+    def _sample_evaluation_noise(self, template: torch.Tensor, tokens_list) -> torch.Tensor:
+        """Generate order-independent noise from scenario tokens during evaluation."""
+        if tokens_list is None or len(tokens_list) != template.shape[0]:
+            return torch.randn_like(template)
+
+        samples = []
+        for token in tokens_list:
+            digest = hashlib.sha256(str(token).encode("utf-8")).digest()
+            seed = int.from_bytes(digest[:8], byteorder="little") % (2**63 - 1)
+            generator = torch.Generator(device=template.device)
+            generator.manual_seed(seed)
+            samples.append(
+                torch.randn(template.shape[1:], device=template.device, dtype=template.dtype, generator=generator)
+            )
+        return torch.stack(samples, dim=0)
+
     def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img,tokens_list=None) -> Dict[str, torch.Tensor]:
         step_num = 2
         bs = ego_query.shape[0]
@@ -669,9 +813,10 @@ class TrajectoryHead(nn.Module):
         # 1. add truncated noise to the plan anchor
         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
         img = self.norm_odo(plan_anchor)
-        noise = torch.randn(img.shape, device=device)
+        noise = self._sample_evaluation_noise(img, tokens_list)
         trunc_timesteps = torch.ones((bs,), device=device, dtype=torch.long) * 8
         img = self.diffusion_scheduler.add_noise(original_samples=img, noise=noise, timesteps=trunc_timesteps)
+        initial_sample = img.detach().clone()
         noisy_trajs = self.denorm_odo(img)
         ego_fut_mode = img.shape[1]
         for k in roll_timesteps[:]:
@@ -716,12 +861,42 @@ class TrajectoryHead(nn.Module):
         mode_idx = poses_cls.argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
-        
+
+        final_ref_poses_cls = final_poses_cls
+        if self.ref_policy is not None:
+            with torch.no_grad():
+                _, final_ref_poses_cls = self._run_policy_rollout(
+                    self.ref_policy, initial_sample, ego_query, agents_query,
+                    bev_feature, bev_spatial_shape, status_encoding, global_img,
+                )
+
+        rewards = None
+        reward_valid_mask = None
+        if tokens_list is not None:
+            if self._lazy_metric_cache is not None:
+                reward_result = self._compute_rewards_from_lazy_cache(
+                    final_poses_reg, tokens_list, num_modes,
+                )
+            elif self.metric_cache_loader is not None:
+                reward_result = self._compute_rewards_from_disk(
+                    final_poses_reg, tokens_list, num_modes,
+                )
+            else:
+                reward_result = None
+            if reward_result is not None:
+                if isinstance(reward_result, tuple):
+                    rewards, reward_valid_mask = reward_result
+                else:
+                    rewards = reward_result
+                    reward_valid_mask = torch.isfinite(rewards)
+
         output_dict = {
         "trajectory": best_reg,                    # 主输出（必需）
         "final_poses_cls": final_poses_cls,        # GRPO损失必需
-        "final_ref_poses_cls": final_poses_cls,    # validation时用相同的
-        "rewards": None,                           # validation时不需要奖励
+        "final_ref_poses_cls": final_ref_poses_cls,
+        "final_old_poses_cls": final_poses_cls,
+        "rewards": rewards,
+        "reward_valid_mask": reward_valid_mask,
         "num_modes": num_modes                     # 
         }
         #print(f"[TEST] 返回 - rewards: {output_dict['rewards']}, 其他keys: {list(output_dict.keys())}")
@@ -763,7 +938,8 @@ class TrajectoryHead(nn.Module):
         """Batched PDM reward: simulate all modes per token in one call instead of one-by-one."""
         batch_size = trajectories.shape[0]
         pred_np = trajectories.reshape(-1, 8, 3).detach().cpu().numpy()
-        rewards = np.full(batch_size * num_modes, 0.5, dtype=np.float32)
+        rewards = np.full(batch_size * num_modes, np.nan, dtype=np.float32)
+        valid_mask = np.zeros(batch_size * num_modes, dtype=np.bool_)
         future_sampling = self.simulator.proposal_sampling
 
         for batch_idx, token in enumerate(tokens_list):
@@ -817,7 +993,10 @@ class TrajectoryHead(nn.Module):
 
                 # scores[0] = pdm reference; scores[1:] = predicted modes
                 for j, mode_idx in enumerate(valid_mode_indices):
-                    rewards[mode_start + mode_idx] = scores[j + 1]
+                    score = float(scores[j + 1])
+                    if np.isfinite(score):
+                        rewards[mode_start + mode_idx] = score
+                        valid_mask[mode_start + mode_idx] = True
 
             except Exception:
                 pass
@@ -825,4 +1004,10 @@ class TrajectoryHead(nn.Module):
         rewards_tensor = torch.tensor(
             rewards, device=trajectories.device, dtype=trajectories.dtype,
         ).detach()
-        return rewards_tensor.view(batch_size, num_modes)
+        valid_mask_tensor = torch.tensor(
+            valid_mask, device=trajectories.device, dtype=torch.bool,
+        )
+        return (
+            rewards_tensor.view(batch_size, num_modes),
+            valid_mask_tensor.view(batch_size, num_modes),
+        )
