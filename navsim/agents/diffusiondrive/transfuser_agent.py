@@ -77,7 +77,7 @@ class TransfuserAgent(AbstractAgent):
         trajectory_head = self._transfuser_model._trajectory_head
         if training_mode == "classification_shared":
             trajectory_head.diff_decoder.requires_grad_(True)
-        elif training_mode == "classification_head":
+        elif training_mode in {"classification_head", "selector"}:
             trajectory_head.diff_decoder.layers[-1].task_decoder.plan_cls_branch.requires_grad_(
                 True
             )
@@ -89,7 +89,8 @@ class TransfuserAgent(AbstractAgent):
         else:
             raise ValueError(
                 "grpo_training_mode must be one of "
-                "{'classification_shared', 'classification_head', 'generation', 'joint'}; "
+                "{'classification_shared', 'classification_head', 'selector', "
+                "'generation', 'joint'}; "
                 f"got {training_mode!r}"
             )
         trainable_params = sum(
@@ -312,11 +313,25 @@ class TransfuserAgent(AbstractAgent):
             filename="grpo-{epoch:02d}-{step}",
             monitor="val/selected_reward_epoch",
             mode="max",
-            save_top_k=2,
+            save_top_k=int(getattr(self._config, "grpo_checkpoint_save_top_k", 2)),
             save_last=True,
             auto_insert_metric_name=False,
         )
-        return [
+        callbacks = [
             TransfuserCallback(self._config),
             selection_checkpoint,
         ]
+        checkpoint_every = int(
+            getattr(self._config, "grpo_checkpoint_every_n_train_steps", 0)
+        )
+        if checkpoint_every > 0:
+            callbacks.append(
+                ModelCheckpoint(
+                    filename="grpo-step-{step}",
+                    every_n_train_steps=checkpoint_every,
+                    save_top_k=-1,
+                    save_on_train_epoch_end=False,
+                    auto_insert_metric_name=False,
+                )
+            )
+        return callbacks

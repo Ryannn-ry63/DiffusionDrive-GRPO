@@ -14,10 +14,36 @@ config:
   latent: False
 
   grpo_training_mode: classification_shared
+  grpo_checkpoint_save_top_k: 2
+  policy_loss_weight: 1.0
+  grpo_checkpoint_every_n_train_steps: 0
+  grpo_old_policy_sync_steps: 32
   selection_temperature: 1.0
   selection_entropy_weight: 0.0
+  selection_exploration_floor: 0.0
+  selection_behavior_weighting: old_policy
+  selection_rank_loss_weight: 0.0
+  selection_rank_reward_gap: 0.01
+  selection_rank_reward_scale: 0.10
+  selection_rank_logit_margin: 0.20
+  grpo_scene_weight_mode: uniform
+  grpo_reference_gate_margin: 0.01
+  grpo_reference_gate_scale: 0.05
+  selector_consistency_kl_weight: 0.0
+  grpo_reward_mode: pdms
+  pdm_tiebreak_max_epsilon: 0.001
+  pdm_dense_weight: 0.1
   generation_policy_loss_weight: 1.0
   generation_kl_loss_weight: 0.1
+  generation_advantage_mode: group_zscore
+  reference_advantage_margin: 0.01
+  reference_advantage_scale: 0.10
+  reference_advantage_clip: 2.0
+  grpo_rollouts_per_mode: 1
+  grpo_priority_manifest_path: ""
+  grpo_priority_sample_fraction: 0.0
+  generation_mode_weighting: uniform
+  generation_mode_temperature: 1.0
   generation_ddim_eta: 1.0
   generation_final_std: 0.05
   generation_sigma_min: 1e-4

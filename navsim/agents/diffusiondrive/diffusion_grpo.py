@@ -6,6 +6,147 @@ from typing import Optional, Tuple
 import torch
 
 
+def flatten_generation_rollouts(
+    tensor: torch.Tensor,
+    batch_size: int,
+    rollouts_per_mode: int,
+) -> torch.Tensor:
+    """Flatten [batch * rollout, mode, ...] in anchor-major order.
+
+    The output order is mode0/rollout0, mode0/rollout1, and so on, so the
+    generation objective can recover within-anchor groups by a reshape.
+    """
+    if batch_size <= 0 or rollouts_per_mode <= 0:
+        raise ValueError("batch_size and rollouts_per_mode must be positive")
+    if tensor.ndim < 2 or tensor.shape[0] != batch_size * rollouts_per_mode:
+        raise ValueError(
+            "rollout tensor must have leading shape "
+            "[batch_size * rollouts_per_mode, mode]"
+        )
+    if rollouts_per_mode == 1:
+        return tensor
+    num_modes = tensor.shape[1]
+    trailing_shape = tensor.shape[2:]
+    return (
+        tensor.reshape(batch_size, rollouts_per_mode, num_modes, *trailing_shape)
+        .transpose(1, 2)
+        .reshape(batch_size, num_modes * rollouts_per_mode, *trailing_shape)
+    )
+
+
+def _compute_pdm_secondary_score(
+    aggregate_rewards: torch.Tensor,
+    component_scores: torch.Tensor,
+    valid_mask: torch.Tensor,
+    weighted_metric_weights: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if aggregate_rewards.ndim != 2 or valid_mask.shape != aggregate_rewards.shape:
+        raise ValueError(
+            "aggregate_rewards and valid_mask must have shape [batch, num_modes]"
+        )
+    if component_scores.shape != (*aggregate_rewards.shape, 6):
+        raise ValueError(
+            "component_scores must have shape [batch, num_modes, 6]"
+        )
+    if weighted_metric_weights.numel() != 4:
+        raise ValueError("weighted_metric_weights must contain four values")
+
+    valid_mask = (
+        valid_mask.bool()
+        & torch.isfinite(aggregate_rewards)
+        & torch.isfinite(component_scores).all(dim=-1)
+    )
+    components = component_scores.float().clamp(0.0, 1.0)
+    safety_score = components[..., :2].mean(dim=-1)
+    metric_weights = weighted_metric_weights.to(
+        device=components.device, dtype=components.dtype
+    ).clamp_min(0.0)
+    weight_sum = metric_weights.sum()
+    if weight_sum <= 0:
+        raise ValueError("weighted_metric_weights must have a positive sum")
+    weighted_score = (
+        components[..., 2:] * metric_weights.view(1, 1, -1)
+    ).sum(dim=-1) / weight_sum
+    secondary_score = 0.5 * safety_score + 0.5 * weighted_score
+    return valid_mask, components, secondary_score
+
+
+def compute_pdm_tiebreak_rewards(
+    aggregate_rewards: torch.Tensor,
+    component_scores: torch.Tensor,
+    valid_mask: torch.Tensor,
+    weighted_metric_weights: torch.Tensor,
+    max_epsilon: float = 1e-3,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Add an order-preserving PDM-component tie-break to aggregate rewards.
+
+    Component scores store no-collision, drivable-area, progress, TTC,
+    comfort, and driving-direction values. The epsilon for each scene is at
+    most one quarter of the smallest positive aggregate-reward gap, so the
+    secondary score cannot reverse the aggregate PDMS ordering.
+    """
+    if max_epsilon <= 0:
+        raise ValueError("max_epsilon must be positive")
+
+    valid_mask, _, secondary_score = _compute_pdm_secondary_score(
+        aggregate_rewards,
+        component_scores,
+        valid_mask,
+        weighted_metric_weights,
+    )
+
+    epsilons = aggregate_rewards.new_zeros((aggregate_rewards.shape[0],))
+    for batch_idx in range(aggregate_rewards.shape[0]):
+        values = aggregate_rewards[batch_idx][valid_mask[batch_idx]].float()
+        if values.numel() < 2:
+            epsilon = max_epsilon
+        else:
+            distinct = torch.unique(values).sort().values
+            gaps = distinct[1:] - distinct[:-1]
+            positive_gaps = gaps[gaps > 0]
+            epsilon = (
+                min(max_epsilon, float(positive_gaps.min()) / 4.0)
+                if positive_gaps.numel() > 0
+                else max_epsilon
+            )
+        epsilons[batch_idx] = epsilon
+
+    shaped_rewards = aggregate_rewards + epsilons.unsqueeze(-1) * secondary_score
+    shaped_rewards = torch.where(valid_mask, shaped_rewards, aggregate_rewards)
+    return shaped_rewards, secondary_score, epsilons
+
+
+def compute_pdm_dense_rewards(
+    aggregate_rewards: torch.Tensor,
+    component_scores: torch.Tensor,
+    valid_mask: torch.Tensor,
+    weighted_metric_weights: torch.Tensor,
+    dense_weight: float = 0.1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Add safety-gated PDM component shaping to aggregate PDMS.
+
+    Unlike the conservative tie-break mode, this reward may reorder valid
+    candidates. The collision and drivable-area product gates the dense term,
+    so a candidate that fails either multiplicative safety gate receives no
+    component bonus.
+    """
+    if dense_weight < 0:
+        raise ValueError("dense_weight must be non-negative")
+    valid_mask, components, secondary_score = _compute_pdm_secondary_score(
+        aggregate_rewards,
+        component_scores,
+        valid_mask,
+        weighted_metric_weights,
+    )
+    safety_gate = components[..., 0] * components[..., 1]
+    shaped_rewards = (
+        aggregate_rewards
+        + float(dense_weight) * safety_gate * secondary_score
+    )
+    shaped_rewards = torch.where(valid_mask, shaped_rewards, aggregate_rewards)
+    return shaped_rewards, secondary_score, safety_gate
+
+
 def diagonal_gaussian_log_prob(
     value: torch.Tensor,
     mean: torch.Tensor,

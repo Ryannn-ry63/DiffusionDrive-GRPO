@@ -1,5 +1,6 @@
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from pathlib import Path
+import json
 import logging
 import uuid
 import os
@@ -21,6 +22,26 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/training"
 CONFIG_NAME = "default_training"
+
+
+def load_requested_manifest(path: Path) -> Tuple[List[str], Optional[List[str]]]:
+    """Load tokens and optional log names from a JSON manifest."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        tokens = payload
+        log_names = None
+    elif isinstance(payload, dict) and isinstance(payload.get("records"), list):
+        tokens = [record["token"] for record in payload["records"]]
+        if all("log_name" in record for record in payload["records"]):
+            log_names = [str(record["log_name"]) for record in payload["records"]]
+        else:
+            log_names = None
+    else:
+        raise ValueError(f"Unsupported token manifest schema: {path}")
+    tokens = [str(token) for token in tokens]
+    if len(tokens) != len(set(tokens)):
+        raise ValueError(f"Token manifest contains duplicates: {path}")
+    return tokens, log_names
 
 
 def cache_features(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[Optional[Any]]:
@@ -72,6 +93,25 @@ def main(cfg: DictConfig) -> None:
 
     logger.info("Building SceneLoader")
     scene_filter: SceneFilter = instantiate(cfg.train_test_split.scene_filter)
+    tokens_file = cfg.get("tokens_file", None)
+    requested_tokens = None
+    if tokens_file is not None:
+        tokens_path = Path(tokens_file)
+        if not tokens_path.is_file():
+            raise FileNotFoundError(tokens_path)
+        requested_tokens, requested_log_names = load_requested_manifest(tokens_path)
+        tokens_limit = cfg.get("tokens_limit", None)
+        if tokens_limit is not None:
+            tokens_limit = int(tokens_limit)
+            if tokens_limit <= 0:
+                raise ValueError("tokens_limit must be positive")
+            requested_tokens = requested_tokens[:tokens_limit]
+            if requested_log_names is not None:
+                requested_log_names = requested_log_names[:tokens_limit]
+        scene_filter.tokens = requested_tokens
+        if requested_log_names is not None:
+            scene_filter.log_names = sorted(set(requested_log_names))
+        logger.info("Restricting dataset caching to %d manifest tokens", len(requested_tokens))
     data_path = Path(cfg.navsim_log_path)
     sensor_blobs_path = Path(cfg.sensor_blobs_path)
     scene_loader = SceneLoader(
@@ -80,6 +120,14 @@ def main(cfg: DictConfig) -> None:
         scene_filter=scene_filter,
         sensor_config=SensorConfig.build_no_sensors(),
     )
+    if requested_tokens is not None:
+        missing_tokens = set(requested_tokens) - set(scene_loader.tokens)
+        if missing_tokens:
+            first_missing = sorted(missing_tokens)[0]
+            raise RuntimeError(
+                f"SceneLoader could not resolve {len(missing_tokens)} manifest tokens; "
+                f"first={first_missing}"
+            )
     logger.info(f"Extracted {len(scene_loader)} scenarios for training/validation dataset")
 
     data_points = [

@@ -99,11 +99,40 @@ class TransfuserConfig:
     grpo_clip_ratio: float = 0.2
     grpo_advantage_eps: float = 1e-3
     grpo_old_policy_sync_steps: int = 32
+    # Set to -1 for gated ablations that must retain every epoch checkpoint.
+    grpo_checkpoint_save_top_k: int = 2
+    grpo_checkpoint_every_n_train_steps: int = 0
     grpo_training_mode: str = "classification_shared"
     selection_temperature: float = 1.0
     selection_entropy_weight: float = 0.0
+    selection_exploration_floor: float = 0.0
+    selection_behavior_weighting: str = "old_policy"
+    selection_rank_loss_weight: float = 0.0
+    selection_rank_reward_gap: float = 0.01
+    selection_rank_reward_scale: float = 0.10
+    selection_rank_logit_margin: float = 0.20
+    grpo_scene_weight_mode: str = "uniform"
+    grpo_reference_gate_margin: float = 0.01
+    grpo_reference_gate_scale: float = 0.05
+    # Generation-only GRPO may change the shared features consumed by the
+    # frozen selector. This optional KL preserves the fixed-reference
+    # selector distribution without adding a selection policy gradient.
+    selector_consistency_kl_weight: float = 0.0
+    grpo_reward_mode: str = "pdms"
+    pdm_tiebreak_max_epsilon: float = 1e-3
+    pdm_dense_weight: float = 0.1
     generation_policy_loss_weight: float = 1.0
     generation_kl_loss_weight: float = 0.1
+    # group_zscore/reference_centered use K=1; within_anchor/hierarchical use K=2.
+    generation_advantage_mode: str = "group_zscore"
+    reference_advantage_margin: float = 0.01
+    reference_advantage_scale: float = 0.10
+    reference_advantage_clip: float = 2.0
+    grpo_rollouts_per_mode: int = 1
+    grpo_priority_manifest_path: str = ""
+    grpo_priority_sample_fraction: float = 0.0
+    generation_mode_weighting: str = "uniform"
+    generation_mode_temperature: float = 1.0
     generation_ddim_eta: float = 1.0
     generation_final_std: float = 0.05
     generation_sigma_min: float = 1e-4

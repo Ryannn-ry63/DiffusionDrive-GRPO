@@ -35,6 +35,147 @@ def compute_group_relative_advantages(
     return advantages, valid_mask, group_valid, means.squeeze(-1), stds.squeeze(-1)
 
 
+def compute_smoothed_selector_policy(
+    logits: torch.Tensor,
+    valid_mask: torch.Tensor,
+    temperature: float = 1.0,
+    exploration_floor: float = 0.0,
+):
+    """Return a valid-mode categorical policy with optional uniform support."""
+    if logits.ndim != 2 or valid_mask.shape != logits.shape:
+        raise ValueError("logits and valid_mask must have shape [batch, num_modes]")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if not 0.0 <= exploration_floor < 1.0:
+        raise ValueError("exploration_floor must satisfy 0 <= epsilon < 1")
+
+    valid_mask = valid_mask.bool()
+    valid_counts = valid_mask.sum(dim=-1, keepdim=True)
+    has_valid = valid_counts.squeeze(-1) > 0
+    masked_logits = (logits.float() / temperature).masked_fill(
+        ~valid_mask, torch.finfo(torch.float32).min
+    )
+    raw_probs = F.softmax(masked_logits, dim=-1)
+    raw_probs = torch.where(
+        has_valid.unsqueeze(-1),
+        raw_probs * valid_mask.to(raw_probs.dtype),
+        torch.zeros_like(raw_probs),
+    )
+    uniform_probs = valid_mask.to(raw_probs.dtype) / valid_counts.clamp_min(1)
+    probs = (
+        (1.0 - exploration_floor) * raw_probs
+        + exploration_floor * uniform_probs
+    )
+    probs = torch.where(valid_mask, probs, torch.zeros_like(probs))
+    log_probs = torch.where(
+        valid_mask,
+        probs.clamp_min(torch.finfo(probs.dtype).tiny).log(),
+        torch.zeros_like(probs),
+    )
+    return probs, log_probs, has_valid
+
+
+def _prepare_scene_weights(
+    scene_weights: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if scene_weights is None:
+        return torch.ones(batch_size, device=device, dtype=dtype)
+    if scene_weights.shape != (batch_size,):
+        raise ValueError("scene_weights must have shape [batch]")
+    if not torch.isfinite(scene_weights).all() or torch.any(scene_weights < 0):
+        raise ValueError("scene_weights must be finite and non-negative")
+    return scene_weights.detach().to(device=device, dtype=dtype)
+
+
+def _weighted_scene_mean(
+    values: torch.Tensor,
+    valid_scenes: torch.Tensor,
+    scene_weights: torch.Tensor,
+) -> torch.Tensor:
+    weights = scene_weights * valid_scenes.to(scene_weights.dtype)
+    weight_sum = weights.sum()
+    return (
+        (values * weights).sum() / weight_sum
+        if weight_sum > 0
+        else values.sum() * 0.0
+    )
+
+
+def compute_pairwise_reward_ranking_objective(
+    current_logits: torch.Tensor,
+    rewards: torch.Tensor,
+    valid_mask: torch.Tensor,
+    reward_gap: float = 0.01,
+    reward_scale: float = 0.10,
+    logit_margin: float = 0.20,
+    scene_weights: torch.Tensor = None,
+):
+    """Rank valid modes using detached raw-reward preferences within each scene."""
+    if current_logits.ndim != 2 or rewards.shape != current_logits.shape:
+        raise ValueError("current_logits and rewards must have shape [batch, num_modes]")
+    if valid_mask.shape != current_logits.shape:
+        raise ValueError("valid_mask must match current_logits")
+    if reward_gap < 0:
+        raise ValueError("reward_gap must be non-negative")
+    if reward_scale <= 0:
+        raise ValueError("reward_scale must be positive")
+    if logit_margin < 0:
+        raise ValueError("logit_margin must be non-negative")
+
+    rewards = rewards.detach().float()
+    valid_mask = valid_mask.bool() & torch.isfinite(rewards)
+    clean_rewards = torch.where(valid_mask, rewards, torch.zeros_like(rewards))
+    reward_differences = clean_rewards.unsqueeze(2) - clean_rewards.unsqueeze(1)
+    pair_valid = (
+        valid_mask.unsqueeze(2)
+        & valid_mask.unsqueeze(1)
+        & (reward_differences > reward_gap)
+    )
+    pair_weights = ((reward_differences - reward_gap) / reward_scale).clamp(0.0, 1.0)
+    pair_weights = torch.where(pair_valid, pair_weights, torch.zeros_like(pair_weights))
+
+    logit_differences = current_logits.float().unsqueeze(2) - current_logits.float().unsqueeze(1)
+    pair_losses = F.softplus(logit_margin - logit_differences)
+    pair_weight_sums = pair_weights.sum(dim=(1, 2))
+    active_scenes = pair_weight_sums > 0
+    per_scene_loss = (
+        (pair_weights * pair_losses).sum(dim=(1, 2))
+        / pair_weight_sums.clamp_min(torch.finfo(pair_weights.dtype).eps)
+    )
+    scene_weights = _prepare_scene_weights(
+        scene_weights,
+        current_logits.shape[0],
+        current_logits.device,
+        current_logits.dtype,
+    )
+    rank_loss = _weighted_scene_mean(per_scene_loss, active_scenes, scene_weights)
+
+    pair_counts = pair_valid.sum(dim=(1, 2)).float()
+    active_pair_weights = pair_weights[pair_valid]
+    weighted_gap_sum = (pair_weights * reward_differences).sum(dim=(1, 2))
+    per_scene_reward_gap = weighted_gap_sum / pair_weight_sums.clamp_min(
+        torch.finfo(pair_weights.dtype).eps
+    )
+    zero = current_logits.detach().float().new_zeros(())
+    return {
+        "rank_loss": rank_loss,
+        "rank_active_scene_fraction": active_scenes.float().mean().detach(),
+        "rank_pair_count": (
+            pair_counts[active_scenes].mean().detach() if active_scenes.any() else zero
+        ),
+        "rank_pair_weight": (
+            active_pair_weights.mean().detach() if active_pair_weights.numel() else zero
+        ),
+        "rank_pair_reward_gap": (
+            per_scene_reward_gap[active_scenes].mean().detach()
+            if active_scenes.any() else zero
+        ),
+    }
+
+
 def compute_grpo_objective(
     current_logits: torch.Tensor,
     old_logits: torch.Tensor,
@@ -44,6 +185,9 @@ def compute_grpo_objective(
     clip_ratio: float = 0.2,
     advantage_eps: float = 1e-3,
     temperature: float = 1.0,
+    exploration_floor: float = 0.0,
+    behavior_weighting: str = "old_policy",
+    scene_weights: torch.Tensor = None,
 ):
     """Exact categorical, group-relative clipped policy objective over all modes."""
     if not (current_logits.shape == old_logits.shape == reference_logits.shape == rewards.shape):
@@ -51,18 +195,43 @@ def compute_grpo_objective(
     if temperature <= 0:
         raise ValueError("temperature must be positive")
 
-    current_logits = current_logits.float() / temperature
-    old_logits = old_logits.detach().float() / temperature
-    reference_logits = reference_logits.detach().float() / temperature
     advantages, valid_mask, group_valid, reward_mean, reward_std = (
         compute_group_relative_advantages(rewards, valid_mask, advantage_eps)
     )
-
-    current_log_probs = F.log_softmax(current_logits, dim=-1)
-    old_log_probs = F.log_softmax(old_logits, dim=-1)
-    reference_log_probs = F.log_softmax(reference_logits, dim=-1)
-    old_weights = old_log_probs.exp() * valid_mask.float()
-    old_weights = old_weights / old_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    current_probs, current_log_probs, has_valid = compute_smoothed_selector_policy(
+        current_logits,
+        valid_mask,
+        temperature=temperature,
+        exploration_floor=exploration_floor,
+    )
+    old_probs, old_log_probs, _ = compute_smoothed_selector_policy(
+        old_logits.detach(),
+        valid_mask,
+        temperature=temperature,
+        exploration_floor=exploration_floor,
+    )
+    if behavior_weighting == "old_policy":
+        behavior_weights = old_probs
+    elif behavior_weighting == "uniform_valid":
+        valid_counts = valid_mask.sum(dim=-1, keepdim=True).clamp_min(1)
+        behavior_weights = valid_mask.to(old_probs.dtype) / valid_counts
+    else:
+        raise ValueError(
+            "behavior_weighting must be one of "
+            "{'old_policy', 'uniform_valid'}"
+        )
+    _, reference_log_probs, _ = compute_smoothed_selector_policy(
+        reference_logits.detach(),
+        valid_mask,
+        temperature=temperature,
+        exploration_floor=exploration_floor,
+    )
+    scene_weights = _prepare_scene_weights(
+        scene_weights,
+        current_logits.shape[0],
+        current_logits.device,
+        current_logits.dtype,
+    )
 
     log_ratio = (current_log_probs - old_log_probs).clamp(min=-20.0, max=20.0)
     ratio = log_ratio.exp()
@@ -70,18 +239,30 @@ def compute_grpo_objective(
         ratio * advantages,
         ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * advantages,
     )
-    per_scene_policy_loss = -(old_weights * surrogate).sum(dim=-1)
-    policy_loss = (
-        per_scene_policy_loss[group_valid].mean()
-        if group_valid.any()
-        else current_logits.sum() * 0.0
+    per_scene_policy_loss = -(behavior_weights * surrogate).sum(dim=-1)
+    policy_loss = _weighted_scene_mean(
+        per_scene_policy_loss, group_valid, scene_weights
     )
 
-    current_probs = current_log_probs.exp()
-    kl_loss = (current_probs * (current_log_probs - reference_log_probs)).sum(dim=-1).mean()
-    entropy = -(current_probs * current_log_probs).sum(dim=-1).mean()
+    per_scene_kl = (
+        current_probs * (current_log_probs - reference_log_probs)
+    ).sum(dim=-1)
+    kl_loss = (
+        per_scene_kl[has_valid].mean()
+        if has_valid.any()
+        else current_logits.sum() * 0.0
+    )
+    per_scene_entropy = -(current_probs * current_log_probs).sum(dim=-1)
+    entropy = (
+        per_scene_entropy[has_valid].mean()
+        if has_valid.any()
+        else current_logits.sum() * 0.0
+    )
+    entropy_for_loss = _weighted_scene_mean(
+        per_scene_entropy, has_valid, scene_weights
+    )
 
-    selected_idx = current_logits.argmax(dim=-1)
+    selected_idx = current_logits.float().argmax(dim=-1)
     clean_rewards = torch.nan_to_num(rewards.float(), nan=0.0, posinf=0.0, neginf=0.0)
     selected_reward_by_scene = clean_rewards.gather(1, selected_idx.unsqueeze(-1)).squeeze(-1)
     oracle_reward_by_scene = clean_rewards.masked_fill(~valid_mask, float("-inf")).max(dim=-1).values
@@ -103,7 +284,7 @@ def compute_grpo_objective(
         (selected_idx[metric_valid] == oracle_idx[metric_valid]).float().mean()
         if metric_valid.any() else rewards.new_zeros(())
     )
-    clip_fraction_per_scene = (old_weights * clipped.float()).sum(dim=-1)
+    clip_fraction_per_scene = (behavior_weights * clipped.float()).sum(dim=-1)
     clip_fraction = (
         clip_fraction_per_scene[group_valid].mean()
         if group_valid.any()
@@ -113,7 +294,7 @@ def compute_grpo_objective(
     return {
         "policy_loss": policy_loss,
         "kl_loss": kl_loss,
-        "entropy_for_loss": entropy,
+        "entropy_for_loss": entropy_for_loss,
         "entropy": entropy.detach(),
         "reward_mean": reward_mean.mean().detach(),
         "reward_std": reward_std.mean().detach(),
@@ -124,7 +305,10 @@ def compute_grpo_objective(
         "valid_mode_fraction": valid_mask.float().mean().detach(),
         "valid_group_fraction": group_valid.float().mean().detach(),
         "zero_advantage_fraction": (1.0 - group_valid.float().mean()).detach(),
-        "ratio_mean": (old_weights * ratio).sum(dim=-1).mean().detach(),
+        "ratio_mean": (
+            (behavior_weights * ratio).sum(dim=-1)[has_valid].mean()
+            if has_valid.any() else rewards.new_zeros(())
+        ).detach(),
         "clip_fraction": clip_fraction.detach(),
     }
 
@@ -135,20 +319,183 @@ def compute_generation_grpo_objective(
     generation_kl: torch.Tensor,
     rewards: torch.Tensor,
     valid_mask: torch.Tensor,
+    mode_weights: torch.Tensor = None,
     clip_ratio: float = 0.2,
     advantage_eps: float = 1e-3,
+    scene_weights: torch.Tensor = None,
+    advantage_mode: str = "group_zscore",
+    reference_selected_reward: torch.Tensor = None,
+    reference_valid_mask: torch.Tensor = None,
+    reference_margin: float = 0.01,
+    reference_scale: float = 0.10,
+    reference_clip: float = 2.0,
+    rollouts_per_mode: int = 1,
 ):
-    """Clipped group-relative objective over sampled denoising actions."""
+    """Clipped policy objective over sampled denoising actions.
+
+    group_zscore preserves the established generation-GRPO behavior.
+    reference_centered uses the fixed reference policy deployable raw reward
+    as an absolute baseline. within_anchor and hierarchical use K=2 samples
+    per anchor; hierarchical mixes equal-weight within-anchor and reference
+    advantages.
+    """
     if current_log_probs.shape != old_log_probs.shape:
         raise ValueError("current and old generation log-probs must have identical shapes")
     if current_log_probs.ndim != 3 or current_log_probs.shape[:2] != rewards.shape:
         raise ValueError("generation log-probs must have shape [batch, mode, step]")
     if generation_kl.shape != current_log_probs.shape:
         raise ValueError("generation KL must match generation log-prob shape")
-
-    advantages, valid_mask, group_valid, _, _ = compute_group_relative_advantages(
-        rewards, valid_mask, advantage_eps
+    if mode_weights is None:
+        mode_weights = torch.ones_like(rewards)
+    if mode_weights.shape != rewards.shape:
+        raise ValueError("generation mode weights must match reward shape")
+    if not torch.isfinite(mode_weights).all() or torch.any(mode_weights < 0):
+        raise ValueError("generation mode weights must be finite and non-negative")
+    mode_weights = mode_weights.detach().to(
+        device=current_log_probs.device, dtype=current_log_probs.dtype
     )
+    scene_weights = _prepare_scene_weights(
+        scene_weights,
+        current_log_probs.shape[0],
+        current_log_probs.device,
+        current_log_probs.dtype,
+    )
+
+    rewards = rewards.float()
+    valid_mask = valid_mask.bool() & torch.isfinite(rewards)
+    reference_delta = None
+    reference_valid_mask_for_metrics = None
+    within_anchor_metrics = {}
+    if advantage_mode == "group_zscore":
+        advantages, valid_mask, group_valid, _, _ = compute_group_relative_advantages(
+            rewards, valid_mask, advantage_eps
+        )
+        optimize_mode_mask = valid_mask & group_valid.unsqueeze(-1)
+    elif advantage_mode in {
+        "reference_centered",
+        "within_anchor",
+        "hierarchical",
+    }:
+        if advantage_mode in {"within_anchor", "hierarchical"}:
+            if rollouts_per_mode != 2:
+                raise ValueError(
+                    "within_anchor/hierarchical generation advantage requires "
+                    "rollouts_per_mode=2"
+                )
+            if rewards.shape[1] % rollouts_per_mode != 0:
+                raise ValueError(
+                    "generation candidate count must be divisible by "
+                    "rollouts_per_mode"
+                )
+            num_anchors = rewards.shape[1] // rollouts_per_mode
+            anchor_rewards = rewards.reshape(
+                rewards.shape[0] * num_anchors, rollouts_per_mode
+            )
+            anchor_valid_mask = valid_mask.reshape(
+                rewards.shape[0] * num_anchors, rollouts_per_mode
+            )
+            (
+                within_advantages,
+                _,
+                anchor_group_valid,
+                _,
+                _,
+            ) = compute_group_relative_advantages(
+                anchor_rewards,
+                anchor_valid_mask,
+                advantage_eps,
+            )
+            within_advantages = within_advantages.reshape_as(rewards)
+            within_valid_mask = (
+                anchor_group_valid.reshape(rewards.shape[0], num_anchors, 1)
+                .expand(-1, -1, rollouts_per_mode)
+                .reshape_as(valid_mask)
+            )
+            pair_reward_gap = (
+                anchor_rewards[:, 0] - anchor_rewards[:, 1]
+            ).abs()
+            within_anchor_metrics = {
+                "within_anchor_pair_fraction": (
+                    anchor_group_valid.float().mean().detach()
+                ),
+                "within_anchor_reward_gap_mean": (
+                    pair_reward_gap[anchor_group_valid].mean().detach()
+                    if anchor_group_valid.any()
+                    else rewards.new_zeros(())
+                ),
+            }
+        else:
+            within_advantages = None
+            within_valid_mask = None
+
+        if advantage_mode in {"reference_centered", "hierarchical"}:
+            if reference_selected_reward is None:
+                raise ValueError(
+                    f"{advantage_mode} generation advantage requires "
+                    "reference_selected_reward"
+                )
+            if reference_selected_reward.shape != (rewards.shape[0],):
+                raise ValueError("reference_selected_reward must have shape [batch]")
+            if reference_margin < 0:
+                raise ValueError("reference advantage margin must be non-negative")
+            if reference_scale <= 0:
+                raise ValueError("reference advantage scale must be positive")
+            if reference_clip <= 0:
+                raise ValueError("reference advantage clip must be positive")
+            if reference_valid_mask is None:
+                reference_valid_mask = torch.isfinite(reference_selected_reward)
+            elif reference_valid_mask.shape != (rewards.shape[0],):
+                raise ValueError("reference_valid_mask must have shape [batch]")
+            reference_valid_mask = (
+                reference_valid_mask.bool()
+                & torch.isfinite(reference_selected_reward)
+            )
+            reference_valid_mask_for_metrics = reference_valid_mask
+            reference_delta = (
+                rewards - reference_selected_reward.detach().float().unsqueeze(-1)
+            )
+            magnitude = (
+                (reference_delta.abs() - reference_margin).clamp_min(0.0)
+                / reference_scale
+            )
+            reference_advantages = (
+                reference_delta.sign() * magnitude
+            ).clamp(min=-reference_clip, max=reference_clip)
+            reference_signal_mask = (
+                valid_mask & reference_valid_mask.unsqueeze(-1)
+            )
+            reference_advantages = torch.where(
+                reference_signal_mask,
+                reference_advantages,
+                torch.zeros_like(reference_advantages),
+            ).detach()
+        else:
+            reference_advantages = None
+            reference_signal_mask = torch.zeros_like(valid_mask)
+
+        if advantage_mode == "reference_centered":
+            advantages = reference_advantages
+            optimize_mode_mask = advantages != 0
+        elif advantage_mode == "within_anchor":
+            advantages = within_advantages.clamp(-2.0, 2.0).detach()
+            optimize_mode_mask = within_valid_mask & (advantages != 0)
+        else:
+            advantages = (
+                0.5 * within_advantages.clamp(-2.0, 2.0)
+                + 0.5 * reference_advantages
+            ).detach()
+            optimize_mode_mask = (
+                valid_mask
+                & (within_valid_mask | reference_signal_mask)
+                & (advantages != 0)
+            )
+        group_valid = optimize_mode_mask.any(dim=-1)
+    else:
+        raise ValueError(
+            "generation advantage mode must be one of "
+            "{'group_zscore', 'reference_centered', "
+            "'within_anchor', 'hierarchical'}"
+        )
     log_ratio = (current_log_probs - old_log_probs.detach()).clamp(-20.0, 20.0)
     ratio = log_ratio.exp()
     step_advantages = advantages.unsqueeze(-1)
@@ -156,13 +503,17 @@ def compute_generation_grpo_objective(
         ratio * step_advantages,
         ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * step_advantages,
     )
-    optimize_mask = (
-        valid_mask
-        & group_valid.unsqueeze(-1)
-    ).unsqueeze(-1).expand_as(surrogate)
+    optimize_mask = optimize_mode_mask.unsqueeze(-1).expand_as(surrogate)
+    step_weights = mode_weights.unsqueeze(-1).expand_as(surrogate)
+    optimize_weights = (
+        step_weights
+        * optimize_mask.to(step_weights.dtype)
+        * scene_weights[:, None, None]
+    )
+    optimize_weight_sum = optimize_weights.sum()
     policy_loss = (
-        -surrogate[optimize_mask].mean()
-        if optimize_mask.any()
+        -(surrogate * optimize_weights).sum() / optimize_weight_sum
+        if optimize_weight_sum > 0
         else current_log_probs.sum() * 0.0
     )
     kl_mask = valid_mask.unsqueeze(-1).expand_as(generation_kl)
@@ -172,12 +523,126 @@ def compute_generation_grpo_objective(
         else generation_kl.sum() * 0.0
     )
     clipped = (ratio < 1.0 - clip_ratio) | (ratio > 1.0 + clip_ratio)
-    return {
+    metric_weights = step_weights * kl_mask.to(step_weights.dtype)
+    metric_weight_sum = metric_weights.sum()
+    ratio_mean = (
+        (ratio * metric_weights).sum() / metric_weight_sum
+        if metric_weight_sum > 0
+        else ratio.sum() * 0.0
+    )
+    clip_fraction = (
+        (clipped.float() * metric_weights).sum() / metric_weight_sum
+        if metric_weight_sum > 0
+        else clipped.float().sum() * 0.0
+    )
+    valid_count = valid_mask.float().sum().clamp_min(1.0)
+    result = {
         "policy_loss": policy_loss,
         "kl_loss": kl_loss,
-        "ratio_mean": ratio[kl_mask].mean().detach(),
-        "clip_fraction": clipped[kl_mask].float().mean().detach(),
+        "ratio_mean": ratio_mean.detach(),
+        "clip_fraction": clip_fraction.detach(),
+        "policy_active_scene_fraction": group_valid.float().mean().detach(),
+        "positive_advantage_fraction": (
+            ((advantages > 0) & valid_mask).float().sum() / valid_count
+        ).detach(),
+        "negative_advantage_fraction": (
+            ((advantages < 0) & valid_mask).float().sum() / valid_count
+        ).detach(),
+        **within_anchor_metrics,
     }
+    if reference_delta is not None:
+        reference_metric_mask = (
+            valid_mask & reference_valid_mask_for_metrics.unsqueeze(-1)
+        )
+        if reference_metric_mask.any():
+            valid_delta = reference_delta[reference_metric_mask]
+            result.update(
+                {
+                    "reference_delta_mean": valid_delta.mean().detach(),
+                    "reference_delta_std": valid_delta.std(unbiased=False).detach(),
+                    "within_margin_fraction": (
+                        (valid_delta.abs() <= reference_margin).float().mean().detach()
+                    ),
+                }
+            )
+        else:
+            zero = rewards.new_zeros(())
+            result.update(
+                {
+                    "reference_delta_mean": zero,
+                    "reference_delta_std": zero,
+                    "within_margin_fraction": zero,
+                }
+            )
+    return result
+
+
+def compute_reference_headroom_scene_weights(
+    raw_rewards: torch.Tensor,
+    valid_mask: torch.Tensor,
+    reference_selected_reward: torch.Tensor,
+    reference_valid_mask: torch.Tensor = None,
+    margin: float = 0.01,
+    scale: float = 0.05,
+):
+    """Compute detached per-scene update weights from deployable reference reward."""
+    if raw_rewards.ndim != 2 or valid_mask.shape != raw_rewards.shape:
+        raise ValueError("raw_rewards and valid_mask must have shape [batch, num_modes]")
+    if reference_selected_reward.shape != (raw_rewards.shape[0],):
+        raise ValueError("reference_selected_reward must have shape [batch]")
+    if margin < 0:
+        raise ValueError("reference gate margin must be non-negative")
+    if scale <= 0:
+        raise ValueError("reference gate scale must be positive")
+
+    valid_mask = valid_mask.bool() & torch.isfinite(raw_rewards)
+    has_candidate = valid_mask.any(dim=-1)
+    oracle_reward = raw_rewards.float().masked_fill(
+        ~valid_mask, float("-inf")
+    ).max(dim=-1).values
+    if reference_valid_mask is None:
+        reference_valid_mask = torch.isfinite(reference_selected_reward)
+    else:
+        if reference_valid_mask.shape != (raw_rewards.shape[0],):
+            raise ValueError("reference_valid_mask must have shape [batch]")
+        reference_valid_mask = (
+            reference_valid_mask.bool() & torch.isfinite(reference_selected_reward)
+        )
+    valid_scene = has_candidate & reference_valid_mask
+    headroom = oracle_reward - reference_selected_reward.float()
+    headroom = torch.where(valid_scene, headroom, torch.zeros_like(headroom))
+    weights = ((headroom - margin) / scale).clamp(0.0, 1.0)
+    weights = torch.where(valid_scene, weights, torch.zeros_like(weights))
+    return weights.detach(), headroom.detach(), valid_scene.detach()
+
+
+def compute_selector_consistency_kl(
+    current_logits: torch.Tensor,
+    reference_logits: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Return KL(reference || current) on the same candidate trace.
+
+    The reference logits are detached so the regularizer can constrain shared
+    current-policy features while the fixed reference policy stays frozen.
+    """
+    if current_logits.shape != reference_logits.shape or current_logits.ndim != 2:
+        raise ValueError(
+            "current and reference selector logits must have identical "
+            "[batch, num_modes] shapes"
+        )
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+
+    current_log_probs = F.log_softmax(current_logits.float() / temperature, dim=-1)
+    reference_probs = F.softmax(
+        reference_logits.detach().float() / temperature, dim=-1
+    )
+    return F.kl_div(
+        current_log_probs,
+        reference_probs,
+        reduction="batchmean",
+    )
 
 
 def transfuser_loss(
@@ -188,6 +653,9 @@ def transfuser_loss(
     grpo_weight = getattr(config, "policy_loss_weight", 1.0)
     kl_weight = getattr(config, "kl_loss_weight", 0.01)
     entropy_weight = getattr(config, "selection_entropy_weight", 0.0)
+    valid_mask = predictions.get(
+        "reward_valid_mask", torch.ones_like(predictions["rewards"], dtype=torch.bool)
+    ) if predictions.get("rewards") is not None else None
 
     if "rewards" not in predictions or predictions["rewards"] is None:
         zero = current_logits.sum() * 0.0
@@ -202,26 +670,135 @@ def transfuser_loss(
     if predictions.get("final_ref_poses_cls") is None:
         raise ValueError("GRPO training requires final_ref_poses_cls")
 
+    scene_weight_mode = getattr(config, "grpo_scene_weight_mode", "uniform")
+    if scene_weight_mode == "uniform":
+        scene_weights = torch.ones(
+            current_logits.shape[0],
+            device=current_logits.device,
+            dtype=current_logits.dtype,
+        )
+        headroom = None
+        reference_scene_valid = None
+    elif scene_weight_mode == "reference_headroom":
+        raw_for_gate = predictions.get("raw_rewards")
+        reference_reward = predictions.get("reference_selected_reward")
+        if raw_for_gate is None or reference_reward is None:
+            if predictions.get("grpo_training_rollout", True):
+                raise ValueError(
+                    "reference_headroom gating requires raw_rewards and "
+                    "reference_selected_reward during training"
+                )
+            scene_weights = torch.ones(
+                current_logits.shape[0],
+                device=current_logits.device,
+                dtype=current_logits.dtype,
+            )
+            headroom = None
+            reference_scene_valid = None
+        else:
+            scene_weights, headroom, reference_scene_valid = (
+                compute_reference_headroom_scene_weights(
+                    raw_rewards=raw_for_gate,
+                    valid_mask=valid_mask,
+                    reference_selected_reward=reference_reward,
+                    reference_valid_mask=predictions.get("reference_reward_valid_mask"),
+                    margin=getattr(config, "grpo_reference_gate_margin", 0.01),
+                    scale=getattr(config, "grpo_reference_gate_scale", 0.05),
+                )
+            )
+    else:
+        raise ValueError(
+            "grpo_scene_weight_mode must be one of "
+            "{'uniform', 'reference_headroom'}"
+        )
+
+    exploration_floor = getattr(config, "selection_exploration_floor", 0.0)
+    behavior_weighting = getattr(
+        config, "selection_behavior_weighting", "old_policy"
+    )
     objective = compute_grpo_objective(
         current_logits=current_logits,
         old_logits=predictions["final_old_poses_cls"],
         reference_logits=predictions["final_ref_poses_cls"],
         rewards=predictions["rewards"],
-        valid_mask=predictions.get(
-            "reward_valid_mask", torch.ones_like(predictions["rewards"], dtype=torch.bool)
-        ),
+        valid_mask=valid_mask,
         clip_ratio=getattr(config, "grpo_clip_ratio", 0.2),
         advantage_eps=getattr(config, "grpo_advantage_eps", 1e-3),
         temperature=getattr(config, "selection_temperature", 1.0),
+        exploration_floor=exploration_floor,
+        behavior_weighting=behavior_weighting,
+        scene_weights=scene_weights,
     )
+    raw_rewards = predictions.get("raw_rewards")
+    raw_objective = None
+    if raw_rewards is not None:
+        raw_objective = compute_grpo_objective(
+            current_logits=current_logits,
+            old_logits=predictions["final_old_poses_cls"],
+            reference_logits=predictions["final_ref_poses_cls"],
+            rewards=raw_rewards,
+            valid_mask=predictions.get(
+                "reward_valid_mask",
+                torch.ones_like(raw_rewards, dtype=torch.bool),
+            ),
+            clip_ratio=getattr(config, "grpo_clip_ratio", 0.2),
+            advantage_eps=getattr(config, "grpo_advantage_eps", 1e-3),
+            temperature=getattr(config, "selection_temperature", 1.0),
+            exploration_floor=exploration_floor,
+            behavior_weighting=behavior_weighting,
+        )
 
     training_mode = getattr(config, "grpo_training_mode", "classification_shared")
     selection_weight = 0.0 if training_mode == "generation" else grpo_weight
+    selection_regularization_enabled = training_mode != "generation"
+    rank_weight = (
+        getattr(config, "selection_rank_loss_weight", 0.0)
+        if selection_regularization_enabled else 0.0
+    )
+    if rank_weight < 0:
+        raise ValueError("selection_rank_loss_weight must be non-negative")
+    rank_objective = None
+    if rank_weight > 0:
+        ranking_rewards = raw_rewards
+        if (
+            ranking_rewards is None
+            and not predictions.get("grpo_training_rollout", True)
+            and getattr(config, "grpo_reward_mode", "pdms") == "pdms"
+        ):
+            ranking_rewards = predictions["rewards"]
+        if ranking_rewards is None:
+            raise ValueError("selector ranking requires raw_rewards during training")
+        rank_objective = compute_pairwise_reward_ranking_objective(
+            current_logits=current_logits,
+            rewards=ranking_rewards,
+            valid_mask=predictions.get(
+                "reward_valid_mask", torch.ones_like(ranking_rewards, dtype=torch.bool)
+            ),
+            reward_gap=getattr(config, "selection_rank_reward_gap", 0.01),
+            reward_scale=getattr(config, "selection_rank_reward_scale", 0.10),
+            logit_margin=getattr(config, "selection_rank_logit_margin", 0.20),
+            scene_weights=scene_weights,
+        )
     total_loss = (
         selection_weight * objective["policy_loss"]
-        + kl_weight * objective["kl_loss"]
-        - entropy_weight * objective["entropy_for_loss"]
+        + (rank_weight * rank_objective["rank_loss"] if rank_objective is not None else 0.0)
+        + (kl_weight if selection_regularization_enabled else 0.0)
+        * objective["kl_loss"]
+        - (entropy_weight if selection_regularization_enabled else 0.0)
+        * objective["entropy_for_loss"]
     )
+
+    selector_consistency_kl = compute_selector_consistency_kl(
+        current_logits=current_logits,
+        reference_logits=predictions["final_ref_poses_cls"],
+        temperature=getattr(config, "selection_temperature", 1.0),
+    )
+    selector_consistency_weight = (
+        getattr(config, "selector_consistency_kl_weight", 0.0)
+        if training_mode == "generation"
+        else 0.0
+    )
+    total_loss = total_loss + selector_consistency_weight * selector_consistency_kl
 
     generation_objective = None
     if (
@@ -236,17 +813,73 @@ def transfuser_loss(
         missing = [key for key in required if predictions.get(key) is None]
         if missing:
             raise ValueError(f"Missing generation GRPO tensors: {missing}")
+        generation_mode_weighting = getattr(
+            config, "generation_mode_weighting", "uniform"
+        )
+        generation_mode_temperature = float(
+            getattr(config, "generation_mode_temperature", 1.0)
+        )
+        if generation_mode_temperature <= 0:
+            raise ValueError("generation_mode_temperature must be positive")
+        if generation_mode_weighting == "uniform":
+            generation_mode_weights = None
+        elif generation_mode_weighting == "selector_softmax":
+            generation_mode_weights = F.softmax(
+                current_logits.detach() / generation_mode_temperature,
+                dim=-1,
+            )
+        elif generation_mode_weighting == "selector_top1":
+            generation_mode_weights = F.one_hot(
+                current_logits.detach().argmax(dim=-1),
+                num_classes=current_logits.shape[-1],
+            ).to(current_logits.dtype)
+        else:
+            raise ValueError(
+                "generation_mode_weighting must be one of "
+                "{'uniform', 'selector_softmax', 'selector_top1'}"
+            )
+        generation_advantage_mode = getattr(
+            config, "generation_advantage_mode", "group_zscore"
+        )
+        generation_rewards = predictions["rewards"]
+        if generation_advantage_mode == "reference_centered":
+            generation_rewards = predictions.get("raw_rewards")
+            if generation_rewards is None:
+                raise ValueError(
+                    "reference_centered generation advantage requires raw_rewards"
+                )
         generation_objective = compute_generation_grpo_objective(
             current_log_probs=predictions["generation_current_log_probs"],
             old_log_probs=predictions["generation_old_log_probs"],
             generation_kl=predictions["generation_kl"],
-            rewards=predictions["rewards"],
+            rewards=generation_rewards,
             valid_mask=predictions.get(
                 "reward_valid_mask",
-                torch.ones_like(predictions["rewards"], dtype=torch.bool),
+                torch.ones_like(generation_rewards, dtype=torch.bool),
             ),
+            mode_weights=generation_mode_weights,
             clip_ratio=getattr(config, "grpo_clip_ratio", 0.2),
             advantage_eps=getattr(config, "grpo_advantage_eps", 1e-3),
+            scene_weights=scene_weights,
+            advantage_mode=generation_advantage_mode,
+            reference_selected_reward=predictions.get(
+                "reference_selected_reward"
+            ),
+            reference_valid_mask=predictions.get(
+                "reference_reward_valid_mask"
+            ),
+            reference_margin=getattr(
+                config, "reference_advantage_margin", 0.01
+            ),
+            reference_scale=getattr(
+                config, "reference_advantage_scale", 0.10
+            ),
+            reference_clip=getattr(
+                config, "reference_advantage_clip", 2.0
+            ),
+            rollouts_per_mode=getattr(
+                config, "grpo_rollouts_per_mode", 1
+            ),
         )
         total_loss = (
             total_loss
@@ -260,11 +893,44 @@ def transfuser_loss(
         "loss": total_loss,
         "grpo_loss": selection_weight * objective["policy_loss"],
         "kl_loss": objective["kl_loss"],
+        "selector_consistency_kl_loss": selector_consistency_kl,
         **{
             key: value for key, value in objective.items()
             if key not in {"policy_loss", "kl_loss", "entropy_for_loss"}
         },
+        "grpo_scene_weight": scene_weights.float().mean().detach(),
+        "active_scene_fraction": (scene_weights > 0).float().mean().detach(),
     }
+    if rank_objective is not None:
+        result.update(rank_objective)
+    else:
+        result["rank_loss"] = current_logits.detach().new_zeros(())
+    if headroom is not None:
+        result["oracle_headroom"] = (
+            headroom[reference_scene_valid].mean().detach()
+            if reference_scene_valid.any()
+            else headroom.new_zeros(())
+        )
+        reference_reward = predictions["reference_selected_reward"].float()
+        result["reference_selected_reward"] = (
+            reference_reward[reference_scene_valid].mean().detach()
+            if reference_scene_valid.any()
+            else reference_reward.new_zeros(())
+        )
+    elif predictions.get("reference_selected_reward") is not None:
+        reference_reward = predictions["reference_selected_reward"].float()
+        reference_valid = predictions.get("reference_reward_valid_mask")
+        if reference_valid is None:
+            reference_valid = torch.isfinite(reference_reward)
+        else:
+            reference_valid = reference_valid.bool() & torch.isfinite(
+                reference_reward
+            )
+        result["reference_selected_reward"] = (
+            reference_reward[reference_valid].mean().detach()
+            if reference_valid.any()
+            else reference_reward.new_zeros(())
+        )
     if generation_objective is not None:
         result.update(
             {
@@ -272,8 +938,39 @@ def transfuser_loss(
                 "generation_kl_loss": generation_objective["kl_loss"],
                 "generation_ratio_mean": generation_objective["ratio_mean"],
                 "generation_clip_fraction": generation_objective["clip_fraction"],
+                "generation_policy_active_scene_fraction": generation_objective[
+                    "policy_active_scene_fraction"
+                ],
+                "generation_positive_advantage_fraction": generation_objective[
+                    "positive_advantage_fraction"
+                ],
+                "generation_negative_advantage_fraction": generation_objective[
+                    "negative_advantage_fraction"
+                ],
             }
         )
+        for key in (
+            "reference_delta_mean",
+            "reference_delta_std",
+            "within_margin_fraction",
+            "within_anchor_pair_fraction",
+            "within_anchor_reward_gap_mean",
+        ):
+            if key in generation_objective:
+                result[f"generation_{key}"] = generation_objective[key]
+    if raw_objective is not None:
+        result.update(
+            {
+                "raw_reward_mean": raw_objective["reward_mean"],
+                "raw_reward_std": raw_objective["reward_std"],
+                "raw_selected_reward": raw_objective["selected_reward"],
+                "raw_oracle_reward": raw_objective["oracle_reward"],
+                "raw_selection_regret": raw_objective["selection_regret"],
+            }
+        )
+    tie_epsilon = predictions.get("reward_tiebreak_epsilon")
+    if tie_epsilon is not None:
+        result["reward_tiebreak_epsilon"] = tie_epsilon.float().mean().detach()
     return result
 
 

@@ -14,6 +14,10 @@ from navsim.common.dataclasses import SceneFilter
 from navsim.common.dataloader import MetricCacheLoader, SceneLoader
 from navsim.planning.training.dataset import CacheOnlyDataset, Dataset
 from navsim.planning.training.agent_lightning_module import AgentLightningModule
+from navsim.planning.training.grpo_sampler import (
+    BalancedPriorityBatchSampler,
+    load_manifest_tokens,
+)
 
 from pytorch_lightning.loggers import TensorBoardLogger  #
 from pytorch_lightning.strategies import DDPStrategy 
@@ -166,7 +170,52 @@ def main(cfg: DictConfig) -> None:
         assert len(val_data) > 0, "No validation token overlaps metric_cache_path!"
 
     logger.info("Building Datasets")
-    train_dataloader = DataLoader(train_data, collate_fn=custom_collate_fn,  **cfg.dataloader.params, shuffle=True)
+    priority_manifest_path = str(
+        getattr(agent_config, "grpo_priority_manifest_path", "")
+    )
+    priority_fraction = float(
+        getattr(agent_config, "grpo_priority_sample_fraction", 0.0)
+    )
+    if priority_manifest_path:
+        if not 0.0 < priority_fraction < 1.0:
+            raise ValueError(
+                "grpo_priority_sample_fraction must be between 0 and 1 "
+                "when a priority manifest is configured"
+            )
+        priority_tokens = load_manifest_tokens(Path(priority_manifest_path))
+        train_loader_params = dict(cfg.dataloader.params)
+        batch_size = int(train_loader_params.pop("batch_size"))
+        batch_sampler = BalancedPriorityBatchSampler(
+            train_data.tokens,
+            priority_tokens,
+            batch_size=batch_size,
+            priority_fraction=priority_fraction,
+            seed=int(cfg.seed),
+        )
+        train_dataloader = DataLoader(
+            train_data,
+            collate_fn=custom_collate_fn,
+            batch_sampler=batch_sampler,
+            **train_loader_params,
+        )
+        logger.info(
+            "GRPO balanced sampler: priority=%d common=%d fraction=%.3f batches=%d",
+            len(batch_sampler.priority_indices),
+            len(batch_sampler.common_indices),
+            priority_fraction,
+            len(batch_sampler),
+        )
+    else:
+        if priority_fraction != 0.0:
+            raise ValueError(
+                "grpo_priority_sample_fraction requires a priority manifest"
+            )
+        train_dataloader = DataLoader(
+            train_data,
+            collate_fn=custom_collate_fn,
+            **cfg.dataloader.params,
+            shuffle=True,
+        )
     logger.info("Num training samples: %d", len(train_data))
     val_dataloader = DataLoader(val_data, collate_fn=custom_collate_fn, **cfg.dataloader.params, shuffle=False)
     logger.info("Num validation samples: %d", len(val_data))

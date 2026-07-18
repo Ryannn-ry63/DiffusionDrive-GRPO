@@ -24,13 +24,22 @@ from navsim.agents.diffusiondrive.modules.blocks import (
     linear_relu_ln, bias_init_with_prob, gen_sineembed_for_position, GridSampleCrossBEVAttention,
 )
 from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
-from navsim.agents.diffusiondrive.diffusion_grpo import collect_generation_trace
+from navsim.agents.diffusiondrive.diffusion_grpo import (
+    collect_generation_trace,
+    compute_pdm_dense_rewards,
+    compute_pdm_tiebreak_rewards,
+    flatten_generation_rollouts,
+)
 
 from navsim.common.dataclasses import Trajectory
 from navsim.common.dataloader import MetricCacheLoader
 from navsim.evaluate.pdm_score import pdm_score, transform_trajectory, get_trajectory_as_array
 from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
 from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer, PDMScorerConfig
+from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import (
+    MultiMetricIndex,
+    WeightedMetricIndex,
+)
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 class V2TransfuserModel(nn.Module):
     """Torch module for Transfuser."""
@@ -471,9 +480,66 @@ class TrajectoryHead(nn.Module):
             getattr(config, "diffusion_scheduler_num_inference_steps", 125)
         )
         self._grpo_training_mode = getattr(config, "grpo_training_mode", "classification_shared")
+        self._grpo_scene_weight_mode = str(
+            getattr(config, "grpo_scene_weight_mode", "uniform")
+        )
+        if self._grpo_scene_weight_mode not in {"uniform", "reference_headroom"}:
+            raise ValueError(
+                "grpo_scene_weight_mode must be one of "
+                "{'uniform', 'reference_headroom'}; "
+                f"got {self._grpo_scene_weight_mode!r}"
+            )
         self._generation_ddim_eta = float(getattr(config, "generation_ddim_eta", 1.0))
         self._generation_final_std = float(getattr(config, "generation_final_std", 0.05))
         self._generation_sigma_min = float(getattr(config, "generation_sigma_min", 1e-4))
+        self._generation_advantage_mode = str(
+            getattr(config, "generation_advantage_mode", "group_zscore")
+        )
+        if self._generation_advantage_mode not in {
+            "group_zscore",
+            "reference_centered",
+            "within_anchor",
+            "hierarchical",
+        }:
+            raise ValueError(
+                "generation_advantage_mode must be one of "
+                "{'group_zscore', 'reference_centered', "
+                "'within_anchor', 'hierarchical'}; "
+                f"got {self._generation_advantage_mode!r}"
+            )
+        self._grpo_rollouts_per_mode = int(
+            getattr(config, "grpo_rollouts_per_mode", 1)
+        )
+        if self._grpo_rollouts_per_mode not in {1, 2}:
+            raise ValueError(
+                "grpo_rollouts_per_mode must be 1 or 2"
+            )
+        hierarchical_mode = self._generation_advantage_mode in {
+            "within_anchor",
+            "hierarchical",
+        }
+        if hierarchical_mode != (self._grpo_rollouts_per_mode == 2):
+            raise ValueError(
+                "within_anchor/hierarchical require grpo_rollouts_per_mode=2; "
+                "group_zscore/reference_centered require 1"
+            )
+        self._grpo_reward_mode = str(getattr(config, "grpo_reward_mode", "pdms"))
+        if self._grpo_reward_mode not in {"pdms", "pdm_tiebreak", "pdm_dense"}:
+            raise ValueError(
+                "grpo_reward_mode must be one of "
+                "{'pdms', 'pdm_tiebreak', 'pdm_dense'}; "
+                f"got {self._grpo_reward_mode!r}"
+            )
+        self._pdm_tiebreak_max_epsilon = float(
+            getattr(config, "pdm_tiebreak_max_epsilon", 1e-3)
+        )
+        if self._pdm_tiebreak_max_epsilon <= 0:
+            raise ValueError("pdm_tiebreak_max_epsilon must be positive")
+        self._pdm_dense_weight = float(
+            getattr(config, "pdm_dense_weight", 0.1)
+        )
+        if self._pdm_dense_weight < 0:
+            raise ValueError("pdm_dense_weight must be non-negative")
         self._validate_roll_schedule()
 
         self.loss_computer = LossComputer(config)
@@ -643,6 +709,70 @@ class TrajectoryHead(nn.Module):
 
         return poses_reg, poses_cls
 
+    def _compute_reference_selected_reward(
+        self,
+        final_poses_reg,
+        final_ref_poses_cls,
+        raw_rewards,
+        reward_valid_mask,
+        initial_sample,
+        ego_query,
+        agents_query,
+        bev_feature,
+        bev_spatial_shape,
+        status_encoding,
+        global_img,
+        tokens_list,
+    ):
+        """Score the fixed-reference deployed choice without policy gradients."""
+        if self._grpo_training_mode in {"generation", "joint"}:
+            with torch.no_grad():
+                reference_reg, reference_cls = self._run_policy_rollout(
+                    self.ref_policy,
+                    initial_sample.detach(),
+                    ego_query.detach(),
+                    agents_query.detach(),
+                    bev_feature.detach(),
+                    bev_spatial_shape,
+                    status_encoding.detach(),
+                    global_img.detach() if global_img is not None else None,
+                )
+                reference_idx = reference_cls.argmax(dim=-1)
+                batch_idx = torch.arange(
+                    reference_reg.shape[0], device=reference_reg.device
+                )
+                reference_trajectory = reference_reg[
+                    batch_idx, reference_idx
+                ].unsqueeze(1)
+
+            with torch.no_grad():
+                if self._lazy_metric_cache is not None:
+                    reference_result = self._compute_rewards_from_lazy_cache(
+                        reference_trajectory, tokens_list, 1
+                    )
+                elif self.metric_cache_loader is not None:
+                    reference_result = self._compute_rewards_from_disk(
+                        reference_trajectory, tokens_list, 1
+                    )
+                else:
+                    reference_result = None
+            if reference_result is None:
+                raise RuntimeError("Reference gate requires a PDM metric cache")
+            reference_reward = reference_result["raw_rewards"][:, 0]
+            reference_valid = reference_result["valid_mask"][:, 0]
+        else:
+            # The generator is frozen in selector-only stages. Use the
+            # fixed-reference selector's mode on the current candidate group.
+            reference_idx = final_ref_poses_cls.detach().argmax(dim=-1)
+            reference_reward = raw_rewards.gather(
+                1, reference_idx.unsqueeze(-1)
+            ).squeeze(-1)
+            reference_valid = reward_valid_mask.gather(
+                1, reference_idx.unsqueeze(-1)
+            ).squeeze(-1)
+
+        return reference_reward.detach(), reference_valid.detach()
+
     def forward_train_grpo(
         self, ego_query, agents_query, bev_feature, bev_spatial_shape,
         status_encoding, targets=None, global_img=None, tokens_list=None,
@@ -671,22 +801,52 @@ class TrajectoryHead(nn.Module):
 
         generation_outputs = {}
         if self._grpo_training_mode in {"generation", "joint"}:
+            rollout_count = self._grpo_rollouts_per_mode
+            if rollout_count == 1:
+                trace_initial_sample = initial_sample
+                trace_ego_query = ego_query
+                trace_agents_query = agents_query
+                trace_bev_feature = bev_feature
+                trace_status_encoding = status_encoding
+                trace_global_img = global_img
+            else:
+                trace_initial_sample = initial_sample.repeat_interleave(
+                    rollout_count, dim=0
+                )
+                trace_ego_query = ego_query.repeat_interleave(rollout_count, dim=0)
+                trace_agents_query = agents_query.repeat_interleave(
+                    rollout_count, dim=0
+                )
+                trace_bev_feature = bev_feature.repeat_interleave(
+                    rollout_count, dim=0
+                )
+                trace_status_encoding = status_encoding.repeat_interleave(
+                    rollout_count, dim=0
+                )
+                trace_global_img = (
+                    global_img.repeat_interleave(rollout_count, dim=0)
+                    if global_img is not None
+                    else None
+                )
             trace = collect_generation_trace(
                 self,
-                initial_sample,
-                ego_query,
-                agents_query,
-                bev_feature,
+                trace_initial_sample,
+                trace_ego_query,
+                trace_agents_query,
+                trace_bev_feature,
                 bev_spatial_shape,
-                status_encoding,
-                global_img,
+                trace_status_encoding,
+                trace_global_img,
             )
+            trace = {
+                key: flatten_generation_rollouts(value, bs, rollout_count)
+                for key, value in trace.items()
+            }
             final_poses_reg = trace["trajectories"]
-            final_poses_cls = (
-                trace["current_cls"]
-                if self._grpo_training_mode == "joint"
-                else trace["reference_cls"]
-            )
+            # Always expose current selector logits. Generation-only keeps the
+            # classification branches frozen and its selection policy weight
+            # at zero; the logits support metrics and optional consistency KL.
+            final_poses_cls = trace["current_cls"]
             final_old_poses_cls = trace["old_cls"]
             final_ref_poses_cls = trace["reference_cls"]
             generation_outputs = {
@@ -713,7 +873,9 @@ class TrajectoryHead(nn.Module):
                 )
 
         rewards = None
+        raw_rewards = None
         reward_valid_mask = None
+        reward_tiebreak_epsilon = None
         num_modes = final_poses_cls.shape[-1]
         if tokens_list is not None:
             if self._lazy_metric_cache is not None:
@@ -727,11 +889,10 @@ class TrajectoryHead(nn.Module):
             else:
                 reward_result = None
             if reward_result is not None:
-                if isinstance(reward_result, tuple):
-                    rewards, reward_valid_mask = reward_result
-                else:
-                    rewards = reward_result
-                    reward_valid_mask = torch.isfinite(rewards)
+                rewards = reward_result["training_rewards"]
+                raw_rewards = reward_result["raw_rewards"]
+                reward_valid_mask = reward_result["valid_mask"]
+                reward_tiebreak_epsilon = reward_result["tiebreak_epsilon"]
         if rewards is None or reward_valid_mask is None:
             raise RuntimeError(
                 "GRPO training requires PDM rewards and scene tokens for every batch"
@@ -739,6 +900,30 @@ class TrajectoryHead(nn.Module):
         if not reward_valid_mask.any():
             raise RuntimeError(
                 f"No valid PDM reward in batch; tokens={list(tokens_list or [])}"
+            )
+
+        reference_selected_reward = None
+        reference_reward_valid_mask = None
+        if (
+            self._grpo_scene_weight_mode == "reference_headroom"
+            or self._generation_advantage_mode
+            in {"reference_centered", "hierarchical"}
+        ):
+            reference_selected_reward, reference_reward_valid_mask = (
+                self._compute_reference_selected_reward(
+                    final_poses_reg=final_poses_reg,
+                    final_ref_poses_cls=final_ref_poses_cls,
+                    raw_rewards=raw_rewards,
+                    reward_valid_mask=reward_valid_mask,
+                    initial_sample=initial_sample,
+                    ego_query=ego_query,
+                    agents_query=agents_query,
+                    bev_feature=bev_feature,
+                    bev_spatial_shape=bev_spatial_shape,
+                    status_encoding=status_encoding,
+                    global_img=global_img,
+                    tokens_list=tokens_list,
+                )
             )
 
         mode_idx = final_poses_cls.argmax(dim=-1)
@@ -749,7 +934,12 @@ class TrajectoryHead(nn.Module):
             "final_old_poses_cls": final_old_poses_cls,
             "final_ref_poses_cls": final_ref_poses_cls,
             "rewards": rewards,
+            "raw_rewards": raw_rewards,
             "reward_valid_mask": reward_valid_mask,
+            "reward_tiebreak_epsilon": reward_tiebreak_epsilon,
+            "reference_selected_reward": reference_selected_reward,
+            "reference_reward_valid_mask": reference_reward_valid_mask,
+            "grpo_training_rollout": True,
             "num_modes": num_modes,
             "mode_idx": mode_idx,
             **generation_outputs,
@@ -953,6 +1143,7 @@ class TrajectoryHead(nn.Module):
 
         rewards = None
         reward_valid_mask = None
+        reward_component_scores = None
         if tokens_list is not None:
             if self._lazy_metric_cache is not None:
                 reward_result = self._compute_rewards_from_lazy_cache(
@@ -965,28 +1156,30 @@ class TrajectoryHead(nn.Module):
             else:
                 reward_result = None
             if reward_result is not None:
-                if isinstance(reward_result, tuple):
-                    rewards, reward_valid_mask = reward_result
-                else:
-                    rewards = reward_result
-                    reward_valid_mask = torch.isfinite(rewards)
+                # Evaluation and checkpoint selection always use aggregate
+                # PDMS, even when training used the component tie-break.
+                rewards = reward_result["raw_rewards"]
+                reward_valid_mask = reward_result["valid_mask"]
+                reward_component_scores = reward_result["component_scores"]
 
         output_dict = {
-        "trajectory": best_reg,                    # 主输出（必需）
-        "final_poses_reg": final_poses_reg,
-        "final_poses_cls": final_poses_cls,        # GRPO损失必需
-        "final_ref_poses_cls": final_ref_poses_cls,
-        "final_old_poses_cls": final_poses_cls,
-        "rewards": rewards,
-        "reward_valid_mask": reward_valid_mask,
-        "num_modes": num_modes                     # 
+            "trajectory": best_reg,
+            "final_poses_reg": final_poses_reg,
+            "final_poses_cls": final_poses_cls,
+            "final_ref_poses_cls": final_ref_poses_cls,
+            "final_old_poses_cls": final_poses_cls,
+            "rewards": rewards,
+            "reward_valid_mask": reward_valid_mask,
+            "reward_component_scores": reward_component_scores,
+            "num_modes": num_modes,
+            "grpo_training_rollout": False,
         }
         #print(f"[TEST] 返回 - rewards: {output_dict['rewards']}, 其他keys: {list(output_dict.keys())}")
         return output_dict
 
     def _compute_rewards_from_lazy_cache(
         self, trajectories: torch.Tensor, tokens_list, num_modes: int,
-    ) -> torch.Tensor:
+    ) -> Dict[str, torch.Tensor]:
         """Compute rewards using lazily loaded metric caches (first hit reads disk, then cached)."""
         cache_dict = {}
         for token in set(tokens_list):
@@ -995,7 +1188,7 @@ class TrajectoryHead(nn.Module):
 
     def _compute_rewards_from_disk(
         self, trajectories: torch.Tensor, tokens_list, num_modes: int,
-    ) -> torch.Tensor:
+    ) -> Dict[str, torch.Tensor]:
         """Original fallback: load metric caches from disk per step (slowest)."""
         cache_dict = {}
         for token in set(tokens_list):
@@ -1016,11 +1209,14 @@ class TrajectoryHead(nn.Module):
         tokens_list,
         num_modes: int,
         cache_dict: Dict[str, Any],
-    ) -> torch.Tensor:
+    ) -> Dict[str, torch.Tensor]:
         """Batched PDM reward: simulate all modes per token in one call instead of one-by-one."""
         batch_size = trajectories.shape[0]
         pred_np = trajectories.reshape(-1, 8, 3).detach().cpu().numpy()
         rewards = np.full(batch_size * num_modes, np.nan, dtype=np.float32)
+        components = np.full(
+            (batch_size * num_modes, 6), np.nan, dtype=np.float32
+        )
         valid_mask = np.zeros(batch_size * num_modes, dtype=np.bool_)
         future_sampling = self.simulator.proposal_sampling
 
@@ -1072,24 +1268,70 @@ class TrajectoryHead(nn.Module):
                     metric_cache.route_lane_ids,
                     metric_cache.drivable_area_map,
                 )
+                multi_metrics = self.scorer._multi_metrics[:, 1:].copy()
+                weighted_metrics = self.scorer._weighted_metrics[:, 1:].copy()
 
                 # scores[0] = pdm reference; scores[1:] = predicted modes
                 for j, mode_idx in enumerate(valid_mode_indices):
                     score = float(scores[j + 1])
-                    if np.isfinite(score):
+                    component_values = np.asarray(
+                        [
+                            multi_metrics[MultiMetricIndex.NO_COLLISION, j],
+                            multi_metrics[MultiMetricIndex.DRIVABLE_AREA, j],
+                            weighted_metrics[WeightedMetricIndex.PROGRESS, j],
+                            weighted_metrics[WeightedMetricIndex.TTC, j],
+                            weighted_metrics[WeightedMetricIndex.COMFORTABLE, j],
+                            weighted_metrics[WeightedMetricIndex.DRIVING_DIRECTION, j],
+                        ],
+                        dtype=np.float32,
+                    )
+                    if np.isfinite(score) and np.isfinite(component_values).all():
                         rewards[mode_start + mode_idx] = score
+                        components[mode_start + mode_idx] = component_values
                         valid_mask[mode_start + mode_idx] = True
 
             except Exception:
                 pass
 
-        rewards_tensor = torch.tensor(
+        raw_rewards = torch.tensor(
             rewards, device=trajectories.device, dtype=trajectories.dtype,
-        ).detach()
-        valid_mask_tensor = torch.tensor(
+        ).detach().view(batch_size, num_modes)
+        component_tensor = torch.tensor(
+            components, device=trajectories.device, dtype=trajectories.dtype,
+        ).detach().view(batch_size, num_modes, 6)
+        valid_mask = torch.tensor(
             valid_mask, device=trajectories.device, dtype=torch.bool,
+        ).detach().view(batch_size, num_modes)
+        weighted_metric_weights = torch.as_tensor(
+            self.scorer._config.weighted_metrics_array,
+            device=trajectories.device,
+            dtype=trajectories.dtype,
         )
-        return (
-            rewards_tensor.view(batch_size, num_modes),
-            valid_mask_tensor.view(batch_size, num_modes),
+        shaped_rewards, secondary_score, tie_epsilon = compute_pdm_tiebreak_rewards(
+            aggregate_rewards=raw_rewards,
+            component_scores=component_tensor,
+            valid_mask=valid_mask,
+            weighted_metric_weights=weighted_metric_weights,
+            max_epsilon=self._pdm_tiebreak_max_epsilon,
         )
+        dense_rewards, _, _ = compute_pdm_dense_rewards(
+            aggregate_rewards=raw_rewards,
+            component_scores=component_tensor,
+            valid_mask=valid_mask,
+            weighted_metric_weights=weighted_metric_weights,
+            dense_weight=self._pdm_dense_weight,
+        )
+        if self._grpo_reward_mode == "pdm_tiebreak":
+            training_rewards = shaped_rewards
+        elif self._grpo_reward_mode == "pdm_dense":
+            training_rewards = dense_rewards
+        else:
+            training_rewards = raw_rewards
+        return {
+            "training_rewards": training_rewards,
+            "raw_rewards": raw_rewards,
+            "valid_mask": valid_mask,
+            "component_scores": component_tensor,
+            "secondary_score": secondary_score.detach(),
+            "tiebreak_epsilon": tie_epsilon.detach(),
+        }

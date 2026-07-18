@@ -2,6 +2,7 @@
 """Paired NAVSIM holdout evaluation for truncated-diffusion schedules."""
 
 import argparse
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -29,6 +30,15 @@ DEFAULT_CACHE = Path(
 DEFAULT_METRIC_CACHE = Path(
     "/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/metric_cache_trainval"
 )
+COMPONENT_NAMES = (
+    "collision",
+    "drivable",
+    "progress",
+    "ttc",
+    "comfort",
+    "direction",
+)
+SAFETY_COMPONENTS = ("collision", "drivable", "ttc")
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +47,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-path", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--metric-cache-path", type=Path, default=DEFAULT_METRIC_CACHE)
     parser.add_argument("--limit", type=int, default=1024)
+    parser.add_argument(
+        "--log-split",
+        choices=("train", "val"),
+        default="val",
+        help="Select cached train or val logs; defaults to the historical val behavior",
+    )
+    parser.add_argument(
+        "--tokens-file",
+        type=Path,
+        help="JSON token list or prior evaluation artifact whose record order is reused",
+    )
+    parser.add_argument(
+        "--baseline-artifact",
+        type=Path,
+        help="Prior evaluation artifact used for paired deltas and bootstrap CI",
+    )
+    parser.add_argument("--bootstrap-samples", type=int, default=10000)
+    parser.add_argument("--bootstrap-seed", type=int, default=20260716)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", default="cuda:0")
@@ -78,6 +106,38 @@ def pairwise_diversity(trajectories: torch.Tensor) -> torch.Tensor:
     return distances[:, upper].mean(dim=-1)
 
 
+def load_ordered_tokens(path: Path) -> list[str]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        tokens = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("records"), list):
+        tokens = [record["token"] for record in payload["records"]]
+    else:
+        raise ValueError(
+            "tokens file must be a JSON list or an evaluation artifact with records"
+        )
+    tokens = [str(token) for token in tokens]
+    if len(tokens) != len(set(tokens)):
+        raise ValueError(f"tokens file contains duplicate tokens: {path}")
+    return tokens
+
+
+def paired_bootstrap_ci(
+    differences: np.ndarray, samples: int, seed: int
+) -> list[float]:
+    if samples <= 0:
+        raise ValueError("bootstrap-samples must be positive")
+    rng = np.random.default_rng(seed)
+    means = np.empty(samples, dtype=np.float64)
+    for start in range(0, samples, 1000):
+        size = min(1000, samples - start)
+        indices = rng.integers(
+            0, differences.size, size=(size, differences.size)
+        )
+        means[start : start + size] = differences[indices].mean(axis=1)
+    return np.quantile(means, [0.025, 0.975]).tolist()
+
+
 def main() -> None:
     args = parse_args()
     if not args.checkpoint.is_file():
@@ -104,18 +164,31 @@ def main() -> None:
         Path(__file__).resolve().parents[2]
         / "navsim/planning/script/config/training/default_train_val_test_log_split.yaml"
     )
-    val_logs = list(OmegaConf.load(split_path).val_logs)
+    split_config = OmegaConf.load(split_path)
+    selected_logs = list(getattr(split_config, f"{args.log_split}_logs"))
     dataset = CacheOnlyDataset(
         cache_path=str(args.cache_path),
         feature_builders=agent.get_feature_builders(),
         target_builders=agent.get_target_builders(),
-        log_names=val_logs,
+        log_names=selected_logs,
     )
     rewardable = set(MetricCacheLoader(args.metric_cache_path).tokens)
-    dataset.tokens = sorted(set(dataset.tokens).intersection(rewardable))[: args.limit]
+    available = set(dataset.tokens).intersection(rewardable)
+    if args.tokens_file is not None:
+        requested_tokens = load_ordered_tokens(args.tokens_file)[: args.limit]
+        missing_tokens = [token for token in requested_tokens if token not in available]
+        if missing_tokens:
+            raise RuntimeError(
+                f"{len(missing_tokens)} fixed tokens are unavailable; "
+                f"first missing token={missing_tokens[0]}"
+            )
+        dataset.tokens = requested_tokens
+    else:
+        dataset.tokens = sorted(available)[: args.limit]
     if len(dataset.tokens) != args.limit:
         raise RuntimeError(
-            f"Requested {args.limit} tokens, found only {len(dataset.tokens)} rewardable validation tokens"
+            f"Requested {args.limit} tokens, found only {len(dataset.tokens)} "
+            f"rewardable {args.log_split} tokens"
         )
 
     loader = DataLoader(
@@ -135,6 +208,7 @@ def main() -> None:
     entropy_values = []
     diversity_values = []
     rank_values = []
+    component_values = {name: [] for name in COMPONENT_NAMES}
 
     with torch.inference_mode():
         for batch_idx, (features, targets, tokens) in enumerate(loader):
@@ -147,9 +221,16 @@ def main() -> None:
             valid = predictions["reward_valid_mask"].bool()
             logits = predictions["final_poses_cls"].float()
             trajectories = predictions["final_poses_reg"].float()
+            components = predictions["reward_component_scores"].float()
+            masked_logits = logits.masked_fill(~valid, torch.finfo(logits.dtype).min)
+            selector_probs = torch.softmax(masked_logits, dim=-1) * valid.float()
 
             selected_idx = logits.argmax(dim=-1)
             selected = rewards.gather(1, selected_idx[:, None]).squeeze(1)
+            selected_components = components.gather(
+                1,
+                selected_idx[:, None, None].expand(-1, 1, len(COMPONENT_NAMES)),
+            ).squeeze(1)
             oracle_idx = rewards.masked_fill(~valid, float("-inf")).argmax(dim=-1)
             oracle = rewards.gather(1, oracle_idx[:, None]).squeeze(1)
             entropy = torch.distributions.Categorical(logits=logits).entropy()
@@ -171,6 +252,14 @@ def main() -> None:
                 hit_value = float(selected_idx[row] == oracle_idx[row])
                 entropy_value = float(entropy[row].item())
                 diversity_value = float(diversity[row].item())
+                selected_mode = int(selected_idx[row].item())
+                oracle_mode = int(oracle_idx[row].item())
+                valid_logits = logits[row, mask]
+                if valid_logits.numel() >= 2:
+                    top_logits = torch.topk(valid_logits, k=2).values
+                    selector_margin = float((top_logits[0] - top_logits[1]).item())
+                else:
+                    selector_margin = 0.0
 
                 selected_values.append(selected_value)
                 oracle_values.append(oracle_value)
@@ -179,6 +268,12 @@ def main() -> None:
                 entropy_values.append(entropy_value)
                 diversity_values.append(diversity_value)
                 rank_values.append(correlation)
+                component_record = {
+                    name: float(selected_components[row, index].item())
+                    for index, name in enumerate(COMPONENT_NAMES)
+                }
+                for name, value in component_record.items():
+                    component_values[name].append(value)
                 records.append(
                     {
                         "token": token,
@@ -187,9 +282,28 @@ def main() -> None:
                         "regret": oracle_value - selected_value,
                         "candidate_reward": candidate_value,
                         "oracle_hit": hit_value,
+                        "selected_mode": selected_mode,
+                        "oracle_mode": oracle_mode,
+                        "selector_margin": selector_margin,
+                        "selected_probability": float(
+                            selector_probs[row, selected_mode].item()
+                        ),
+                        "oracle_probability": float(
+                            selector_probs[row, oracle_mode].item()
+                        ),
+                        "candidate_rewards": [
+                            float(rewards[row, mode].item())
+                            if bool(valid[row, mode]) else None
+                            for mode in range(rewards.shape[1])
+                        ],
+                        "selector_probabilities": [
+                            float(selector_probs[row, mode].item())
+                            for mode in range(rewards.shape[1])
+                        ],
                         "entropy": entropy_value,
                         "diversity": diversity_value,
                         "reward_logit_spearman": correlation,
+                        "selected_components": component_record,
                     }
                 )
 
@@ -199,6 +313,7 @@ def main() -> None:
     summary = {
         "checkpoint": str(args.checkpoint),
         "num_tokens": len(records),
+        "log_split": args.log_split,
         "schedule": agent._transfuser_model._trajectory_head.get_roll_schedule(),
         "selected_reward": float(np.mean(selected_values)),
         "oracle_reward": float(np.mean(oracle_values)),
@@ -208,7 +323,156 @@ def main() -> None:
         "classification_entropy": float(np.mean(entropy_values)),
         "trajectory_diversity": float(np.mean(diversity_values)),
         "reward_logit_spearman": float(np.mean(rank_values)),
+        "selected_component_means": {
+            name: float(np.mean(values))
+            for name, values in component_values.items()
+        },
+        "token_set_sha256": hashlib.sha256(
+            "\n".join(record["token"] for record in records).encode("utf-8")
+        ).hexdigest(),
     }
+    if args.baseline_artifact is not None:
+        baseline_payload = json.loads(
+            args.baseline_artifact.read_text(encoding="utf-8")
+        )
+        baseline_records = {
+            str(record["token"]): record
+            for record in baseline_payload["records"]
+        }
+        missing_baseline = [
+            record["token"] for record in records
+            if record["token"] not in baseline_records
+        ]
+        if missing_baseline:
+            raise RuntimeError(
+                f"baseline artifact is missing {len(missing_baseline)} tokens"
+            )
+        selected_differences = np.asarray(
+            [
+                record["selected_reward"]
+                - float(baseline_records[record["token"]]["selected_reward"])
+                for record in records
+            ],
+            dtype=np.float64,
+        )
+        oracle_differences = np.asarray(
+            [
+                record["oracle_reward"]
+                - float(baseline_records[record["token"]]["oracle_reward"])
+                for record in records
+            ],
+            dtype=np.float64,
+        )
+        summary["paired_baseline"] = {
+            "artifact": str(args.baseline_artifact),
+            "selected_difference": float(selected_differences.mean()),
+            "selected_bootstrap_ci95": paired_bootstrap_ci(
+                selected_differences,
+                args.bootstrap_samples,
+                args.bootstrap_seed,
+            ),
+            "oracle_difference": float(oracle_differences.mean()),
+            "wins": int((selected_differences > 0).sum()),
+            "ties": int((selected_differences == 0).sum()),
+            "losses": int((selected_differences < 0).sum()),
+            "bootstrap_samples": args.bootstrap_samples,
+            "bootstrap_seed": args.bootstrap_seed,
+        }
+        baseline_has_selector_diagnostics = all(
+            "selected_mode" in baseline_records[record["token"]]
+            for record in records
+        )
+        if baseline_has_selector_diagnostics:
+            switches = np.asarray(
+                [
+                    record["selected_mode"]
+                    != int(baseline_records[record["token"]]["selected_mode"])
+                    for record in records
+                ],
+                dtype=bool,
+            )
+            switched_differences = selected_differences[switches]
+            margin_differences = np.asarray(
+                [
+                    record["selector_margin"]
+                    - float(baseline_records[record["token"]]["selector_margin"])
+                    for record in records
+                ],
+                dtype=np.float64,
+            )
+            oracle_probability_differences = np.asarray(
+                [
+                    record["oracle_probability"]
+                    - float(
+                        baseline_records[record["token"]]["oracle_probability"]
+                    )
+                    for record in records
+                ],
+                dtype=np.float64,
+            )
+            summary["paired_baseline"]["selector_diagnostics"] = {
+                "mode_switches": int(switches.sum()),
+                "mode_switch_rate": float(switches.mean()),
+                "switched_selected_difference": (
+                    float(switched_differences.mean())
+                    if switched_differences.size else 0.0
+                ),
+                "beneficial_switches": int((switched_differences > 0).sum()),
+                "neutral_switches": int((switched_differences == 0).sum()),
+                "harmful_switches": int((switched_differences < 0).sum()),
+                "selector_margin_difference": float(margin_differences.mean()),
+                "oracle_probability_difference": float(
+                    oracle_probability_differences.mean()
+                ),
+            }
+        baseline_has_components = all(
+            "selected_components" in baseline_records[record["token"]]
+            for record in records
+        )
+        if baseline_has_components:
+            component_differences = {}
+            for name in COMPONENT_NAMES:
+                differences = np.asarray(
+                    [
+                        record["selected_components"][name]
+                        - float(
+                            baseline_records[record["token"]][
+                                "selected_components"
+                            ][name]
+                        )
+                        for record in records
+                    ],
+                    dtype=np.float64,
+                )
+                component_differences[name] = float(differences.mean())
+
+            baseline_safety_pass = np.asarray(
+                [
+                    all(
+                        float(
+                            baseline_records[record["token"]][
+                                "selected_components"
+                            ][name]
+                        )
+                        >= 1.0 - 1e-6
+                        for name in SAFETY_COMPONENTS
+                    )
+                    for record in records
+                ],
+                dtype=bool,
+            )
+            safety_differences = selected_differences[baseline_safety_pass]
+            summary["paired_baseline"]["selected_component_differences"] = (
+                component_differences
+            )
+            summary["paired_baseline"]["baseline_safety_pass_tokens"] = int(
+                baseline_safety_pass.sum()
+            )
+            summary["paired_baseline"]["safety_pass_selected_difference"] = (
+                float(safety_differences.mean())
+                if safety_differences.size
+                else None
+            )
     payload = {"summary": summary, "records": records}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
