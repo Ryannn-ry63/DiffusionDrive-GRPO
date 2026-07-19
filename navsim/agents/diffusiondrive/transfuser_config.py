@@ -104,6 +104,9 @@ class TransfuserConfig:
     grpo_checkpoint_every_n_train_steps: int = 0
     grpo_training_mode: str = "classification_shared"
     grpo_decoder_gradient_scope: str = "last_layer"
+    # Deployment-only selector. Reference logits choose among current generator
+    # candidates and never participate in the training objective.
+    inference_selector_source: str = "current"
     selection_temperature: float = 1.0
     selection_entropy_weight: float = 0.0
     selection_exploration_floor: float = 0.0
@@ -128,6 +131,19 @@ class TransfuserConfig:
     pdm_dense_weight: float = 0.1
     generation_policy_loss_weight: float = 1.0
     generation_kl_loss_weight: float = 0.1
+    generation_adaptive_kl_enabled: bool = False
+    generation_kl_initial_coefficient: float = 0.1
+    generation_kl_min_coefficient: float = 0.1
+    generation_kl_max_coefficient: float = 100.0
+    generation_kl_target: float = 1e-4
+    generation_kl_hard_limit: float = 2.5e-4
+    generation_kl_window: int = 32
+    generation_kl_update_interval: int = 8
+    generation_kl_adaptation_factor: float = 2.0
+    generation_kl_lower_ratio: float = 2.0 / 3.0
+    generation_kl_upper_ratio: float = 1.5
+    generation_kl_hard_limit_patience: int = 2
+    grpo_decoder_layer0_lr_mult: float = 1.0
     # group_zscore/reference_centered use K=1; within_anchor/hierarchical use
     # K=2; anchor_hierarchical supports K=2 or K=4; anchor_rloo requires K=2.
     generation_advantage_mode: str = "group_zscore"

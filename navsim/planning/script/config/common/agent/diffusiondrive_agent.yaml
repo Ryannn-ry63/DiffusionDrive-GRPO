@@ -18,6 +18,7 @@ config:
   grpo_checkpoint_save_top_k: 2
   policy_loss_weight: 1.0
   grpo_clip_ratio: 0.2
+  inference_selector_source: current
   grpo_advantage_eps: 0.001
   grpo_checkpoint_every_n_train_steps: 0
   grpo_old_policy_sync_steps: 32
@@ -39,6 +40,19 @@ config:
   pdm_dense_weight: 0.1
   generation_policy_loss_weight: 1.0
   generation_kl_loss_weight: 0.1
+  generation_adaptive_kl_enabled: false
+  generation_kl_initial_coefficient: 0.1
+  generation_kl_min_coefficient: 0.1
+  generation_kl_max_coefficient: 100.0
+  generation_kl_target: 0.0001
+  generation_kl_hard_limit: 0.00025
+  generation_kl_window: 32
+  generation_kl_update_interval: 8
+  generation_kl_adaptation_factor: 2.0
+  generation_kl_lower_ratio: 0.6666666666666666
+  generation_kl_upper_ratio: 1.5
+  generation_kl_hard_limit_patience: 2
+  grpo_decoder_layer0_lr_mult: 1.0
   generation_advantage_mode: group_zscore
   reference_advantage_margin: 0.01
   reference_advantage_scale: 0.10

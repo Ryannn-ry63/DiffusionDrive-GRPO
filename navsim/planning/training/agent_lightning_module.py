@@ -1,6 +1,7 @@
 import pytorch_lightning as pl
 import torch
 
+from pathlib import Path
 from torch import Tensor
 from typing import Dict, Tuple
 
@@ -18,6 +19,9 @@ class AgentLightningModule(pl.LightningModule):
         super().__init__()
         self.agent = agent
         self._decoder_weight_snapshot = None
+        self._latest_generation_kl = None
+        self._adaptive_kl_stop_pending = False
+        self._adaptive_kl_stop_checkpoint_saved = False
 
     def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str) -> Tensor:
         """
@@ -32,6 +36,8 @@ class AgentLightningModule(pl.LightningModule):
         # self.log(f"{logging_prefix}/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         # return loss
         loss_dict = self.agent.compute_loss(features, targets, prediction)
+        if logging_prefix == "train":
+            self._latest_generation_kl = loss_dict.get("generation_kl_loss")
         for k, v in loss_dict.items():
             if v is not None:
                 self.log(f"{logging_prefix}/{k}", v, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=len(batch[0]))
@@ -177,7 +183,9 @@ class AgentLightningModule(pl.LightningModule):
         training_mode = getattr(
             getattr(self.agent, "_config", None), "grpo_training_mode", None
         )
-        if training_mode in {"generation", "generation_group"} and (
+        if training_mode in {
+            "generation", "generation_group", "generation_group_adaptive"
+        } and (
             grad_norms["classification"] != 0 or perception_grad_norm != 0
         ):
             raise RuntimeError(
@@ -200,6 +208,37 @@ class AgentLightningModule(pl.LightningModule):
                 f"train/{group}_grad_norm", grad_norm,
                 on_step=True, on_epoch=True, prog_bar=False, sync_dist=True,
             )
+
+        controller_update = getattr(
+            self.agent, "update_generation_kl_controller", None
+        )
+        if controller_update is not None and self._latest_generation_kl is not None:
+            controller_metrics = controller_update(self._latest_generation_kl)
+            self._latest_generation_kl = None
+            for name, value in controller_metrics.items():
+                self.log(
+                    f"train/{name}", value, on_step=True, on_epoch=False,
+                    prog_bar=name in {
+                        "generation_kl_coefficient",
+                        "generation_kl_rolling_mean",
+                    },
+                    sync_dist=True,
+                )
+            should_stop = controller_metrics.get("generation_kl_should_stop")
+            if should_stop is not None and bool(should_stop.item()):
+                self._adaptive_kl_stop_pending = True
+
+    def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
+        if not self._adaptive_kl_stop_pending:
+            return
+        if not self._adaptive_kl_stop_checkpoint_saved:
+            log_dir = getattr(self.logger, "log_dir", self.trainer.default_root_dir)
+            checkpoint_dir = Path(log_dir) / "checkpoints"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint_path = checkpoint_dir / f"kl-stop-step-{self.global_step}.ckpt"
+            self.trainer.save_checkpoint(str(checkpoint_path))
+            self._adaptive_kl_stop_checkpoint_saved = True
+        self.trainer.should_stop = True
 
     def configure_optimizers(self):
         """Inherited, see superclass."""

@@ -35,7 +35,9 @@ from navsim.agents.diffusiondrive.diffusion_grpo import (
     load_generation_trust_calibration,
     normalized_rms_displacement,
     project_reference_mean_ball,
+    select_inference_mode,
     summarize_trust_projection,
+    validate_inference_selector_source,
     validate_generation_trust_provenance,
 )
 
@@ -506,6 +508,9 @@ class TrajectoryHead(nn.Module):
             getattr(config, "diffusion_scheduler_num_inference_steps", 125)
         )
         self._grpo_training_mode = getattr(config, "grpo_training_mode", "classification_shared")
+        self._inference_selector_source = validate_inference_selector_source(
+            getattr(config, "inference_selector_source", "current")
+        )
         self._grpo_scene_weight_mode = str(
             getattr(config, "grpo_scene_weight_mode", "uniform")
         )
@@ -1147,7 +1152,9 @@ class TrajectoryHead(nn.Module):
         )
 
         generation_outputs = {}
-        if self._grpo_training_mode in {"generation", "generation_group", "joint"}:
+        if self._grpo_training_mode in {
+            "generation", "generation_group", "generation_group_adaptive", "joint"
+        }:
             rollout_count = self._grpo_rollouts_per_mode
             if rollout_count == 1:
                 trace_initial_sample = initial_sample
@@ -1561,10 +1568,6 @@ class TrajectoryHead(nn.Module):
         final_poses_cls = poses_cls
         num_modes = final_poses_cls.shape[1]
         
-        mode_idx = poses_cls.argmax(dim=-1)
-        mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
-        best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
-
         final_ref_poses_cls = (
             paired_reference_cls
             if trust_active
@@ -1576,6 +1579,23 @@ class TrajectoryHead(nn.Module):
                     self.ref_policy, initial_sample, ego_query, agents_query,
                     bev_feature, bev_spatial_shape, status_encoding, global_img,
                 )
+
+        if (
+            self._inference_selector_source == "reference"
+            and self.ref_policy is None
+        ):
+            raise RuntimeError(
+                "reference inference selector requires a frozen reference policy"
+            )
+        mode_idx, inference_selector_logits = select_inference_mode(
+            final_poses_cls,
+            final_ref_poses_cls,
+            self._inference_selector_source,
+        )
+        batch_idx = torch.arange(bs, device=device)
+        best_reg = final_poses_reg[batch_idx, mode_idx]
+        current_mode_idx = final_poses_cls.argmax(dim=-1)
+        reference_mode_idx = final_ref_poses_cls.argmax(dim=-1)
 
         rewards = None
         reward_valid_mask = None
@@ -1604,6 +1624,11 @@ class TrajectoryHead(nn.Module):
             "final_poses_cls": final_poses_cls,
             "final_ref_poses_cls": final_ref_poses_cls,
             "final_old_poses_cls": final_poses_cls,
+            "inference_selector_logits": inference_selector_logits,
+            "inference_selector_source": self._inference_selector_source,
+            "mode_idx": mode_idx,
+            "current_mode_idx": current_mode_idx,
+            "reference_mode_idx": reference_mode_idx,
             "rewards": rewards,
             "reward_valid_mask": reward_valid_mask,
             "reward_component_scores": reward_component_scores,

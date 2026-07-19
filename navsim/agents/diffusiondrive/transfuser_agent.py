@@ -12,7 +12,10 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
-from navsim.agents.diffusiondrive.diffusion_grpo import file_sha256
+from navsim.agents.diffusiondrive.diffusion_grpo import (
+    AdaptiveKLController,
+    file_sha256,
+)
 
 from navsim.agents.diffusiondrive.transfuser_model_v2 import V2TransfuserModel as TransfuserModel
 
@@ -35,7 +38,9 @@ def build_from_configs(obj, cfg: DictConfig, **kwargs):
     return getattr(obj, type)(**cfg, **kwargs)
 
 
-FORMAL_GRPO_MODES = {"selector_group", "generation_group"}
+STAGE9_GRPO_MODES = {"selector_group", "generation_group"}
+STAGE10_GRPO_MODES = {"generation_group_adaptive"}
+FORMAL_GRPO_MODES = STAGE9_GRPO_MODES | STAGE10_GRPO_MODES
 FORMAL_BASE_SHA256 = (
     "59a8de460cfd8b1266c5cdd393372273da5c2465fa6707da551c4ecb1fbd019d"
 )
@@ -57,7 +62,7 @@ def validate_frozen_policy_state(policy: nn.Module, expected_state: Dict[str, to
 
 
 def validate_formal_grpo_config(config: TransfuserConfig) -> None:
-    """Fail closed if a stage-9 objective drifts from its registration."""
+    """Fail closed if a registered Stage-9/10 objective drifts."""
     mode = str(getattr(config, "grpo_training_mode", ""))
     if mode not in FORMAL_GRPO_MODES:
         return
@@ -86,6 +91,7 @@ def validate_formal_grpo_config(config: TransfuserConfig) -> None:
             "selector_generation_kl_weight": 0.1,
             "generation_policy_loss_weight": 0.0,
             "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
         },
         "generation_group": {
             "policy_loss_weight": 0.0,
@@ -93,6 +99,26 @@ def validate_formal_grpo_config(config: TransfuserConfig) -> None:
             "selector_generation_kl_weight": 0.0,
             "generation_policy_loss_weight": 1.0,
             "generation_kl_loss_weight": 0.1,
+            "generation_adaptive_kl_enabled": False,
+        },
+        "generation_group_adaptive": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.1,
+            "generation_adaptive_kl_enabled": True,
+            "generation_kl_initial_coefficient": 0.1,
+            "generation_kl_min_coefficient": 0.1,
+            "generation_kl_max_coefficient": 100.0,
+            "generation_kl_target": 1e-4,
+            "generation_kl_hard_limit": 2.5e-4,
+            "generation_kl_window": 32,
+            "generation_kl_update_interval": 8,
+            "generation_kl_adaptation_factor": 2.0,
+            "generation_kl_lower_ratio": 2.0 / 3.0,
+            "generation_kl_upper_ratio": 1.5,
+            "generation_kl_hard_limit_patience": 2,
         },
     }[mode]
     for name, wanted in {**expected, **route_expected}.items():
@@ -105,6 +131,37 @@ def validate_formal_grpo_config(config: TransfuserConfig) -> None:
             raise ValueError(
                 f"formal {mode} requires {name}={wanted!r}; got {actual!r}"
             )
+    layer0_lr_mult = float(getattr(config, "grpo_decoder_layer0_lr_mult", 1.0))
+    if mode in STAGE9_GRPO_MODES and not math.isclose(
+        layer0_lr_mult, 1.0, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError("formal Stage-9 routes require layer-0 LR multiplier 1.0")
+    if mode in STAGE10_GRPO_MODES and not any(
+        math.isclose(layer0_lr_mult, wanted, rel_tol=0.0, abs_tol=1e-12)
+        for wanted in (0.1, 1.0)
+    ):
+        raise ValueError("formal Stage-10 route requires layer-0 LR multiplier 0.1 or 1.0")
+
+
+def build_stage10_decoder_param_groups(
+    named_parameters, layer0_lr_mult: float
+) -> List[Dict[str, Any]]:
+    """Split trainable layer-0 parameters without freezing either decoder layer."""
+    layer0 = []
+    remaining = []
+    for name, parameter in named_parameters:
+        if not parameter.requires_grad:
+            continue
+        if "_trajectory_head.diff_decoder.layers.0." in name:
+            layer0.append(parameter)
+        else:
+            remaining.append(parameter)
+    if not layer0 or not remaining:
+        raise RuntimeError("Stage-10 optimizer requires trainable layer-0 and layer-1 parameters")
+    return [
+        {"params": remaining, "lr_scale": 1.0},
+        {"params": layer0, "lr_scale": float(layer0_lr_mult)},
+    ]
 
 class TransfuserAgent(AbstractAgent):
     """Agent interface for TransFuser baseline."""
@@ -151,17 +208,32 @@ class TransfuserAgent(AbstractAgent):
         if str(getattr(config, "grpo_training_mode", "")) in FORMAL_GRPO_MODES:
             if self._reference_checkpoint_sha256 != FORMAL_BASE_SHA256:
                 raise RuntimeError(
-                    "Formal stage-9 reference checkpoint is not the registered base"
+                    "Formal Stage-9/10 reference checkpoint is not the registered base"
                 )
             if self._checkpoint_sha256 != self._reference_checkpoint_sha256:
                 raise RuntimeError(
-                    "Formal stage-9 current policy must initialize from frozen base"
+                    "Formal Stage-9/10 current policy must initialize from frozen base"
                 )
             if not math.isclose(float(lr), 1e-6, rel_tol=0.0, abs_tol=1e-12):
-                raise ValueError("Formal stage-9 learning rate must be 1e-6")
+                raise ValueError("Formal Stage-9/10 layer-1 learning rate must be 1e-6")
         self._reference_checkpoint_path = reference_checkpoint_path
         self._transfuser_model = TransfuserModel(config)
         self.init_from_pretrained()
+        self._adaptive_kl_controller = None
+        if bool(getattr(config, "generation_adaptive_kl_enabled", False)):
+            self._adaptive_kl_controller = AdaptiveKLController(
+                initial_coefficient=config.generation_kl_initial_coefficient,
+                minimum_coefficient=config.generation_kl_min_coefficient,
+                maximum_coefficient=config.generation_kl_max_coefficient,
+                target=config.generation_kl_target,
+                hard_limit=config.generation_kl_hard_limit,
+                window=config.generation_kl_window,
+                update_interval=config.generation_kl_update_interval,
+                adaptation_factor=config.generation_kl_adaptation_factor,
+                lower_ratio=config.generation_kl_lower_ratio,
+                upper_ratio=config.generation_kl_upper_ratio,
+                hard_limit_patience=config.generation_kl_hard_limit_patience,
+            )
 
         # 1. 冻结整个模型
         self._transfuser_model.requires_grad_(False)
@@ -175,9 +247,13 @@ class TransfuserAgent(AbstractAgent):
             trajectory_head.diff_decoder.layers[-1].task_decoder.plan_cls_branch.requires_grad_(
                 True
             )
-        elif training_mode in {"generation", "generation_group", "joint"}:
+        elif training_mode in {
+            "generation", "generation_group", "generation_group_adaptive", "joint"
+        }:
             trajectory_head.diff_decoder.requires_grad_(True)
-            if training_mode in {"generation", "generation_group"}:
+            if training_mode in {
+                "generation", "generation_group", "generation_group_adaptive"
+            }:
                 for layer in trajectory_head.diff_decoder.layers:
                     layer.task_decoder.plan_cls_branch.requires_grad_(False)
         else:
@@ -185,7 +261,7 @@ class TransfuserAgent(AbstractAgent):
                 "grpo_training_mode must be one of "
                 "{'classification_shared', 'classification_head', 'selector', "
                 "'generation', 'joint', 'selector_group', "
-                "'generation_group'}; "
+                "'generation_group', 'generation_group_adaptive'}; "
                 f"got {training_mode!r}"
             )
         trainable_params = sum(
@@ -259,6 +335,7 @@ class TransfuserAgent(AbstractAgent):
         policy_snapshot_prefixes = (
             "_transfuser_model._trajectory_head.ref_policy.",
             "_transfuser_model._trajectory_head.old_policy.",
+            "_adaptive_kl_controller.",
         )
         unexpected_keys = [key for key in unexpected_keys if not key.startswith(policy_snapshot_prefixes)]
 
@@ -346,7 +423,19 @@ class TransfuserAgent(AbstractAgent):
         predictions: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         """Inherited, see superclass."""
+        if self._adaptive_kl_controller is not None:
+            predictions = dict(predictions)
+            predictions["generation_kl_coefficient"] = (
+                self._adaptive_kl_controller.coefficient.detach().float()
+            )
         return transfuser_loss(targets, predictions, self._config)
+
+    def update_generation_kl_controller(
+        self, generation_kl: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        if self._adaptive_kl_controller is None:
+            return {}
+        return self._adaptive_kl_controller.update(generation_kl)
 
     def get_optimizers(self) -> Union[Optimizer, Dict[str, Union[Optimizer, LRScheduler]]]:
         """Inherited, see superclass."""
@@ -377,8 +466,18 @@ class TransfuserAgent(AbstractAgent):
         
         with open_dict(optimizer_cfg):
             paramwise_cfg = optimizer_cfg.pop('paramwise_cfg', None)
-        
-        if paramwise_cfg:
+
+        stage10_param_groups = None
+        if str(getattr(self._config, "grpo_training_mode", "")) in STAGE10_GRPO_MODES:
+            stage10_param_groups = build_stage10_decoder_param_groups(
+                self._transfuser_model.named_parameters(),
+                self._config.grpo_decoder_layer0_lr_mult,
+            )
+            paramwise_cfg = None
+
+        if stage10_param_groups is not None:
+            params = stage10_param_groups
+        elif paramwise_cfg:
             params = []
             pgs = [[] for _ in paramwise_cfg['name']]
 

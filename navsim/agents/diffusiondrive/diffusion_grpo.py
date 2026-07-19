@@ -7,10 +7,164 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import torch
+from torch import nn
 
 
 TRUST_PROJECTION_FORMULA_VERSION = "reference_mean_ball_v1"
 TRUST_PROJECTION_POST_TOLERANCE = 1e-6
+INFERENCE_SELECTOR_SOURCES = ("current", "reference")
+
+
+def validate_inference_selector_source(source: str) -> str:
+    """Validate and normalize the selector used only for deployed inference."""
+    source = str(source)
+    if source not in INFERENCE_SELECTOR_SOURCES:
+        raise ValueError(
+            "inference_selector_source must be 'current' or 'reference'; "
+            f"got {source!r}"
+        )
+    return source
+
+
+def select_inference_mode(
+    current_logits: torch.Tensor,
+    reference_logits: Optional[torch.Tensor],
+    source: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return the deployed mode and logits without touching candidate trajectories."""
+    source = validate_inference_selector_source(source)
+    if current_logits.ndim != 2:
+        raise ValueError("selector logits must have shape [batch, modes]")
+    if source == "reference":
+        if reference_logits is None:
+            raise RuntimeError(
+                "reference inference selector requires frozen reference logits"
+            )
+        if reference_logits.shape != current_logits.shape:
+            raise ValueError(
+                "current and reference selector logits must have identical shapes"
+            )
+        selector_logits = reference_logits.detach()
+    else:
+        selector_logits = current_logits
+    return selector_logits.argmax(dim=-1), selector_logits
+
+
+class AdaptiveKLController(nn.Module):
+    """Checkpointable one-sided controller for a generation KL penalty."""
+
+    def __init__(
+        self,
+        initial_coefficient: float,
+        minimum_coefficient: float,
+        maximum_coefficient: float,
+        target: float,
+        hard_limit: float,
+        window: int,
+        update_interval: int,
+        adaptation_factor: float,
+        lower_ratio: float,
+        upper_ratio: float,
+        hard_limit_patience: int,
+    ) -> None:
+        super().__init__()
+        values = (
+            initial_coefficient,
+            minimum_coefficient,
+            maximum_coefficient,
+            target,
+            hard_limit,
+            adaptation_factor,
+            lower_ratio,
+            upper_ratio,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("adaptive KL parameters must be finite")
+        if not 0 < minimum_coefficient <= initial_coefficient <= maximum_coefficient:
+            raise ValueError("adaptive KL coefficient bounds are invalid")
+        if target <= 0 or hard_limit <= target:
+            raise ValueError("adaptive KL requires 0 < target < hard_limit")
+        if window <= 0 or update_interval <= 0 or hard_limit_patience <= 0:
+            raise ValueError("adaptive KL integer parameters must be positive")
+        if adaptation_factor <= 1:
+            raise ValueError("adaptive KL adaptation factor must be > 1")
+        if not 0 < lower_ratio < 1 < upper_ratio:
+            raise ValueError("adaptive KL ratios must straddle 1")
+
+        self.minimum_coefficient = float(minimum_coefficient)
+        self.maximum_coefficient = float(maximum_coefficient)
+        self.target = float(target)
+        self.hard_limit = float(hard_limit)
+        self.window = int(window)
+        self.update_interval = int(update_interval)
+        self.adaptation_factor = float(adaptation_factor)
+        self.lower_ratio = float(lower_ratio)
+        self.upper_ratio = float(upper_ratio)
+        self.hard_limit_patience = int(hard_limit_patience)
+        self.register_buffer(
+            "coefficient", torch.tensor(float(initial_coefficient), dtype=torch.float64)
+        )
+        self.register_buffer(
+            "rolling_values", torch.zeros(self.window, dtype=torch.float64)
+        )
+        self.register_buffer("rolling_index", torch.zeros((), dtype=torch.long))
+        self.register_buffer("rolling_count", torch.zeros((), dtype=torch.long))
+        self.register_buffer("observation_count", torch.zeros((), dtype=torch.long))
+        self.register_buffer("consecutive_hard_violations", torch.zeros((), dtype=torch.long))
+        self.register_buffer("rolling_mean", torch.zeros((), dtype=torch.float64))
+        self.register_buffer("should_stop", torch.zeros((), dtype=torch.bool))
+
+    @torch.no_grad()
+    def update(self, kl_value: torch.Tensor) -> Dict[str, torch.Tensor]:
+        value = torch.as_tensor(
+            kl_value, device=self.rolling_values.device, dtype=torch.float64
+        ).detach()
+        if value.numel() != 1 or not torch.isfinite(value):
+            raise FloatingPointError("adaptive KL observation must be finite and scalar")
+        index = int(self.rolling_index.item())
+        self.rolling_values[index] = value
+        self.rolling_index.fill_((index + 1) % self.window)
+        self.rolling_count.add_(1).clamp_(max=self.window)
+        self.observation_count.add_(1)
+        count = int(self.rolling_count.item())
+        self.rolling_mean.copy_(self.rolling_values[:count].mean())
+
+        checked = (
+            count == self.window
+            and int(self.observation_count.item()) % self.update_interval == 0
+        )
+        if checked:
+            rolling = float(self.rolling_mean.item())
+            coefficient = float(self.coefficient.item())
+            if rolling > self.target * self.upper_ratio:
+                coefficient = min(
+                    self.maximum_coefficient,
+                    coefficient * self.adaptation_factor,
+                )
+            elif rolling < self.target * self.lower_ratio:
+                coefficient = max(
+                    self.minimum_coefficient,
+                    coefficient / self.adaptation_factor,
+                )
+            self.coefficient.fill_(coefficient)
+            if rolling > self.hard_limit:
+                self.consecutive_hard_violations.add_(1)
+            else:
+                self.consecutive_hard_violations.zero_()
+            if int(self.consecutive_hard_violations.item()) >= self.hard_limit_patience:
+                self.should_stop.fill_(True)
+
+        return {
+            "generation_kl_coefficient": self.coefficient.detach().float().clone(),
+            "generation_kl_rolling_mean": self.rolling_mean.detach().float().clone(),
+            "generation_kl_controller_checked": torch.tensor(
+                float(checked), device=self.coefficient.device
+            ),
+            "generation_kl_hard_violation_count": (
+                self.consecutive_hard_violations.detach().float().clone()
+            ),
+            "generation_kl_should_stop": self.should_stop.detach().float().clone(),
+        }
 
 
 def file_sha256(path: Path) -> str:

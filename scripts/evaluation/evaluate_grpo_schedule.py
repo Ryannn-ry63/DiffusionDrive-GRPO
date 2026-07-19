@@ -95,6 +95,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--truncation-timestep", type=int, required=True)
     parser.add_argument("--roll-timesteps", type=int, nargs="+", required=True)
     parser.add_argument("--scheduler-num-inference-steps", type=int, required=True)
+    parser.add_argument(
+        "--selector-logits-source",
+        choices=("current", "reference"),
+        default="current",
+        help="Choose current candidates with current or frozen-reference logits",
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -212,6 +218,7 @@ def main() -> None:
         diffusion_truncation_timestep=args.truncation_timestep,
         diffusion_roll_timesteps=tuple(args.roll_timesteps),
         diffusion_scheduler_num_inference_steps=args.scheduler_num_inference_steps,
+        inference_selector_source=args.selector_logits_source,
         generation_trust_projection_mode=args.generation_trust_projection_mode,
         generation_trust_calibration_path=str(
             args.generation_trust_calibration_path or ""
@@ -225,8 +232,6 @@ def main() -> None:
         checkpoint_path=str(args.checkpoint),
         reference_checkpoint_path=str(args.reference_checkpoint),
     )
-    if not trust_active:
-        agent._transfuser_model._trajectory_head.ref_policy = None
     agent.eval().to(args.device)
 
     split_path = (
@@ -281,6 +286,7 @@ def main() -> None:
     diversity_values = []
     rank_values = []
     component_values = {name: [] for name in COMPONENT_NAMES}
+    current_reference_agreement_values = []
 
     with torch.inference_mode():
         for batch_idx, (features, targets, tokens) in enumerate(loader):
@@ -314,7 +320,9 @@ def main() -> None:
                 continue
             rewards = predictions["rewards"].float()
             valid = predictions["reward_valid_mask"].bool()
-            logits = predictions["final_poses_cls"].float()
+            current_logits = predictions["final_poses_cls"].float()
+            reference_logits = predictions["final_ref_poses_cls"].float()
+            logits = predictions["inference_selector_logits"].float()
             trajectories = predictions["final_poses_reg"].float()
             components = predictions["reward_component_scores"].float()
             trust_batch = {}
@@ -325,7 +333,11 @@ def main() -> None:
             masked_logits = logits.masked_fill(~valid, torch.finfo(logits.dtype).min)
             selector_probs = torch.softmax(masked_logits, dim=-1) * valid.float()
 
-            selected_idx = logits.argmax(dim=-1)
+            selected_idx = predictions["mode_idx"]
+            if not torch.equal(selected_idx, logits.argmax(dim=-1)):
+                raise RuntimeError("model trajectory mode and evaluator selector disagree")
+            current_idx = current_logits.argmax(dim=-1)
+            reference_idx = reference_logits.argmax(dim=-1)
             selected = rewards.gather(1, selected_idx[:, None]).squeeze(1)
             selected_components = components.gather(
                 1,
@@ -353,6 +365,8 @@ def main() -> None:
                 entropy_value = float(entropy[row].item())
                 diversity_value = float(diversity[row].item())
                 selected_mode = int(selected_idx[row].item())
+                current_mode = int(current_idx[row].item())
+                reference_mode = int(reference_idx[row].item())
                 oracle_mode = int(oracle_idx[row].item())
                 valid_logits = logits[row, mask]
                 if valid_logits.numel() >= 2:
@@ -368,6 +382,9 @@ def main() -> None:
                 entropy_values.append(entropy_value)
                 diversity_values.append(diversity_value)
                 rank_values.append(correlation)
+                current_reference_agreement_values.append(
+                    float(current_mode == reference_mode)
+                )
                 component_record = {
                     name: float(selected_components[row, index].item())
                     for index, name in enumerate(COMPONENT_NAMES)
@@ -377,6 +394,7 @@ def main() -> None:
                 records.append(
                     {
                         "token": token,
+                        "selector_logits_source": args.selector_logits_source,
                         "selected_reward": selected_value,
                         "oracle_reward": oracle_value,
                         "regret": oracle_value - selected_value,
@@ -385,6 +403,11 @@ def main() -> None:
                         "selected_mode": selected_mode,
                         "oracle_mode": oracle_mode,
                         "selector_margin": selector_margin,
+                        "current_mode": current_mode,
+                        "reference_mode": reference_mode,
+                        "selected_trajectory": trajectories[
+                            row, selected_mode
+                        ].detach().cpu().tolist(),
                         "selected_probability": float(
                             selector_probs[row, selected_mode].item()
                         ),
@@ -422,6 +445,7 @@ def main() -> None:
     if args.collect_trust_calibration:
         selected_values = oracle_values = candidate_values = [0.0]
         hit_values = entropy_values = diversity_values = rank_values = [0.0]
+        current_reference_agreement_values = [0.0]
         component_values = {
             name: [0.0] for name in COMPONENT_NAMES
         }
@@ -429,6 +453,7 @@ def main() -> None:
         "checkpoint": str(args.checkpoint),
         "num_tokens": len(records),
         "log_split": args.log_split,
+        "selector_logits_source": args.selector_logits_source,
         "schedule": agent._transfuser_model._trajectory_head.get_roll_schedule(),
         "selected_reward": float(np.mean(selected_values)),
         "oracle_reward": float(np.mean(oracle_values)),
@@ -438,6 +463,9 @@ def main() -> None:
         "classification_entropy": float(np.mean(entropy_values)),
         "trajectory_diversity": float(np.mean(diversity_values)),
         "reward_logit_spearman": float(np.mean(rank_values)),
+        "current_reference_mode_agreement": float(
+            np.mean(current_reference_agreement_values)
+        ),
         "selected_component_means": {
             name: float(np.mean(values))
             for name, values in component_values.items()
@@ -456,6 +484,7 @@ def main() -> None:
             "classification_entropy",
             "trajectory_diversity",
             "reward_logit_spearman",
+            "current_reference_mode_agreement",
             "selected_component_means",
         ):
             summary.pop(key)

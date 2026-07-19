@@ -999,7 +999,9 @@ def transfuser_loss(
         )
 
     training_mode = getattr(config, "grpo_training_mode", "classification_shared")
-    generation_only = training_mode in {"generation", "generation_group"}
+    generation_only = training_mode in {
+        "generation", "generation_group", "generation_group_adaptive"
+    }
     selection_weight = 0.0 if generation_only else grpo_weight
     selection_regularization_enabled = not generation_only
     rank_weight = (
@@ -1077,7 +1079,9 @@ def transfuser_loss(
 
     generation_objective = None
     if (
-        training_mode in {"generation", "generation_group", "joint"}
+        training_mode in {
+            "generation", "generation_group", "generation_group_adaptive", "joint"
+        }
         and predictions.get("generation_current_log_probs") is not None
     ):
         required = (
@@ -1176,12 +1180,26 @@ def transfuser_loss(
                 config, "grpo_rollouts_per_mode", 1
             ),
         )
+        generation_kl_coefficient = predictions.get("generation_kl_coefficient")
+        if generation_kl_coefficient is None:
+            generation_kl_coefficient = generation_objective["kl_loss"].new_tensor(
+                float(getattr(config, "generation_kl_loss_weight", 0.1))
+            )
+        else:
+            generation_kl_coefficient = generation_kl_coefficient.detach().to(
+                generation_objective["kl_loss"]
+            )
+            if generation_kl_coefficient.numel() != 1:
+                raise ValueError("generation_kl_coefficient must be scalar")
+            if not torch.isfinite(generation_kl_coefficient).all() or torch.any(
+                generation_kl_coefficient < 0
+            ):
+                raise ValueError("generation_kl_coefficient must be finite and non-negative")
         total_loss = (
             total_loss
             + getattr(config, "generation_policy_loss_weight", 1.0)
             * generation_objective["policy_loss"]
-            + getattr(config, "generation_kl_loss_weight", 0.1)
-            * generation_objective["kl_loss"]
+            + generation_kl_coefficient * generation_objective["kl_loss"]
         )
 
     result = {
@@ -1232,6 +1250,7 @@ def transfuser_loss(
             {
                 "generation_grpo_loss": generation_objective["policy_loss"],
                 "generation_kl_loss": generation_objective["kl_loss"],
+                "generation_kl_coefficient": generation_kl_coefficient,
                 "generation_ratio_mean": generation_objective["ratio_mean"],
                 "generation_clip_fraction": generation_objective["clip_fraction"],
                 "generation_policy_active_scene_fraction": generation_objective[
