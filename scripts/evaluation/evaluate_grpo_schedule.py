@@ -73,9 +73,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=1024)
     parser.add_argument(
         "--log-split",
-        choices=("train", "val"),
+        choices=("train", "val", "test"),
         default="val",
-        help="Select cached train or val logs; defaults to the historical val behavior",
+        help="Select cached train, val, or navtest test logs",
     )
     parser.add_argument(
         "--tokens-file",

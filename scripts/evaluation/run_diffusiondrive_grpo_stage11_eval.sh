@@ -27,7 +27,7 @@ DEFAULT_METRIC_CACHE="/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/m
 [[ -f "$BASE_CHECKPOINT" ]] || { echo "Base checkpoint does not exist: $BASE_CHECKPOINT"; exit 2; }
 [[ -f "$TOKENS_FILE" ]] || { echo "Tokens file does not exist: $TOKENS_FILE"; exit 2; }
 [[ "$LIMIT" =~ ^[1-9][0-9]*$ ]] || { echo "LIMIT must be positive"; exit 2; }
-[[ "$LOG_SPLIT" == train || "$LOG_SPLIT" == val ]] || { echo "LOG_SPLIT must be train or val"; exit 2; }
+[[ "$LOG_SPLIT" == train || "$LOG_SPLIT" == val || "$LOG_SPLIT" == test ]] || { echo "LOG_SPLIT must be train, val, or test"; exit 2; }
 if [[ "$BASELINE_ARTIFACT" != none && ! -f "$BASELINE_ARTIFACT" ]]; then
   echo "Baseline artifact does not exist: $BASELINE_ARTIFACT"
   exit 2
