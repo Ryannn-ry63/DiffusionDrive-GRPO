@@ -3,6 +3,7 @@
 Date prepared: 2026-07-19
 Branch: `experiment-after-stage9`
 Required starting commit: `0c45475` (`Implement Stage 10-11 generation GRPO validation`)
+Stage-12 implementation commit: `24d6287` (`Add Stage 12 frozen-selector continuation protocol`)
 
 ## 0. New session: start here
 
@@ -27,12 +28,11 @@ partially written output file.
 - Therefore tomorrow starts at **Phase A**, after re-running the environment,
   resume-preflight, and base-equivalence checks. It does not start at Phase B.
 
-`0c45475` is the committed Stage-10/11 base, not a commit containing Stage 12. At
-the time this handoff was prepared, the Stage-12 files and the two small extensions
-to existing evaluation files were uncommitted worktree changes. First inspect
-`git status -sb` and `git diff`; if a later commit contains those changes, record
-that commit in the run log. Do not reset or discard the worktree merely because
-HEAD still equals `0c45475`.
+`0c45475` is the immutable committed Stage-10/11 experimental base. The Stage-12
+implementation was committed separately as `24d6287` and pushed to
+`origin/experiment-after-stage9`. First inspect `git status -sb`, `git log -2`, and
+`git diff`; preserve unrelated untracked history and record the actual checked-out
+commit in the run log. Do not reset or discard the worktree to make it look clean.
 
 ### Tomorrow's first actions, in order
 
