@@ -17,6 +17,7 @@ class AgentLightningModule(pl.LightningModule):
         """
         super().__init__()
         self.agent = agent
+        self._decoder_weight_snapshot = None
 
     def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str) -> Tensor:
         """
@@ -44,6 +45,25 @@ class AgentLightningModule(pl.LightningModule):
         :return: scalar loss
         """
         return self._step(batch, "train")
+
+    def on_fit_start(self) -> None:
+        """Revalidate the frozen base after Lightning restores a checkpoint."""
+        validator = getattr(
+            self.agent, "validate_reference_policy_immutability", None
+        )
+        if validator is not None:
+            validator()
+
+    def on_train_batch_start(self, batch, batch_idx: int) -> None:
+        """Sync PPO's old policy by Lightning's optimizer step, not forwards.
+
+        This hook is reached for training batches only; validation forwards no
+        longer advance the behavior-policy snapshot cadence.
+        """
+        model = getattr(self.agent, "_transfuser_model", None)
+        head = getattr(model, "_trajectory_head", None)
+        if head is not None and hasattr(head, "maybe_sync_old_policy"):
+            head.maybe_sync_old_policy(self.global_step)
 
     def validation_step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], batch_idx: int):
         """
@@ -79,13 +99,101 @@ class AgentLightningModule(pl.LightningModule):
                 squared_norms[group] + parameter.grad.detach().float().square().sum()
             )
 
+        # Per-refinement diagnostics make a missing first-layer gradient
+        # immediately visible in smoke/audit runs.
+        for layer_index, layer in enumerate(getattr(decoder, "layers", ())):
+            layer_groups = {
+                "shared_attention": torch.zeros((), device=self.device),
+                "ffn": torch.zeros((), device=self.device),
+                "time_modulation": torch.zeros((), device=self.device),
+                "regression": torch.zeros((), device=self.device),
+                "classification": torch.zeros((), device=self.device),
+            }
+            for name, parameter in layer.named_parameters():
+                if parameter.grad is None:
+                    continue
+                if "plan_reg_branch" in name:
+                    group = "regression"
+                elif "plan_cls_branch" in name:
+                    group = "classification"
+                elif "ffn" in name:
+                    group = "ffn"
+                elif "time_modulation" in name:
+                    group = "time_modulation"
+                else:
+                    group = "shared_attention"
+                layer_groups[group] += parameter.grad.detach().float().square().sum()
+            for group, squared in layer_groups.items():
+                self.log(
+                    f"train/decoder_layer_{layer_index}_{group}_grad_norm",
+                    squared.sqrt(), on_step=True, on_epoch=True,
+                    prog_bar=False, sync_dist=True,
+                )
+
+        # Difference from the previous optimizer boundary (detached snapshot).
+        current_snapshot = {
+            name: parameter.detach().float().clone()
+            for name, parameter in decoder.named_parameters()
+        }
+        if self._decoder_weight_snapshot is not None:
+            for layer_index in range(len(getattr(decoder, "layers", ()) )):
+                for group in ("shared_attention", "ffn", "time_modulation", "regression", "classification"):
+                    deltas = []
+                    for name, value in current_snapshot.items():
+                        if not name.startswith(f"layers.{layer_index}."):
+                            continue
+                        if group == "regression" and "plan_reg_branch" not in name:
+                            continue
+                        if group == "classification" and "plan_cls_branch" not in name:
+                            continue
+                        if group == "ffn" and "ffn" not in name:
+                            continue
+                        if group == "time_modulation" and "time_modulation" not in name:
+                            continue
+                        if group == "shared_attention" and any(
+                            token in name for token in ("plan_reg_branch", "plan_cls_branch", "ffn", "time_modulation")
+                        ):
+                            continue
+                        deltas.append((value - self._decoder_weight_snapshot[name]).square().sum())
+                    change = torch.stack(deltas).sum().sqrt() if deltas else torch.zeros((), device=self.device)
+                    self.log(
+                        f"train/decoder_layer_{layer_index}_{group}_weight_change",
+                        change, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True,
+                    )
+        self._decoder_weight_snapshot = current_snapshot
+
         grad_norms = {name: value.sqrt() for name, value in squared_norms.items()}
         total_grad_norm = sum(squared_norms.values()).sqrt()
-        if not all(torch.isfinite(value) for value in (*grad_norms.values(), total_grad_norm)):
+        perception_squared_norm = torch.zeros((), device=self.device)
+        backbone = getattr(model, "_backbone", None)
+        if backbone is not None:
+            for parameter in backbone.parameters():
+                if parameter.grad is not None:
+                    perception_squared_norm = (
+                        perception_squared_norm
+                        + parameter.grad.detach().float().square().sum()
+                    )
+        perception_grad_norm = perception_squared_norm.sqrt()
+        training_mode = getattr(
+            getattr(self.agent, "_config", None), "grpo_training_mode", None
+        )
+        if training_mode in {"generation", "generation_group"} and (
+            grad_norms["classification"] != 0 or perception_grad_norm != 0
+        ):
+            raise RuntimeError(
+                "Generation-only GRPO produced classification/perception gradients"
+            )
+        if not all(torch.isfinite(value) for value in (
+            *grad_norms.values(), total_grad_norm, perception_grad_norm
+        )):
             raise FloatingPointError("Non-finite diff_decoder gradient norm")
         self.log(
             "train/diff_decoder_grad_norm", total_grad_norm,
             on_step=True, on_epoch=True, prog_bar=True, sync_dist=True,
+        )
+        self.log(
+            "train/perception_grad_norm", perception_grad_norm,
+            on_step=True, on_epoch=True, prog_bar=False, sync_dist=True,
         )
         for group, grad_norm in grad_norms.items():
             self.log(

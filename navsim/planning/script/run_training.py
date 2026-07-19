@@ -251,10 +251,12 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"确保日志目录存在: {final_log_dir} - {os.path.exists(final_log_dir)}")
     
     logger.info("Starting Training")
+    resume_checkpoint = cfg.get("resume_checkpoint_path", None)
     trainer.fit(
         model=lightning_module,
         train_dataloaders=train_dataloader,
         val_dataloaders=val_dataloader,
+        ckpt_path=str(resume_checkpoint) if resume_checkpoint else None,
     )
     
 

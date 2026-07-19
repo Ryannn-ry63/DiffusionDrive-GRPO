@@ -2,6 +2,7 @@ from typing import Any, List, Dict, Optional, Union
 from pathlib import Path
 
 import copy
+import math
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
@@ -11,6 +12,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
+from navsim.agents.diffusiondrive.diffusion_grpo import file_sha256
 
 from navsim.agents.diffusiondrive.transfuser_model_v2 import V2TransfuserModel as TransfuserModel
 
@@ -31,6 +33,78 @@ def build_from_configs(obj, cfg: DictConfig, **kwargs):
         OmegaConf.set_struct(cfg, False)
     type = cfg.pop('type')
     return getattr(obj, type)(**cfg, **kwargs)
+
+
+FORMAL_GRPO_MODES = {"selector_group", "generation_group"}
+FORMAL_BASE_SHA256 = (
+    "59a8de460cfd8b1266c5cdd393372273da5c2465fa6707da551c4ecb1fbd019d"
+)
+
+
+def validate_frozen_policy_state(policy: nn.Module, expected_state: Dict[str, torch.Tensor]) -> None:
+    """Fail closed if a supposedly frozen policy differs from its base state."""
+    actual_state = policy.state_dict()
+    if set(actual_state) != set(expected_state):
+        raise RuntimeError("Frozen reference policy state keys differ from base")
+    for name, expected in expected_state.items():
+        actual = actual_state[name].detach().cpu()
+        if not torch.equal(actual, expected):
+            raise RuntimeError(
+                f"Frozen reference policy changed relative to base: {name}"
+            )
+    if any(parameter.requires_grad for parameter in policy.parameters()):
+        raise RuntimeError("Frozen reference policy has trainable parameters")
+
+
+def validate_formal_grpo_config(config: TransfuserConfig) -> None:
+    """Fail closed if a stage-9 objective drifts from its registration."""
+    mode = str(getattr(config, "grpo_training_mode", ""))
+    if mode not in FORMAL_GRPO_MODES:
+        return
+    expected = {
+        "grpo_decoder_gradient_scope": "all_layers",
+        "grpo_reward_mode": "pdms",
+        "grpo_scene_weight_mode": "uniform",
+        "selection_behavior_weighting": "old_policy",
+        "generation_advantage_mode": "group_zscore",
+        "generation_mode_weighting": "uniform",
+        "generation_trust_projection_mode": "none",
+        "grpo_rollouts_per_mode": 1,
+        "grpo_old_policy_sync_steps": 32,
+        "grpo_priority_manifest_path": "",
+        "grpo_priority_sample_fraction": 0.0,
+        "selection_entropy_weight": 0.0,
+        "selection_exploration_floor": 0.0,
+        "selection_rank_loss_weight": 0.0,
+        "selector_consistency_kl_weight": 0.0,
+        "grpo_clip_ratio": 0.2,
+    }
+    route_expected = {
+        "selector_group": {
+            "policy_loss_weight": 1.0,
+            "kl_loss_weight": 0.01,
+            "selector_generation_kl_weight": 0.1,
+            "generation_policy_loss_weight": 0.0,
+            "generation_kl_loss_weight": 0.0,
+        },
+        "generation_group": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.1,
+        },
+    }[mode]
+    for name, wanted in {**expected, **route_expected}.items():
+        actual = getattr(config, name, None)
+        matches = (
+            math.isclose(float(actual), wanted, rel_tol=0.0, abs_tol=1e-12)
+            if isinstance(wanted, float) else actual == wanted
+        )
+        if not matches:
+            raise ValueError(
+                f"formal {mode} requires {name}={wanted!r}; got {actual!r}"
+            )
 
 class TransfuserAgent(AbstractAgent):
     """Agent interface for TransFuser baseline."""
@@ -65,6 +139,26 @@ class TransfuserAgent(AbstractAgent):
                 f"DiffusionDrive reference checkpoint does not exist: {reference_checkpoint_path}"
             )
         self._checkpoint_path = checkpoint_path
+        checkpoint_file = Path(checkpoint_path)
+        reference_file = Path(reference_checkpoint_path)
+        self._checkpoint_sha256 = file_sha256(checkpoint_file)
+        self._reference_checkpoint_sha256 = (
+            self._checkpoint_sha256
+            if checkpoint_file.resolve() == reference_file.resolve()
+            else file_sha256(reference_file)
+        )
+        validate_formal_grpo_config(config)
+        if str(getattr(config, "grpo_training_mode", "")) in FORMAL_GRPO_MODES:
+            if self._reference_checkpoint_sha256 != FORMAL_BASE_SHA256:
+                raise RuntimeError(
+                    "Formal stage-9 reference checkpoint is not the registered base"
+                )
+            if self._checkpoint_sha256 != self._reference_checkpoint_sha256:
+                raise RuntimeError(
+                    "Formal stage-9 current policy must initialize from frozen base"
+                )
+            if not math.isclose(float(lr), 1e-6, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError("Formal stage-9 learning rate must be 1e-6")
         self._reference_checkpoint_path = reference_checkpoint_path
         self._transfuser_model = TransfuserModel(config)
         self.init_from_pretrained()
@@ -75,22 +169,23 @@ class TransfuserAgent(AbstractAgent):
         # 2. Choose shared-feature training or a fixed-generator baseline.
         training_mode = getattr(config, "grpo_training_mode", "classification_shared")
         trajectory_head = self._transfuser_model._trajectory_head
-        if training_mode == "classification_shared":
+        if training_mode in {"classification_shared", "selector_group"}:
             trajectory_head.diff_decoder.requires_grad_(True)
         elif training_mode in {"classification_head", "selector"}:
             trajectory_head.diff_decoder.layers[-1].task_decoder.plan_cls_branch.requires_grad_(
                 True
             )
-        elif training_mode in {"generation", "joint"}:
+        elif training_mode in {"generation", "generation_group", "joint"}:
             trajectory_head.diff_decoder.requires_grad_(True)
-            if training_mode == "generation":
+            if training_mode in {"generation", "generation_group"}:
                 for layer in trajectory_head.diff_decoder.layers:
                     layer.task_decoder.plan_cls_branch.requires_grad_(False)
         else:
             raise ValueError(
                 "grpo_training_mode must be one of "
                 "{'classification_shared', 'classification_head', 'selector', "
-                "'generation', 'joint'}; "
+                "'generation', 'joint', 'selector_group', "
+                "'generation_group'}; "
                 f"got {training_mode!r}"
             )
         trainable_params = sum(
@@ -118,6 +213,10 @@ class TransfuserAgent(AbstractAgent):
             raise RuntimeError(
                 f"Reference checkpoint has no diff_decoder weights: {self._reference_checkpoint_path}"
             )
+        self._reference_decoder_state = {
+            name: value.detach().cpu().clone()
+            for name, value in reference_decoder_state.items()
+        }
         ref_policy.load_state_dict(reference_decoder_state, strict=True)
         ref_policy.requires_grad_(False)
         ref_policy.eval()
@@ -129,10 +228,22 @@ class TransfuserAgent(AbstractAgent):
         # 3. 设置到TrajectoryHead中
         self._transfuser_model._trajectory_head.set_ref_policy(ref_policy)
         self._transfuser_model._trajectory_head.set_old_policy(old_policy)
+        self._transfuser_model._trajectory_head.validate_generation_trust_runtime(
+            self._reference_checkpoint_path
+        )
 
         print(
             "✓ Reference policy loaded from "
             f"{self._reference_checkpoint_path}; old policy copied from current checkpoint"
+        )
+
+    def validate_reference_policy_immutability(self) -> None:
+        """Validate the in-memory reference after construction or resume."""
+        head = self._transfuser_model._trajectory_head
+        if head.ref_policy is None:
+            raise RuntimeError("GRPO has no frozen reference policy")
+        validate_frozen_policy_state(
+            head.ref_policy, self._reference_decoder_state
         )
         
     def init_from_pretrained(self):
@@ -309,14 +420,29 @@ class TransfuserAgent(AbstractAgent):
 
     def get_training_callbacks(self) -> List[pl.Callback]:
         """Inherited, see superclass."""
-        selection_checkpoint = ModelCheckpoint(
-            filename="grpo-{epoch:02d}-{step}",
-            monitor="val/selected_reward_epoch",
-            mode="max",
-            save_top_k=int(getattr(self._config, "grpo_checkpoint_save_top_k", 2)),
-            save_last=True,
-            auto_insert_metric_name=False,
-        )
+        training_mode = str(getattr(self._config, "grpo_training_mode", ""))
+        if training_mode in FORMAL_GRPO_MODES:
+            # Stage 9 has no on-policy validation rollout: PDMS selection is
+            # performed by the independent fixed-set evaluator. Preserve each
+            # completed epoch instead of monitoring an undefined val metric.
+            selection_checkpoint = ModelCheckpoint(
+                filename="grpo-{epoch:02d}-{step}",
+                every_n_epochs=1,
+                save_top_k=-1,
+                save_last=True,
+                auto_insert_metric_name=False,
+            )
+        else:
+            selection_checkpoint = ModelCheckpoint(
+                filename="grpo-{epoch:02d}-{step}",
+                monitor="val/selected_reward_epoch",
+                mode="max",
+                save_top_k=int(
+                    getattr(self._config, "grpo_checkpoint_save_top_k", 2)
+                ),
+                save_last=True,
+                auto_insert_metric_name=False,
+            )
         callbacks = [
             TransfuserCallback(self._config),
             selection_checkpoint,

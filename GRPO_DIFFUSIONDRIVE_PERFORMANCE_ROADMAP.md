@@ -370,3 +370,17 @@ K2 hierarchical 是目前第一个在独立 dev-select 上显著优于 base、�
 - 增益集中于少量低分难例，正常场景增益很小；oracle 未提升，继续单纯增加 update 不具备足够依据。
 
 下一阶段必须围绕“扩大 K2 的有效覆盖面，同时保护 common 场景”设计单一新机制。不得直接延长 U192/U256，不得重新开启已失败的 priority oversampling、reference margin、selector weighting 或 shaping 网格。新机制在写入本路线图、明确因果消融和停止门槛之前不得启动训练。
+
+### 11.7 Phase 3：Anchor-Conditioned Hierarchical GRPO
+
+Phase 3 已按 GRPO_DIFFUSIONDRIVE_PHASE3_PLAN.md 完成实现和 seed-0 预注册门控：
+
+- fixed reference 对相同 initial diffusion state 的全部 20 anchors 生成无梯度 deterministic baseline；
+- anchor_hierarchical 支持 K2/K4；
+- 负 advantage 比例从旧 hierarchical 的约 84% 降至约 54%--57%；
+- K2/K4 U64 的 fixed-256 oracle 基本不变；
+- K2 U128 fixed-256 selected +0.001107、oracle -0.003161；
+- K4 U128 fixed-256 selected +0.004607、oracle -0.003123，selected CI 跨 0；
+- 两个 U128 均触发 oracle < -0.002 的预注册硬停止。
+
+因此 Phase 3 不进入 fixed-1024、dev-select、dev-confirm、多 seed 或 full-navtest。结果表明 anchor baseline 修正了 advantage 失衡，但没有解决 64→128 updates 间的候选上界退化；下一阶段应研究 update-level credit/trust scheduling，而不是继续增加 K、训练步数或事后选择 U64。

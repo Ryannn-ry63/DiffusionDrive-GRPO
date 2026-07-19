@@ -14,8 +14,11 @@ config:
   latent: False
 
   grpo_training_mode: classification_shared
+  grpo_decoder_gradient_scope: last_layer
   grpo_checkpoint_save_top_k: 2
   policy_loss_weight: 1.0
+  grpo_clip_ratio: 0.2
+  grpo_advantage_eps: 0.001
   grpo_checkpoint_every_n_train_steps: 0
   grpo_old_policy_sync_steps: 32
   selection_temperature: 1.0
@@ -30,6 +33,7 @@ config:
   grpo_reference_gate_margin: 0.01
   grpo_reference_gate_scale: 0.05
   selector_consistency_kl_weight: 0.0
+  selector_generation_kl_weight: 0.0
   grpo_reward_mode: pdms
   pdm_tiebreak_max_epsilon: 0.001
   pdm_dense_weight: 0.1
@@ -39,6 +43,9 @@ config:
   reference_advantage_margin: 0.01
   reference_advantage_scale: 0.10
   reference_advantage_clip: 2.0
+  rloo_advantage_margin: 0.01
+  rloo_advantage_scale: 0.20
+  rloo_advantage_clip: 1.0
   grpo_rollouts_per_mode: 1
   grpo_priority_manifest_path: ""
   grpo_priority_sample_fraction: 0.0
@@ -47,6 +54,10 @@ config:
   generation_ddim_eta: 1.0
   generation_final_std: 0.05
   generation_sigma_min: 1e-4
+  generation_trust_projection_mode: none
+  generation_trust_calibration_path: ""
+  generation_trust_collect_calibration: false
+  generation_trust_calibration_seed: 20260719
   kl_loss_weight: 0.01
   diffusion_truncation_timestep: 8
   diffusion_roll_timesteps: [8, 0]

@@ -35,6 +35,70 @@ def compute_group_relative_advantages(
     return advantages, valid_mask, group_valid, means.squeeze(-1), stds.squeeze(-1)
 
 
+def compute_anchor_rloo_advantages(
+    rewards: torch.Tensor,
+    valid_mask: torch.Tensor,
+    rollouts_per_mode: int = 2,
+    margin: float = 0.01,
+    scale: float = 0.20,
+    clip: float = 1.0,
+):
+    """Return detached magnitude-aware leave-one-out advantages per anchor.
+
+    Candidates must be in anchor-major order. A rollout has an RLOO signal
+    only when its anchor contains at least two valid rollouts; invalid rewards
+    never contribute to the leave-one-out baseline.
+    """
+    if rewards.ndim != 2 or valid_mask.shape != rewards.shape:
+        raise ValueError("rewards and valid_mask must have shape [batch, candidate]")
+    if rollouts_per_mode != 2:
+        raise ValueError("anchor_rloo requires rollouts_per_mode=2")
+    if rewards.shape[1] % rollouts_per_mode != 0:
+        raise ValueError(
+            "generation candidate count must be divisible by rollouts_per_mode"
+        )
+    if margin < 0:
+        raise ValueError("RLOO advantage margin must be non-negative")
+    if scale <= 0:
+        raise ValueError("RLOO advantage scale must be positive")
+    if clip <= 0:
+        raise ValueError("RLOO advantage clip must be positive")
+
+    detached_rewards = rewards.detach().float()
+    valid_mask = valid_mask.bool() & torch.isfinite(detached_rewards)
+    num_anchors = rewards.shape[1] // rollouts_per_mode
+    anchor_rewards = detached_rewards.reshape(
+        rewards.shape[0], num_anchors, rollouts_per_mode
+    )
+    anchor_valid = valid_mask.reshape(
+        rewards.shape[0], num_anchors, rollouts_per_mode
+    )
+    clean_rewards = torch.where(
+        anchor_valid, anchor_rewards, torch.zeros_like(anchor_rewards)
+    )
+    valid_counts = anchor_valid.sum(dim=-1, keepdim=True)
+    rloo_valid = anchor_valid & (valid_counts >= 2)
+    loo_baseline = (
+        (clean_rewards.sum(dim=-1, keepdim=True) - clean_rewards)
+        / (valid_counts - 1).clamp_min(1)
+    )
+    gaps = torch.where(
+        rloo_valid, anchor_rewards - loo_baseline, torch.zeros_like(anchor_rewards)
+    )
+    magnitudes = ((gaps.abs() - margin).clamp_min(0.0) / scale).clamp_max(clip)
+    advantages = torch.where(
+        rloo_valid, gaps.sign() * magnitudes, torch.zeros_like(gaps)
+    )
+    group_valid = valid_counts.squeeze(-1) >= 2
+    return (
+        advantages.reshape_as(rewards).detach(),
+        gaps.reshape_as(rewards).detach(),
+        rloo_valid.reshape_as(valid_mask),
+        group_valid,
+        valid_mask,
+    )
+
+
 def compute_smoothed_selector_policy(
     logits: torch.Tensor,
     valid_mask: torch.Tensor,
@@ -326,9 +390,14 @@ def compute_generation_grpo_objective(
     advantage_mode: str = "group_zscore",
     reference_selected_reward: torch.Tensor = None,
     reference_valid_mask: torch.Tensor = None,
+    reference_anchor_rewards: torch.Tensor = None,
+    reference_anchor_valid_mask: torch.Tensor = None,
     reference_margin: float = 0.01,
     reference_scale: float = 0.10,
     reference_clip: float = 2.0,
+    rloo_margin: float = 0.01,
+    rloo_scale: float = 0.20,
+    rloo_clip: float = 1.0,
     rollouts_per_mode: int = 1,
 ):
     """Clipped policy objective over sampled denoising actions.
@@ -337,7 +406,10 @@ def compute_generation_grpo_objective(
     reference_centered uses the fixed reference policy deployable raw reward
     as an absolute baseline. within_anchor and hierarchical use K=2 samples
     per anchor; hierarchical mixes equal-weight within-anchor and reference
-    advantages.
+    advantages. anchor_hierarchical uses a fixed-reference raw-PDMS baseline
+    for the matching anchor and supports K=2 or K=4. anchor_rloo replaces
+    within-anchor standardization with a magnitude-aware K2 leave-one-out
+    signal while retaining the matching fixed-reference anchor term.
     """
     if current_log_probs.shape != old_log_probs.shape:
         raise ValueError("current and old generation log-probs must have identical shapes")
@@ -362,6 +434,8 @@ def compute_generation_grpo_objective(
     )
 
     rewards = rewards.float()
+    if advantage_mode == "anchor_rloo":
+        rewards = rewards.detach()
     valid_mask = valid_mask.bool() & torch.isfinite(rewards)
     reference_delta = None
     reference_valid_mask_for_metrics = None
@@ -375,12 +449,94 @@ def compute_generation_grpo_objective(
         "reference_centered",
         "within_anchor",
         "hierarchical",
+        "anchor_hierarchical",
+        "anchor_rloo",
     }:
-        if advantage_mode in {"within_anchor", "hierarchical"}:
-            if rollouts_per_mode != 2:
+        within_anchor_mode = advantage_mode in {
+            "within_anchor",
+            "hierarchical",
+            "anchor_hierarchical",
+        }
+        rloo_mode = advantage_mode == "anchor_rloo"
+        if rloo_mode:
+            (
+                within_advantages,
+                rloo_gaps,
+                rloo_valid_mask,
+                anchor_group_valid,
+                valid_mask,
+            ) = compute_anchor_rloo_advantages(
+                rewards,
+                valid_mask,
+                rollouts_per_mode=rollouts_per_mode,
+                margin=rloo_margin,
+                scale=rloo_scale,
+                clip=rloo_clip,
+            )
+            num_anchors = rewards.shape[1] // rollouts_per_mode
+            within_valid_mask = rloo_valid_mask
+            absolute_gaps = rloo_gaps[rloo_valid_mask].abs()
+            active_rloo = rloo_valid_mask & (within_advantages != 0)
+            clipped_rloo = rloo_valid_mask & (
+                within_advantages.abs() >= rloo_clip
+            )
+            zero = rewards.detach().new_zeros(())
+            within_anchor_metrics = {
+                "within_anchor_pair_fraction": (
+                    anchor_group_valid.float().mean().detach()
+                ),
+                "within_anchor_reward_gap_mean": (
+                    absolute_gaps.mean().detach()
+                    if absolute_gaps.numel()
+                    else zero
+                ),
+                "rloo_absolute_gap_mean": (
+                    absolute_gaps.mean().detach()
+                    if absolute_gaps.numel()
+                    else zero
+                ),
+                "rloo_absolute_gap_p50": (
+                    torch.quantile(absolute_gaps, 0.50).detach()
+                    if absolute_gaps.numel()
+                    else zero
+                ),
+                "rloo_absolute_gap_p90": (
+                    torch.quantile(absolute_gaps, 0.90).detach()
+                    if absolute_gaps.numel()
+                    else zero
+                ),
+                "rloo_dead_zone_fraction": (
+                    (absolute_gaps <= rloo_margin).float().mean().detach()
+                    if absolute_gaps.numel()
+                    else zero
+                ),
+                "rloo_clip_fraction": (
+                    clipped_rloo[rloo_valid_mask].float().mean().detach()
+                    if rloo_valid_mask.any()
+                    else zero
+                ),
+                "rloo_active_fraction": (
+                    active_rloo[valid_mask].float().mean().detach()
+                    if valid_mask.any()
+                    else zero
+                ),
+            }
+        if within_anchor_mode:
+            if (
+                advantage_mode in {"within_anchor", "hierarchical"}
+                and rollouts_per_mode != 2
+            ):
                 raise ValueError(
                     "within_anchor/hierarchical generation advantage requires "
                     "rollouts_per_mode=2"
+                )
+            if (
+                advantage_mode == "anchor_hierarchical"
+                and rollouts_per_mode not in {2, 4}
+            ):
+                raise ValueError(
+                    "anchor_hierarchical generation advantage requires "
+                    "rollouts_per_mode=2 or 4"
                 )
             if rewards.shape[1] % rollouts_per_mode != 0:
                 raise ValueError(
@@ -411,20 +567,21 @@ def compute_generation_grpo_objective(
                 .expand(-1, -1, rollouts_per_mode)
                 .reshape_as(valid_mask)
             )
-            pair_reward_gap = (
-                anchor_rewards[:, 0] - anchor_rewards[:, 1]
-            ).abs()
+            anchor_reward_range = (
+                anchor_rewards.masked_fill(~anchor_valid_mask, float("-inf")).max(dim=-1).values
+                - anchor_rewards.masked_fill(~anchor_valid_mask, float("inf")).min(dim=-1).values
+            )
             within_anchor_metrics = {
                 "within_anchor_pair_fraction": (
                     anchor_group_valid.float().mean().detach()
                 ),
                 "within_anchor_reward_gap_mean": (
-                    pair_reward_gap[anchor_group_valid].mean().detach()
+                    anchor_reward_range[anchor_group_valid].mean().detach()
                     if anchor_group_valid.any()
                     else rewards.new_zeros(())
                 ),
             }
-        else:
+        elif not rloo_mode:
             within_advantages = None
             within_valid_mask = None
 
@@ -473,12 +630,91 @@ def compute_generation_grpo_objective(
             reference_advantages = None
             reference_signal_mask = torch.zeros_like(valid_mask)
 
+        if advantage_mode in {"anchor_hierarchical", "anchor_rloo"}:
+            if reference_margin < 0:
+                raise ValueError("reference advantage margin must be non-negative")
+            if reference_scale <= 0:
+                raise ValueError("reference advantage scale must be positive")
+            if reference_clip <= 0:
+                raise ValueError("reference advantage clip must be positive")
+            num_anchors = rewards.shape[1] // rollouts_per_mode
+            expected_shape = (rewards.shape[0], num_anchors)
+            if reference_anchor_rewards is None:
+                raise ValueError(
+                    f"{advantage_mode} generation advantage requires "
+                    "reference_anchor_rewards"
+                )
+            if reference_anchor_rewards.shape != expected_shape:
+                raise ValueError(
+                    "reference_anchor_rewards must have shape "
+                    f"{expected_shape}"
+                )
+            if reference_anchor_valid_mask is None:
+                reference_anchor_valid_mask = torch.isfinite(
+                    reference_anchor_rewards
+                )
+            elif reference_anchor_valid_mask.shape != expected_shape:
+                raise ValueError(
+                    "reference_anchor_valid_mask must match "
+                    "reference_anchor_rewards"
+                )
+            reference_anchor_valid_mask = (
+                reference_anchor_valid_mask.bool()
+                & torch.isfinite(reference_anchor_rewards)
+            )
+            expanded_anchor_rewards = (
+                reference_anchor_rewards.detach().float()
+                .repeat_interleave(rollouts_per_mode, dim=-1)
+            )
+            expanded_anchor_valid = reference_anchor_valid_mask.repeat_interleave(
+                rollouts_per_mode, dim=-1
+            )
+            reference_delta = rewards - expanded_anchor_rewards
+            magnitude = (
+                (reference_delta.abs() - reference_margin).clamp_min(0.0)
+                / reference_scale
+            )
+            reference_advantages = (
+                reference_delta.sign() * magnitude
+            ).clamp(min=-reference_clip, max=reference_clip)
+            reference_signal_mask = valid_mask & expanded_anchor_valid
+            reference_advantages = torch.where(
+                reference_signal_mask,
+                reference_advantages,
+                torch.zeros_like(reference_advantages),
+            ).detach()
+            reference_valid_mask_for_metrics = expanded_anchor_valid
+            within_anchor_metrics.update(
+                {
+                    "reference_anchor_reward_mean": (
+                        reference_anchor_rewards[
+                            reference_anchor_valid_mask
+                        ].float().mean().detach()
+                        if reference_anchor_valid_mask.any()
+                        else rewards.new_zeros(())
+                    ),
+                    "reference_anchor_valid_fraction": (
+                        reference_anchor_valid_mask.float().mean().detach()
+                    ),
+                }
+            )
+
         if advantage_mode == "reference_centered":
             advantages = reference_advantages
             optimize_mode_mask = advantages != 0
         elif advantage_mode == "within_anchor":
             advantages = within_advantages.clamp(-2.0, 2.0).detach()
             optimize_mode_mask = within_valid_mask & (advantages != 0)
+        elif advantage_mode == "anchor_rloo":
+            advantages = (
+                0.5 * within_advantages
+                + 0.5 * reference_advantages
+            ).detach()
+            optimize_mode_mask = (
+                valid_mask
+                & (within_valid_mask | reference_signal_mask)
+                & (advantages != 0)
+            )
         else:
             advantages = (
                 0.5 * within_advantages.clamp(-2.0, 2.0)
@@ -494,7 +730,8 @@ def compute_generation_grpo_objective(
         raise ValueError(
             "generation advantage mode must be one of "
             "{'group_zscore', 'reference_centered', "
-            "'within_anchor', 'hierarchical'}"
+            "'within_anchor', 'hierarchical', 'anchor_hierarchical', "
+            "'anchor_rloo'}"
         )
     log_ratio = (current_log_probs - old_log_probs.detach()).clamp(-20.0, 20.0)
     ratio = log_ratio.exp()
@@ -551,9 +788,7 @@ def compute_generation_grpo_objective(
         **within_anchor_metrics,
     }
     if reference_delta is not None:
-        reference_metric_mask = (
-            valid_mask & reference_valid_mask_for_metrics.unsqueeze(-1)
-        )
+        reference_metric_mask = reference_signal_mask
         if reference_metric_mask.any():
             valid_delta = reference_delta[reference_metric_mask]
             result.update(
@@ -657,6 +892,17 @@ def transfuser_loss(
         "reward_valid_mask", torch.ones_like(predictions["rewards"], dtype=torch.bool)
     ) if predictions.get("rewards") is not None else None
 
+    # Validation/inference does not sample from the current and old behavior
+    # policies, so a PPO objective is undefined there. Keep the validation
+    # loop side-effect free and reserve all GRPO tensors for training forwards.
+    if not predictions.get("grpo_training_rollout", True):
+        zero = current_logits.sum() * 0.0
+        return {
+            "loss": zero,
+            "grpo_loss": zero.detach(),
+            "kl_loss": zero.detach(),
+        }
+
     if "rewards" not in predictions or predictions["rewards"] is None:
         zero = current_logits.sum() * 0.0
         return {
@@ -720,7 +966,11 @@ def transfuser_loss(
         current_logits=current_logits,
         old_logits=predictions["final_old_poses_cls"],
         reference_logits=predictions["final_ref_poses_cls"],
-        rewards=predictions["rewards"],
+        rewards=(
+            predictions.get("raw_rewards")
+            if getattr(config, "grpo_training_mode", "") == "selector_group"
+            else predictions["rewards"]
+        ),
         valid_mask=valid_mask,
         clip_ratio=getattr(config, "grpo_clip_ratio", 0.2),
         advantage_eps=getattr(config, "grpo_advantage_eps", 1e-3),
@@ -749,8 +999,9 @@ def transfuser_loss(
         )
 
     training_mode = getattr(config, "grpo_training_mode", "classification_shared")
-    selection_weight = 0.0 if training_mode == "generation" else grpo_weight
-    selection_regularization_enabled = training_mode != "generation"
+    generation_only = training_mode in {"generation", "generation_group"}
+    selection_weight = 0.0 if generation_only else grpo_weight
+    selection_regularization_enabled = not generation_only
     rank_weight = (
         getattr(config, "selection_rank_loss_weight", 0.0)
         if selection_regularization_enabled else 0.0
@@ -800,9 +1051,33 @@ def transfuser_loss(
     )
     total_loss = total_loss + selector_consistency_weight * selector_consistency_kl
 
+    selector_generation_kl = current_logits.sum() * 0.0
+    if (
+        training_mode == "selector_group"
+        and predictions.get("grpo_training_rollout", True)
+    ):
+        selector_generation_kl_tensor = predictions.get("selector_generation_kl")
+        if selector_generation_kl_tensor is None:
+            raise ValueError("selector_group requires selector_generation_kl")
+        if selector_generation_kl_tensor.shape != (*current_logits.shape, 2):
+            raise ValueError(
+                "selector_generation_kl must have shape [batch, mode, 2]"
+            )
+        selector_kl_mask = valid_mask.unsqueeze(-1).expand_as(
+            selector_generation_kl_tensor
+        )
+        selector_generation_kl = (
+            selector_generation_kl_tensor[selector_kl_mask].mean()
+            if selector_kl_mask.any()
+            else selector_generation_kl_tensor.sum() * 0.0
+        )
+        total_loss = total_loss + getattr(
+            config, "selector_generation_kl_weight", 0.0
+        ) * selector_generation_kl
+
     generation_objective = None
     if (
-        training_mode in {"generation", "joint"}
+        training_mode in {"generation", "generation_group", "joint"}
         and predictions.get("generation_current_log_probs") is not None
     ):
         required = (
@@ -842,11 +1117,16 @@ def transfuser_loss(
             config, "generation_advantage_mode", "group_zscore"
         )
         generation_rewards = predictions["rewards"]
-        if generation_advantage_mode == "reference_centered":
+        if generation_advantage_mode in {
+            "reference_centered",
+            "anchor_hierarchical",
+            "anchor_rloo",
+        }:
             generation_rewards = predictions.get("raw_rewards")
             if generation_rewards is None:
                 raise ValueError(
-                    "reference_centered generation advantage requires raw_rewards"
+                    f"{generation_advantage_mode} generation advantage "
+                    "requires raw_rewards"
                 )
         generation_objective = compute_generation_grpo_objective(
             current_log_probs=predictions["generation_current_log_probs"],
@@ -868,6 +1148,12 @@ def transfuser_loss(
             reference_valid_mask=predictions.get(
                 "reference_reward_valid_mask"
             ),
+            reference_anchor_rewards=predictions.get(
+                "reference_anchor_rewards"
+            ),
+            reference_anchor_valid_mask=predictions.get(
+                "reference_anchor_valid_mask"
+            ),
             reference_margin=getattr(
                 config, "reference_advantage_margin", 0.01
             ),
@@ -876,6 +1162,15 @@ def transfuser_loss(
             ),
             reference_clip=getattr(
                 config, "reference_advantage_clip", 2.0
+            ),
+            rloo_margin=getattr(
+                config, "rloo_advantage_margin", 0.01
+            ),
+            rloo_scale=getattr(
+                config, "rloo_advantage_scale", 0.20
+            ),
+            rloo_clip=getattr(
+                config, "rloo_advantage_clip", 1.0
             ),
             rollouts_per_mode=getattr(
                 config, "grpo_rollouts_per_mode", 1
@@ -898,6 +1193,7 @@ def transfuser_loss(
             key: value for key, value in objective.items()
             if key not in {"policy_loss", "kl_loss", "entropy_for_loss"}
         },
+        "selector_generation_kl_loss": selector_generation_kl.detach(),
         "grpo_scene_weight": scene_weights.float().mean().detach(),
         "active_scene_fraction": (scene_weights > 0).float().mean().detach(),
     }
@@ -955,9 +1251,22 @@ def transfuser_loss(
             "within_margin_fraction",
             "within_anchor_pair_fraction",
             "within_anchor_reward_gap_mean",
+            "reference_anchor_reward_mean",
+            "reference_anchor_valid_fraction",
+            "rloo_absolute_gap_mean",
+            "rloo_absolute_gap_p50",
+            "rloo_absolute_gap_p90",
+            "rloo_dead_zone_fraction",
+            "rloo_clip_fraction",
+            "rloo_active_fraction",
         ):
             if key in generation_objective:
                 result[f"generation_{key}"] = generation_objective[key]
+        for key, value in predictions.items():
+            if key.startswith("generation_trust_"):
+                if not torch.is_tensor(value) or value.numel() != 1:
+                    raise ValueError(f"{key} must be one scalar tensor")
+                result[key] = value.detach()
     if raw_objective is not None:
         result.update(
             {

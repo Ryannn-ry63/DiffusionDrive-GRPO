@@ -25,10 +25,18 @@ from navsim.agents.diffusiondrive.modules.blocks import (
 )
 from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
 from navsim.agents.diffusiondrive.diffusion_grpo import (
+    diagonal_gaussian_kl_same_std,
+    _decode_policy_step,
     collect_generation_trace,
     compute_pdm_dense_rewards,
     compute_pdm_tiebreak_rewards,
+    ddim_transition_with_log_prob,
     flatten_generation_rollouts,
+    load_generation_trust_calibration,
+    normalized_rms_displacement,
+    project_reference_mean_ball,
+    summarize_trust_projection,
+    validate_generation_trust_provenance,
 )
 
 from navsim.common.dataclasses import Trajectory
@@ -390,11 +398,18 @@ class CustomTransformerDecoder(nn.Module):
         decoder_layer, 
         num_layers,
         norm=None,
+        gradient_scope="last_layer",
     ):
         super().__init__()
         torch._C._log_api_usage_once(f"torch.nn.modules.{self.__class__.__name__}")
         self.layers = _get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
+        if gradient_scope not in {"last_layer", "all_layers"}:
+            raise ValueError(
+                "grpo_decoder_gradient_scope must be last_layer or all_layers"
+            )
+        self.gradient_scope = gradient_scope
+
     
     def forward(self, 
                 traj_feature, 
@@ -409,11 +424,14 @@ class CustomTransformerDecoder(nn.Module):
         poses_reg_list = []
         poses_cls_list = []
         traj_points = noisy_traj_points
-        for mod in self.layers:
+        for layer_index, mod in enumerate(self.layers):
             poses_reg, poses_cls = mod(traj_feature, traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
             poses_reg_list.append(poses_reg)
             poses_cls_list.append(poses_cls)
-            traj_points = poses_reg[...,:2].clone().detach()
+            next_points = poses_reg[..., :2].clone()
+            if self.gradient_scope == "last_layer" and layer_index < self.num_layers - 1:
+                next_points = next_points.detach()
+            traj_points = next_points
         return poses_reg_list, poses_cls_list
 
 class TrajectoryHead(nn.Module):
@@ -465,11 +483,19 @@ class TrajectoryHead(nn.Module):
             d_ffn=d_ffn,
             config=config,
         )
-        self.diff_decoder = CustomTransformerDecoder(diff_decoder_layer, 2)
+        self.diff_decoder = CustomTransformerDecoder(
+            diff_decoder_layer,
+            2,
+            gradient_scope=str(
+                getattr(config, "grpo_decoder_gradient_scope", "last_layer")
+            ),
+        )
         self.ref_policy = None
         self.old_policy = None
         self._old_policy_sync_steps = int(getattr(config, "grpo_old_policy_sync_steps", 32))
-        self._policy_forward_steps = 0
+        self.register_buffer(
+            "_old_policy_last_sync_step", torch.tensor(-1, dtype=torch.long)
+        )
         self._truncation_timestep = int(
             getattr(config, "diffusion_truncation_timestep", 8)
         )
@@ -492,6 +518,47 @@ class TrajectoryHead(nn.Module):
         self._generation_ddim_eta = float(getattr(config, "generation_ddim_eta", 1.0))
         self._generation_final_std = float(getattr(config, "generation_final_std", 0.05))
         self._generation_sigma_min = float(getattr(config, "generation_sigma_min", 1e-4))
+        self._generation_trust_projection_mode = str(
+            getattr(config, "generation_trust_projection_mode", "none")
+        )
+        if self._generation_trust_projection_mode not in {
+            "none",
+            "reference_mean_ball",
+        }:
+            raise ValueError(
+                "generation_trust_projection_mode must be none or "
+                "reference_mean_ball"
+            )
+        self._generation_trust_collect_calibration = bool(
+            getattr(config, "generation_trust_collect_calibration", False)
+        )
+        self._generation_trust_calibration_seed = int(
+            getattr(config, "generation_trust_calibration_seed", 20260719)
+        )
+        if (
+            self._generation_trust_collect_calibration
+            and self._generation_trust_projection_mode != "none"
+        ):
+            raise ValueError(
+                "calibration collection requires generation trust mode=none"
+            )
+        self._generation_trust_calibration = None
+        self._generation_trust_radii = {}
+        calibration_path = str(
+            getattr(config, "generation_trust_calibration_path", "")
+        )
+        if self._generation_trust_projection_mode == "reference_mean_ball":
+            if not calibration_path:
+                raise ValueError(
+                    "reference_mean_ball requires generation_trust_calibration_path"
+                )
+            self._generation_trust_calibration = (
+                load_generation_trust_calibration(calibration_path)
+            )
+            self._generation_trust_radii = {
+                step: float(self._generation_trust_calibration["steps"][step]["radius"])
+                for step in ("transition", "final")
+            }
         self._generation_advantage_mode = str(
             getattr(config, "generation_advantage_mode", "group_zscore")
         )
@@ -500,28 +567,54 @@ class TrajectoryHead(nn.Module):
             "reference_centered",
             "within_anchor",
             "hierarchical",
+            "anchor_hierarchical",
+            "anchor_rloo",
         }:
             raise ValueError(
                 "generation_advantage_mode must be one of "
                 "{'group_zscore', 'reference_centered', "
-                "'within_anchor', 'hierarchical'}; "
+                "'within_anchor', 'hierarchical', 'anchor_hierarchical', "
+                "'anchor_rloo'}; "
                 f"got {self._generation_advantage_mode!r}"
             )
         self._grpo_rollouts_per_mode = int(
             getattr(config, "grpo_rollouts_per_mode", 1)
         )
-        if self._grpo_rollouts_per_mode not in {1, 2}:
+        if self._grpo_rollouts_per_mode not in {1, 2, 4}:
             raise ValueError(
-                "grpo_rollouts_per_mode must be 1 or 2"
+                "grpo_rollouts_per_mode must be 1, 2, or 4"
             )
-        hierarchical_mode = self._generation_advantage_mode in {
+        legacy_hierarchical_mode = self._generation_advantage_mode in {
             "within_anchor",
             "hierarchical",
         }
-        if hierarchical_mode != (self._grpo_rollouts_per_mode == 2):
+        if legacy_hierarchical_mode and self._grpo_rollouts_per_mode != 2:
             raise ValueError(
                 "within_anchor/hierarchical require grpo_rollouts_per_mode=2; "
-                "group_zscore/reference_centered require 1"
+                f"got {self._grpo_rollouts_per_mode}"
+            )
+        if (
+            self._generation_advantage_mode == "anchor_hierarchical"
+            and self._grpo_rollouts_per_mode not in {2, 4}
+        ):
+            raise ValueError(
+                "anchor_hierarchical requires grpo_rollouts_per_mode=2 or 4"
+            )
+        if (
+            self._generation_advantage_mode == "anchor_rloo"
+            and self._grpo_rollouts_per_mode != 2
+        ):
+            raise ValueError(
+                "anchor_rloo requires grpo_rollouts_per_mode=2"
+            )
+        if (
+            self._generation_advantage_mode
+            in {"group_zscore", "reference_centered"}
+            and self._grpo_rollouts_per_mode != 1
+        ):
+            raise ValueError(
+                "group_zscore/reference_centered require "
+                "grpo_rollouts_per_mode=1"
             )
         self._grpo_reward_mode = str(getattr(config, "grpo_reward_mode", "pdms"))
         if self._grpo_reward_mode not in {"pdms", "pdm_tiebreak", "pdm_dense"}:
@@ -636,14 +729,62 @@ class TrajectoryHead(nn.Module):
             "transitions": tuple((t, t - step_stride) for t in self._roll_timesteps),
         }
 
+    def get_generation_trust_sigmas(self) -> Dict[str, float]:
+        """Return the exact normalized-space standard deviations used by trust balls."""
+        if len(self._roll_timesteps) != 2:
+            raise ValueError("generation trust projection requires exactly two steps")
+        stride = (
+            self.diffusion_scheduler.config.num_train_timesteps
+            // self._scheduler_num_inference_steps
+        )
+        first_timestep = self._roll_timesteps[0]
+        variance = self.diffusion_scheduler._get_variance(
+            int(first_timestep), int(first_timestep) - stride
+        )
+        transition_sigma = max(
+            self._generation_sigma_min,
+            self._generation_ddim_eta * float(variance.sqrt()),
+        )
+        return {
+            "transition": transition_sigma,
+            "final": self._generation_final_std,
+        }
+
+    def validate_generation_trust_runtime(
+        self, reference_checkpoint_path: str
+    ) -> None:
+        """Bind a loaded radius artifact to the actual frozen base checkpoint."""
+        if self._generation_trust_projection_mode == "none":
+            return
+        if self.ref_policy is None or self._generation_trust_calibration is None:
+            raise RuntimeError("Hard trust projection has no frozen base/calibration")
+        sigmas = self.get_generation_trust_sigmas()
+        validate_generation_trust_provenance(
+            self._generation_trust_calibration,
+            reference_checkpoint_path,
+            self._roll_timesteps,
+            self._scheduler_num_inference_steps,
+            sigmas["transition"],
+            sigmas["final"],
+        )
+
     @torch.no_grad()
-    def maybe_sync_old_policy(self):
+    def maybe_sync_old_policy(self, optimizer_step: int):
+        """Synchronize PPO behavior policy on optimizer-step boundaries.
+
+        The persistent last-sync step keeps old policy and cadence continuous
+        across a Lightning checkpoint resume.
+        """
         if self.old_policy is None:
             return
-        if self._policy_forward_steps % self._old_policy_sync_steps == 0:
+        optimizer_step = int(optimizer_step)
+        if optimizer_step < 0:
+            raise ValueError("optimizer_step must be non-negative")
+        last_sync = int(self._old_policy_last_sync_step.item())
+        if last_sync < 0 or optimizer_step - last_sync >= self._old_policy_sync_steps:
             self.old_policy.load_state_dict(self.diff_decoder.state_dict())
             self.old_policy.eval()
-        self._policy_forward_steps += 1
+            self._old_policy_last_sync_step.fill_(optimizer_step)
     
     
     def norm_odo(self, odo_info_fut):
@@ -709,6 +850,105 @@ class TrajectoryHead(nn.Module):
 
         return poses_reg, poses_cls
 
+    def _run_policy_rollout_with_reference(
+        self,
+        initial_sample,
+        ego_query,
+        agents_query,
+        bev_feature,
+        bev_spatial_shape,
+        status_encoding,
+        global_img,
+        apply_projection: bool,
+    ):
+        """Run current/base on identical states and optionally project each mean."""
+        if self.ref_policy is None:
+            raise RuntimeError("Trust rollout requires a frozen base policy")
+        if len(self._roll_timesteps) != 2 or self._roll_timesteps[-1] != 0:
+            raise ValueError("Trust rollout requires transition and final timesteps")
+        self.diffusion_scheduler.set_timesteps(
+            self._scheduler_num_inference_steps, initial_sample.device
+        )
+        sigmas = self.get_generation_trust_sigmas()
+        sample = initial_sample
+        diagnostics_by_step = []
+        final_reg = final_cls = final_reference_cls = None
+
+        for step_index, timestep in enumerate(self._roll_timesteps):
+            current_reg, current_cls = _decode_policy_step(
+                self, self.diff_decoder, sample, timestep, ego_query, agents_query,
+                bev_feature, bev_spatial_shape, status_encoding, global_img,
+            )
+            with torch.no_grad():
+                reference_reg, reference_cls = _decode_policy_step(
+                    self, self.ref_policy, sample.detach(), timestep,
+                    ego_query.detach(), agents_query.detach(), bev_feature.detach(),
+                    bev_spatial_shape, status_encoding.detach(),
+                    global_img.detach() if global_img is not None else None,
+                )
+            step_name = "transition" if step_index == 0 else "final"
+            sigma = current_reg.new_tensor(sigmas[step_name]).detach()
+            if step_name == "transition":
+                current_mean = self.diffusion_scheduler.step(
+                    model_output=self.norm_odo(current_reg[..., :2]),
+                    timestep=timestep,
+                    sample=sample,
+                ).prev_sample
+                with torch.no_grad():
+                    reference_mean = self.diffusion_scheduler.step(
+                        model_output=self.norm_odo(reference_reg[..., :2]),
+                        timestep=timestep,
+                        sample=sample.detach(),
+                    ).prev_sample.detach()
+            else:
+                current_mean = self.norm_odo(current_reg)
+                reference_mean = self.norm_odo(reference_reg).detach()
+
+            if apply_projection:
+                projected_mean, diagnostics = project_reference_mean_ball(
+                    current_mean,
+                    reference_mean,
+                    sigma,
+                    self._generation_trust_radii[step_name],
+                )
+            else:
+                distance = normalized_rms_displacement(
+                    current_mean, reference_mean, sigma
+                ).detach()
+                projected_mean = current_mean
+                diagnostics = {
+                    "pre_distance": distance,
+                    "post_distance": distance,
+                    "alpha": torch.ones_like(distance),
+                    "projected": torch.zeros_like(distance, dtype=torch.bool),
+                    "reference_coverage": torch.ones_like(distance, dtype=torch.bool),
+                }
+            diagnostics_by_step.append(diagnostics)
+            if step_name == "transition":
+                sample = projected_mean
+            else:
+                final_reg = (
+                    self.denorm_odo(projected_mean)
+                    if apply_projection
+                    else current_reg
+                )
+                final_cls = current_cls
+                final_reference_cls = reference_cls
+
+        diagnostics = {
+            f"generation_trust_{key}": torch.stack(
+                [step[key] for step in diagnostics_by_step], dim=-1
+            )
+            for key in (
+                "pre_distance",
+                "post_distance",
+                "alpha",
+                "projected",
+                "reference_coverage",
+            )
+        }
+        return final_reg, final_cls, final_reference_cls, diagnostics
+
     def _compute_reference_selected_reward(
         self,
         final_poses_reg,
@@ -773,6 +1013,114 @@ class TrajectoryHead(nn.Module):
 
         return reference_reward.detach(), reference_valid.detach()
 
+    def _compute_reference_anchor_rewards(
+        self,
+        initial_sample,
+        ego_query,
+        agents_query,
+        bev_feature,
+        bev_spatial_shape,
+        status_encoding,
+        global_img,
+        tokens_list,
+    ):
+        """Score one fixed-reference trajectory for every anchor.
+
+        The deterministic reference rollout starts from the same initial
+        diffusion state but is computed before, and independently of, the
+        stochastic behavior-policy actions. It is therefore a state/anchor
+        baseline rather than an action-dependent control variate.
+        """
+        with torch.no_grad():
+            reference_reg, _ = self._run_policy_rollout(
+                self.ref_policy,
+                initial_sample.detach(),
+                ego_query.detach(),
+                agents_query.detach(),
+                bev_feature.detach(),
+                bev_spatial_shape,
+                status_encoding.detach(),
+                global_img.detach() if global_img is not None else None,
+            )
+            num_anchors = reference_reg.shape[1]
+            if self._lazy_metric_cache is not None:
+                reference_result = self._compute_rewards_from_lazy_cache(
+                    reference_reg, tokens_list, num_anchors
+                )
+            elif self.metric_cache_loader is not None:
+                reference_result = self._compute_rewards_from_disk(
+                    reference_reg, tokens_list, num_anchors
+                )
+            else:
+                reference_result = None
+        if reference_result is None:
+            raise RuntimeError(
+                "Anchor-conditioned reference baseline requires a PDM metric cache"
+            )
+        return (
+            reference_result["raw_rewards"].detach(),
+            reference_result["valid_mask"].detach(),
+        )
+
+    def _run_selector_policy_with_generation_kl(
+        self,
+        initial_sample,
+        ego_query,
+        agents_query,
+        bev_feature,
+        bev_spatial_shape,
+        status_encoding,
+        global_img,
+    ):
+        """Run deployed refinement and constrain both means to frozen base."""
+        self.diffusion_scheduler.set_timesteps(
+            self._scheduler_num_inference_steps, initial_sample.device
+        )
+        sample = initial_sample
+        step_kls = []
+        final_reg = final_cls = None
+        sigmas = self.get_generation_trust_sigmas()
+        for step_index, timestep in enumerate(self._roll_timesteps):
+            current_reg, current_cls = _decode_policy_step(
+                self, self.diff_decoder, sample, timestep, ego_query,
+                agents_query, bev_feature, bev_spatial_shape, status_encoding,
+                global_img,
+            )
+            with torch.no_grad():
+                reference_reg, _ = _decode_policy_step(
+                    self, self.ref_policy, sample.detach(), timestep,
+                    ego_query.detach(), agents_query.detach(),
+                    bev_feature.detach(), bev_spatial_shape,
+                    status_encoding.detach(),
+                    global_img.detach() if global_img is not None else None,
+                )
+            if step_index == 0:
+                current_mean = self.diffusion_scheduler.step(
+                    model_output=self.norm_odo(current_reg[..., :2]),
+                    timestep=timestep, sample=sample,
+                ).prev_sample
+                with torch.no_grad():
+                    reference_mean = self.diffusion_scheduler.step(
+                        model_output=self.norm_odo(reference_reg[..., :2]),
+                        timestep=timestep, sample=sample.detach(),
+                    ).prev_sample.detach()
+                std = current_mean.new_tensor(sigmas["transition"])
+                sample = current_mean
+            else:
+                current_mean = self.norm_odo(current_reg)
+                reference_mean = self.norm_odo(reference_reg).detach()
+                std = current_mean.new_tensor(sigmas["final"])
+                final_reg = current_reg
+                final_cls = current_cls
+            step_kls.append(
+                diagonal_gaussian_kl_same_std(current_mean, reference_mean, std)
+            )
+        if final_reg is None or final_cls is None or len(step_kls) != 2:
+            raise RuntimeError(
+                "selector_group requires the registered [8, 0] schedule"
+            )
+        return final_reg, final_cls, torch.stack(step_kls, dim=-1)
+
     def forward_train_grpo(
         self, ego_query, agents_query, bev_feature, bev_spatial_shape,
         status_encoding, targets=None, global_img=None, tokens_list=None,
@@ -781,7 +1129,6 @@ class TrajectoryHead(nn.Module):
         if self.ref_policy is None or self.old_policy is None:
             raise RuntimeError("GRPO requires both reference and old policies")
 
-        self.maybe_sync_old_policy()
         self.diff_decoder.eval()
         self.ref_policy.eval()
         self.old_policy.eval()
@@ -800,7 +1147,7 @@ class TrajectoryHead(nn.Module):
         )
 
         generation_outputs = {}
-        if self._grpo_training_mode in {"generation", "joint"}:
+        if self._grpo_training_mode in {"generation", "generation_group", "joint"}:
             rollout_count = self._grpo_rollouts_per_mode
             if rollout_count == 1:
                 trace_initial_sample = initial_sample
@@ -849,12 +1196,45 @@ class TrajectoryHead(nn.Module):
             final_poses_cls = trace["current_cls"]
             final_old_poses_cls = trace["old_cls"]
             final_ref_poses_cls = trace["reference_cls"]
+            trust_metrics = {}
+            if "trust_pre_distance" in trace:
+                trust_metrics = summarize_trust_projection(
+                    trace["trust_pre_distance"],
+                    trace["trust_post_distance"],
+                    trace["trust_alpha"],
+                    trace["trust_projected"],
+                    trace["trust_reference_coverage"],
+                )
             generation_outputs = {
                 "generation_current_log_probs": trace["current_log_probs"],
                 "generation_old_log_probs": trace["old_log_probs"],
                 "generation_reference_log_probs": trace["reference_log_probs"],
                 "generation_kl": trace["generation_kl"],
+                **trust_metrics,
             }
+        elif self._grpo_training_mode == "selector_group":
+            final_poses_reg, final_poses_cls, selector_generation_kl = (
+                self._run_selector_policy_with_generation_kl(
+                    initial_sample, ego_query, agents_query, bev_feature,
+                    bev_spatial_shape, status_encoding, global_img,
+                )
+            )
+            generation_outputs = {
+                "selector_generation_kl": selector_generation_kl,
+            }
+            with torch.no_grad():
+                _, final_old_poses_cls = self._run_policy_rollout(
+                    self.old_policy, initial_sample.detach(), ego_query.detach(),
+                    agents_query.detach(), bev_feature.detach(), bev_spatial_shape,
+                    status_encoding.detach(),
+                    global_img.detach() if global_img is not None else None,
+                )
+                _, final_ref_poses_cls = self._run_policy_rollout(
+                    self.ref_policy, initial_sample.detach(), ego_query.detach(),
+                    agents_query.detach(), bev_feature.detach(), bev_spatial_shape,
+                    status_encoding.detach(),
+                    global_img.detach() if global_img is not None else None,
+                )
         else:
             final_poses_reg, final_poses_cls = self._run_policy_rollout(
                 self.diff_decoder, initial_sample, ego_query, agents_query, bev_feature,
@@ -904,6 +1284,8 @@ class TrajectoryHead(nn.Module):
 
         reference_selected_reward = None
         reference_reward_valid_mask = None
+        reference_anchor_rewards = None
+        reference_anchor_valid_mask = None
         if (
             self._grpo_scene_weight_mode == "reference_headroom"
             or self._generation_advantage_mode
@@ -926,6 +1308,21 @@ class TrajectoryHead(nn.Module):
                 )
             )
 
+        if self._generation_advantage_mode in {"anchor_hierarchical", "anchor_rloo"}:
+            (
+                reference_anchor_rewards,
+                reference_anchor_valid_mask,
+            ) = self._compute_reference_anchor_rewards(
+                initial_sample=initial_sample,
+                ego_query=ego_query,
+                agents_query=agents_query,
+                bev_feature=bev_feature,
+                bev_spatial_shape=bev_spatial_shape,
+                status_encoding=status_encoding,
+                global_img=global_img,
+                tokens_list=tokens_list,
+            )
+
         mode_idx = final_poses_cls.argmax(dim=-1)
         best_reg = final_poses_reg[torch.arange(bs, device=device), mode_idx]
         return {
@@ -939,6 +1336,8 @@ class TrajectoryHead(nn.Module):
             "reward_tiebreak_epsilon": reward_tiebreak_epsilon,
             "reference_selected_reward": reference_selected_reward,
             "reference_reward_valid_mask": reference_reward_valid_mask,
+            "reference_anchor_rewards": reference_anchor_rewards,
+            "reference_anchor_valid_mask": reference_anchor_valid_mask,
             "grpo_training_rollout": True,
             "num_modes": num_modes,
             "mode_idx": mode_idx,
@@ -1052,14 +1451,21 @@ class TrajectoryHead(nn.Module):
             "mode_idx": mode_idx,
         }
 
-    def _sample_evaluation_noise(self, template: torch.Tensor, tokens_list) -> torch.Tensor:
+    def _sample_evaluation_noise(
+        self, template: torch.Tensor, tokens_list, seed_namespace: int = None
+    ) -> torch.Tensor:
         """Generate order-independent noise from scenario tokens during evaluation."""
         if tokens_list is None or len(tokens_list) != template.shape[0]:
             return torch.randn_like(template)
 
         samples = []
         for token in tokens_list:
-            digest = hashlib.sha256(str(token).encode("utf-8")).digest()
+            identity = (
+                str(token)
+                if seed_namespace is None
+                else f"{seed_namespace}:{token}"
+            )
+            digest = hashlib.sha256(identity.encode("utf-8")).digest()
             seed = int.from_bytes(digest[:8], byteorder="little") % (2**63 - 1)
             generator = torch.Generator(device=template.device)
             generator.manual_seed(seed)
@@ -1082,15 +1488,41 @@ class TrajectoryHead(nn.Module):
         # 1. add truncated noise to the plan anchor
         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
         img = self.norm_odo(plan_anchor)
-        noise = self._sample_evaluation_noise(img, tokens_list)
+        if self._generation_trust_collect_calibration and tokens_list is None:
+            raise RuntimeError("Trust calibration collection requires scene tokens")
+        noise_namespace = (
+            self._generation_trust_calibration_seed
+            if self._generation_trust_collect_calibration
+            else None
+        )
+        noise = self._sample_evaluation_noise(img, tokens_list, noise_namespace)
         trunc_timesteps = torch.full(
             (bs,), self._truncation_timestep, device=device, dtype=torch.long
         )
         img = self.diffusion_scheduler.add_noise(original_samples=img, noise=noise, timesteps=trunc_timesteps)
         initial_sample = img.detach().clone()
+        trust_active = (
+            self._generation_trust_projection_mode == "reference_mean_ball"
+            or self._generation_trust_collect_calibration
+        )
+        trust_diagnostics = {}
+        paired_reference_cls = None
+        if trust_active:
+            (
+                poses_reg,
+                poses_cls,
+                paired_reference_cls,
+                trust_diagnostics,
+            ) = self._run_policy_rollout_with_reference(
+                initial_sample, ego_query, agents_query, bev_feature,
+                bev_spatial_shape, status_encoding, global_img,
+                apply_projection=(
+                    self._generation_trust_projection_mode == "reference_mean_ball"
+                ),
+            )
         noisy_trajs = self.denorm_odo(img)
         ego_fut_mode = img.shape[1]
-        for k in roll_timesteps[:]:
+        for k in (() if trust_active else roll_timesteps[:]):
             x_boxes = torch.clamp(img, min=-1, max=1)
             noisy_traj_points = self.denorm_odo(x_boxes)
 
@@ -1133,8 +1565,12 @@ class TrajectoryHead(nn.Module):
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
 
-        final_ref_poses_cls = final_poses_cls
-        if self.ref_policy is not None:
+        final_ref_poses_cls = (
+            paired_reference_cls
+            if trust_active
+            else final_poses_cls
+        )
+        if not trust_active and self.ref_policy is not None:
             with torch.no_grad():
                 _, final_ref_poses_cls = self._run_policy_rollout(
                     self.ref_policy, initial_sample, ego_query, agents_query,
@@ -1173,6 +1609,7 @@ class TrajectoryHead(nn.Module):
             "reward_component_scores": reward_component_scores,
             "num_modes": num_modes,
             "grpo_training_rollout": False,
+            **trust_diagnostics,
         }
         #print(f"[TEST] 返回 - rewards: {output_dict['rewards']}, 其他keys: {list(output_dict.keys())}")
         return output_dict

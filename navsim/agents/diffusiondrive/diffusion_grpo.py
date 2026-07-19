@@ -1,9 +1,222 @@
 """Probability helpers for reward-guided truncated diffusion."""
 
+import hashlib
+import json
 import math
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import torch
+
+
+TRUST_PROJECTION_FORMULA_VERSION = "reference_mean_ball_v1"
+TRUST_PROJECTION_POST_TOLERANCE = 1e-6
+
+
+def file_sha256(path: Path) -> str:
+    """Return the SHA256 of a file without loading it into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_generation_trust_calibration(path: str) -> Dict:
+    """Load and structurally validate an immutable Phase-5 calibration artifact."""
+    calibration_path = Path(path)
+    if not calibration_path.is_file():
+        raise FileNotFoundError(
+            f"Generation trust calibration does not exist: {calibration_path}"
+        )
+    if calibration_path.stat().st_mode & 0o222:
+        raise PermissionError(
+            "Generation trust calibration must be read-only (mode 0444)"
+        )
+    payload = json.loads(calibration_path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1:
+        raise ValueError("generation trust calibration schema_version must be 1")
+    if payload.get("formula_version") != TRUST_PROJECTION_FORMULA_VERSION:
+        raise ValueError(
+            "generation trust calibration formula_version mismatch: "
+            f"{payload.get('formula_version')!r}"
+        )
+    if payload.get("mode") != "reference_mean_ball":
+        raise ValueError("generation trust calibration mode must be reference_mean_ball")
+    if payload.get("seed") != 20260719:
+        raise ValueError("generation trust calibration seed must be 20260719")
+    if payload.get("percentile") != 0.99:
+        raise ValueError("generation trust calibration percentile must be 0.99")
+    steps = payload.get("steps")
+    if not isinstance(steps, dict) or set(steps) != {"transition", "final"}:
+        raise ValueError(
+            "generation trust calibration must contain transition and final steps"
+        )
+    for step_name, step in steps.items():
+        if not isinstance(step, dict):
+            raise ValueError(f"invalid {step_name} calibration entry")
+        radius = step.get("radius")
+        sigma = step.get("sigma")
+        if (
+            not isinstance(radius, (int, float))
+            or not math.isfinite(radius)
+            or radius < 0
+        ):
+            raise ValueError(f"invalid {step_name} trust radius")
+        if (
+            not isinstance(sigma, (int, float))
+            or not math.isfinite(sigma)
+            or sigma <= 0
+        ):
+            raise ValueError(f"invalid {step_name} calibration sigma")
+        if int(step.get("count", 0)) <= 0:
+            raise ValueError(f"invalid {step_name} calibration count")
+        quantiles = step.get("quantiles")
+        if not isinstance(quantiles, dict) or "p99" not in quantiles:
+            raise ValueError(f"missing {step_name} calibration quantiles")
+        if not math.isclose(float(radius), float(quantiles["p99"]), abs_tol=1e-12):
+            raise ValueError(f"{step_name} radius is not the registered P99")
+    return payload
+
+
+def validate_generation_trust_provenance(
+    calibration: Dict,
+    reference_checkpoint_path: str,
+    roll_timesteps: Tuple[int, ...],
+    scheduler_num_inference_steps: int,
+    transition_sigma: float,
+    final_sigma: float,
+) -> None:
+    """Fail closed when runtime reference/schedule differs from calibration."""
+    reference_path = Path(reference_checkpoint_path)
+    base = calibration.get("base_checkpoint", {})
+    expected_sha = base.get("sha256")
+    if not isinstance(expected_sha, str) or len(expected_sha) != 64:
+        raise ValueError("calibration is missing base checkpoint SHA256")
+    actual_sha = file_sha256(reference_path)
+    if actual_sha != expected_sha:
+        raise RuntimeError(
+            "Frozen base checkpoint SHA256 does not match trust calibration: "
+            f"expected={expected_sha}, actual={actual_sha}"
+        )
+    schedule = calibration.get("schedule", {})
+    if tuple(schedule.get("roll_timesteps", ())) != tuple(roll_timesteps):
+        raise RuntimeError("Trust calibration roll_timesteps mismatch")
+    if int(schedule.get("scheduler_num_inference_steps", -1)) != int(
+        scheduler_num_inference_steps
+    ):
+        raise RuntimeError("Trust calibration scheduler inference-step mismatch")
+    runtime_sigmas = {"transition": transition_sigma, "final": final_sigma}
+    for step_name, runtime_sigma in runtime_sigmas.items():
+        calibrated_sigma = float(calibration["steps"][step_name]["sigma"])
+        if not math.isclose(
+            float(runtime_sigma), calibrated_sigma, rel_tol=1e-6, abs_tol=1e-8
+        ):
+            raise RuntimeError(
+                f"Trust calibration {step_name} sigma mismatch: "
+                f"calibrated={calibrated_sigma}, runtime={runtime_sigma}"
+            )
+
+
+def normalized_rms_displacement(
+    mean: torch.Tensor,
+    reference_mean: torch.Tensor,
+    std: torch.Tensor,
+) -> torch.Tensor:
+    """Return one normalized RMS displacement for each [batch, anchor]."""
+    if mean.shape != reference_mean.shape:
+        raise ValueError(
+            "current and reference means must have identical shapes; "
+            f"got {tuple(mean.shape)} and {tuple(reference_mean.shape)}"
+        )
+    if mean.ndim < 3:
+        raise ValueError("denoising means must have shape [batch, anchor, ...]")
+    if not torch.isfinite(mean).all() or not torch.isfinite(reference_mean).all():
+        raise FloatingPointError("non-finite current/reference denoising mean")
+    std = torch.as_tensor(std, device=mean.device, dtype=mean.dtype).detach()
+    if std.numel() != 1 or not torch.isfinite(std).all() or torch.any(std <= 0):
+        raise ValueError("trust projection sigma must be one finite positive scalar")
+    reference_mean = reference_mean.detach()
+    normalized_delta = ((mean - reference_mean) / std).flatten(start_dim=2)
+    # This is exactly sqrt(mean(z^2)), but unlike an explicit sqrt at zero,
+    # vector_norm has a finite (zero) gradient when current == reference.
+    return torch.linalg.vector_norm(normalized_delta, dim=-1) / math.sqrt(
+        normalized_delta.shape[-1]
+    )
+
+
+def project_reference_mean_ball(
+    mean: torch.Tensor,
+    reference_mean: torch.Tensor,
+    std: torch.Tensor,
+    radius: float,
+    eps: float = 1e-8,
+    post_tolerance: float = TRUST_PROJECTION_POST_TOLERANCE,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Project each batch/anchor mean onto its frozen-reference RMS ball."""
+    if not isinstance(radius, (int, float)) or not math.isfinite(radius) or radius < 0:
+        raise ValueError("trust projection radius must be finite and non-negative")
+    reference_mean = reference_mean.detach()
+    pre_distance = normalized_rms_displacement(mean, reference_mean, std)
+    radius_tensor = pre_distance.new_tensor(float(radius)).detach()
+    alpha = torch.minimum(
+        torch.ones_like(pre_distance), radius_tensor / (pre_distance + eps)
+    )
+    alpha_view = alpha.view(*alpha.shape, *([1] * (mean.ndim - 2)))
+    projected = reference_mean + alpha_view * (mean - reference_mean)
+    post_distance = normalized_rms_displacement(projected, reference_mean, std)
+    if not torch.isfinite(projected).all() or not torch.isfinite(post_distance).all():
+        raise FloatingPointError("non-finite post-projection denoising mean")
+    excess = post_distance.detach() - radius_tensor
+    if torch.any(excess > post_tolerance):
+        raise RuntimeError(
+            "Hard trust projection post-check failed: "
+            f"max_distance={float(post_distance.detach().max())}, radius={radius}"
+        )
+    diagnostics = {
+        "pre_distance": pre_distance.detach(),
+        "post_distance": post_distance.detach(),
+        "alpha": alpha.detach(),
+        "projected": (pre_distance.detach() > radius_tensor),
+        "reference_coverage": torch.ones_like(pre_distance, dtype=torch.bool),
+    }
+    return projected, diagnostics
+
+
+def summarize_trust_projection(
+    pre_distance: torch.Tensor,
+    post_distance: torch.Tensor,
+    alpha: torch.Tensor,
+    projected: torch.Tensor,
+    reference_coverage: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Build detached per-step logging scalars from [batch, anchor, step] data."""
+    tensors = (post_distance, alpha, projected, reference_coverage)
+    if pre_distance.ndim != 3 or any(value.shape != pre_distance.shape for value in tensors):
+        raise ValueError("trust diagnostics must share shape [batch, anchor, step]")
+    result = {}
+    for step_index, step_name in enumerate(("transition", "final")):
+        pre = pre_distance[..., step_index].detach().float().reshape(-1)
+        post = post_distance[..., step_index].detach().float().reshape(-1)
+        step_alpha = alpha[..., step_index].detach().float().reshape(-1)
+        step_projected = projected[..., step_index].detach().float().reshape(-1)
+        coverage = reference_coverage[..., step_index].detach().float().reshape(-1)
+        for metric_name, value in (
+            ("pre_distance_mean", pre.mean()),
+            ("pre_distance_p90", torch.quantile(pre, 0.90)),
+            ("pre_distance_p99", torch.quantile(pre, 0.99)),
+            ("pre_distance_max", pre.max()),
+            ("post_distance_mean", post.mean()),
+            ("post_distance_p90", torch.quantile(post, 0.90)),
+            ("post_distance_p99", torch.quantile(post, 0.99)),
+            ("post_distance_max", post.max()),
+            ("projection_fraction", step_projected.mean()),
+            ("alpha_mean", step_alpha.mean()),
+            ("alpha_min", step_alpha.min()),
+            ("reference_coverage", coverage.mean()),
+        ):
+            result[f"generation_trust_{step_name}_{metric_name}"] = value.detach()
+    return result
 
 
 def flatten_generation_rollouts(
@@ -249,7 +462,7 @@ def _decode_policy_step(
     return regression[-1], classification[-1]
 
 
-def collect_generation_trace(
+def _collect_generation_trace_legacy(
     head,
     initial_sample,
     ego_query,
@@ -351,4 +564,193 @@ def collect_generation_trace(
         "current_cls": current_cls,
         "old_cls": old_final_cls,
         "reference_cls": reference_cls,
+    }
+
+def collect_generation_trace(
+    head,
+    initial_sample,
+    ego_query,
+    agents_query,
+    bev_feature,
+    bev_spatial_shape,
+    status_encoding,
+    global_img,
+):
+    """Collect behavior actions under the actual hard-projected policy."""
+    if head._generation_trust_projection_mode == "none":
+        return _collect_generation_trace_legacy(
+            head,
+            initial_sample,
+            ego_query,
+            agents_query,
+            bev_feature,
+            bev_spatial_shape,
+            status_encoding,
+            global_img,
+        )
+    if head._generation_trust_projection_mode != "reference_mean_ball":
+        raise RuntimeError("unsupported generation trust projection mode")
+    if head.ref_policy is None or head.old_policy is None:
+        raise RuntimeError("Hard trust projection requires frozen base and old policies")
+    if len(head._roll_timesteps) != 2 or head._roll_timesteps[-1] != 0:
+        raise ValueError("generation GRPO requires transition and final timesteps")
+
+    first_timestep, final_timestep = head._roll_timesteps
+    scheduler = head.diffusion_scheduler
+    scheduler.set_timesteps(head._scheduler_num_inference_steps, initial_sample.device)
+    transition_radius = head._generation_trust_radii["transition"]
+    final_radius = head._generation_trust_radii["final"]
+
+    with torch.no_grad():
+        reference_first_reg, _ = _decode_policy_step(
+            head, head.ref_policy, initial_sample, first_timestep, ego_query,
+            agents_query, bev_feature, bev_spatial_shape, status_encoding, global_img,
+        )
+        _, _, reference_transition_mean, transition_std = ddim_transition_with_log_prob(
+            scheduler,
+            head.norm_odo(reference_first_reg[..., :2]),
+            first_timestep,
+            initial_sample,
+            eta=head._generation_ddim_eta,
+            noise=torch.zeros_like(initial_sample),
+            sigma_min=head._generation_sigma_min,
+        )
+        old_first_reg, _ = _decode_policy_step(
+            head, head.old_policy, initial_sample, first_timestep, ego_query,
+            agents_query, bev_feature, bev_spatial_shape, status_encoding, global_img,
+        )
+        _, _, old_transition_mean, _ = ddim_transition_with_log_prob(
+            scheduler,
+            head.norm_odo(old_first_reg[..., :2]),
+            first_timestep,
+            initial_sample,
+            eta=head._generation_ddim_eta,
+            noise=torch.zeros_like(initial_sample),
+            sigma_min=head._generation_sigma_min,
+        )
+        projected_old_transition_mean, _ = project_reference_mean_ball(
+            old_transition_mean,
+            reference_transition_mean,
+            transition_std,
+            transition_radius,
+        )
+        transition_noise = torch.randn_like(projected_old_transition_mean)
+        transition_action = (
+            projected_old_transition_mean + transition_std * transition_noise
+        ).detach()
+        old_transition_log_prob = diagonal_gaussian_log_prob(
+            transition_action, projected_old_transition_mean, transition_std
+        )
+
+        reference_final_reg, reference_cls = _decode_policy_step(
+            head, head.ref_policy, transition_action, final_timestep, ego_query,
+            agents_query, bev_feature, bev_spatial_shape, status_encoding, global_img,
+        )
+        reference_final_mean = head.norm_odo(reference_final_reg).detach()
+        old_final_reg, old_final_cls = _decode_policy_step(
+            head, head.old_policy, transition_action, final_timestep, ego_query,
+            agents_query, bev_feature, bev_spatial_shape, status_encoding, global_img,
+        )
+        old_final_mean = head.norm_odo(old_final_reg)
+        final_std = old_final_mean.new_tensor(head._generation_final_std).detach()
+        projected_old_final_mean, _ = project_reference_mean_ball(
+            old_final_mean, reference_final_mean, final_std, final_radius
+        )
+        final_noise = torch.randn_like(projected_old_final_mean)
+        final_action = (
+            projected_old_final_mean + final_std * final_noise
+        ).detach()
+        old_final_log_prob = diagonal_gaussian_log_prob(
+            final_action, projected_old_final_mean, final_std
+        )
+        reference_log_probs = torch.stack(
+            (
+                diagonal_gaussian_log_prob(
+                    transition_action, reference_transition_mean, transition_std
+                ),
+                diagonal_gaussian_log_prob(
+                    final_action, reference_final_mean, final_std
+                ),
+            ),
+            dim=-1,
+        )
+
+    current_first_reg, _ = _decode_policy_step(
+        head, head.diff_decoder, initial_sample, first_timestep, ego_query,
+        agents_query, bev_feature, bev_spatial_shape, status_encoding, global_img,
+    )
+    _, _, current_transition_mean, _ = ddim_transition_with_log_prob(
+        scheduler,
+        head.norm_odo(current_first_reg[..., :2]),
+        first_timestep,
+        initial_sample,
+        eta=head._generation_ddim_eta,
+        noise=torch.zeros_like(initial_sample),
+        sigma_min=head._generation_sigma_min,
+    )
+    projected_current_transition_mean, transition_diagnostics = (
+        project_reference_mean_ball(
+            current_transition_mean,
+            reference_transition_mean,
+            transition_std,
+            transition_radius,
+        )
+    )
+    current_transition_log_prob = diagonal_gaussian_log_prob(
+        transition_action, projected_current_transition_mean, transition_std
+    )
+    current_final_reg, current_cls = _decode_policy_step(
+        head, head.diff_decoder, transition_action, final_timestep, ego_query,
+        agents_query, bev_feature, bev_spatial_shape, status_encoding, global_img,
+    )
+    current_final_mean = head.norm_odo(current_final_reg)
+    projected_current_final_mean, final_diagnostics = project_reference_mean_ball(
+        current_final_mean, reference_final_mean, final_std, final_radius
+    )
+    current_final_log_prob = diagonal_gaussian_log_prob(
+        final_action, projected_current_final_mean, final_std
+    )
+
+    current_log_probs = torch.stack(
+        (current_transition_log_prob, current_final_log_prob), dim=-1
+    )
+    old_log_probs = torch.stack(
+        (old_transition_log_prob, old_final_log_prob), dim=-1
+    )
+    generation_kl = torch.stack(
+        (
+            diagonal_gaussian_kl_same_std(
+                projected_current_transition_mean,
+                reference_transition_mean,
+                transition_std,
+            ),
+            diagonal_gaussian_kl_same_std(
+                projected_current_final_mean,
+                reference_final_mean,
+                final_std,
+            ),
+        ),
+        dim=-1,
+    )
+    diagnostics = {}
+    for key in (
+        "pre_distance",
+        "post_distance",
+        "alpha",
+        "projected",
+        "reference_coverage",
+    ):
+        diagnostics[f"trust_{key}"] = torch.stack(
+            (transition_diagnostics[key], final_diagnostics[key]), dim=-1
+        )
+    return {
+        "trajectories": head.denorm_odo(final_action),
+        "current_log_probs": current_log_probs,
+        "old_log_probs": old_log_probs.detach(),
+        "reference_log_probs": reference_log_probs.detach(),
+        "generation_kl": generation_kl,
+        "current_cls": current_cls,
+        "old_cls": old_final_cls.detach(),
+        "reference_cls": reference_cls.detach(),
+        **diagnostics,
     }

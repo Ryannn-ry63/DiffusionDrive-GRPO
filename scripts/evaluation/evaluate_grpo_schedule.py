@@ -39,11 +39,35 @@ COMPONENT_NAMES = (
     "direction",
 )
 SAFETY_COMPONENTS = ("collision", "drivable", "ttc")
+TRUST_METRICS = (
+    "pre_distance",
+    "post_distance",
+    "alpha",
+    "projected",
+    "reference_coverage",
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, default=BASE_CHECKPOINT)
+    parser.add_argument(
+        "--reference-checkpoint",
+        type=Path,
+        default=BASE_CHECKPOINT,
+        help="Frozen base checkpoint used by hard trust projection",
+    )
+    parser.add_argument(
+        "--generation-trust-projection-mode",
+        choices=("none", "reference_mean_ball"),
+        default="none",
+    )
+    parser.add_argument("--generation-trust-calibration-path", type=Path)
+    parser.add_argument(
+        "--collect-trust-calibration",
+        action="store_true",
+        help="Record raw candidate/base displacements without applying projection",
+    )
     parser.add_argument("--cache-path", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--metric-cache-path", type=Path, default=DEFAULT_METRIC_CACHE)
     parser.add_argument("--limit", type=int, default=1024)
@@ -90,6 +114,28 @@ def collate(batch):
 
 def to_device(values, device):
     return {key: value.to(device, non_blocking=True) for key, value in values.items()}
+
+
+def extract_trust_batch(predictions, batch_size, num_modes):
+    trust_batch = {}
+    expected_shape = (batch_size, num_modes, 2)
+    for metric in TRUST_METRICS:
+        key = f"generation_trust_{metric}"
+        if key not in predictions:
+            raise RuntimeError(f"Missing trust diagnostic: {key}")
+        value = predictions[key]
+        if tuple(value.shape) != expected_shape:
+            raise RuntimeError(
+                f"{key} has shape {tuple(value.shape)}, "
+                f"expected {expected_shape}"
+            )
+        if metric in {"pre_distance", "post_distance", "alpha"}:
+            if not torch.isfinite(value).all():
+                raise FloatingPointError(f"Non-finite trust diagnostic: {key}")
+        trust_batch[metric] = value.detach().cpu()
+    return trust_batch
+
+
 
 
 def pairwise_diversity(trajectories: torch.Tensor) -> torch.Tensor:
@@ -142,22 +188,45 @@ def main() -> None:
     args = parse_args()
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
+    trust_active = (
+        args.collect_trust_calibration
+        or args.generation_trust_projection_mode == "reference_mean_ball"
+    )
+    if trust_active and not args.reference_checkpoint.is_file():
+        raise FileNotFoundError(args.reference_checkpoint)
+    if args.collect_trust_calibration and args.generation_trust_projection_mode != "none":
+        raise ValueError("raw calibration collection requires projection mode=none")
+    if (
+        args.generation_trust_projection_mode == "reference_mean_ball"
+        and args.generation_trust_calibration_path is None
+    ):
+        raise ValueError("reference_mean_ball requires a calibration artifact")
+    if args.collect_trust_calibration and args.baseline_artifact is not None:
+        raise ValueError("calibration collection cannot read a reward baseline")
 
     config = replace(
         TransfuserConfig(),
-        metric_cache_path=str(args.metric_cache_path),
+        metric_cache_path=(
+            "" if args.collect_trust_calibration else str(args.metric_cache_path)
+        ),
         diffusion_truncation_timestep=args.truncation_timestep,
         diffusion_roll_timesteps=tuple(args.roll_timesteps),
         diffusion_scheduler_num_inference_steps=args.scheduler_num_inference_steps,
+        generation_trust_projection_mode=args.generation_trust_projection_mode,
+        generation_trust_calibration_path=str(
+            args.generation_trust_calibration_path or ""
+        ),
+        generation_trust_collect_calibration=args.collect_trust_calibration,
+        generation_trust_calibration_seed=20260719,
     )
     agent = TransfuserAgent(
         config=config,
         lr=0.0,
         checkpoint_path=str(args.checkpoint),
-        reference_checkpoint_path=str(args.checkpoint),
+        reference_checkpoint_path=str(args.reference_checkpoint),
     )
-    # No reference forward is needed for schedule diagnostics.
-    agent._transfuser_model._trajectory_head.ref_policy = None
+    if not trust_active:
+        agent._transfuser_model._trajectory_head.ref_policy = None
     agent.eval().to(args.device)
 
     split_path = (
@@ -172,8 +241,11 @@ def main() -> None:
         target_builders=agent.get_target_builders(),
         log_names=selected_logs,
     )
-    rewardable = set(MetricCacheLoader(args.metric_cache_path).tokens)
-    available = set(dataset.tokens).intersection(rewardable)
+    if args.collect_trust_calibration:
+        available = set(dataset.tokens)
+    else:
+        rewardable = set(MetricCacheLoader(args.metric_cache_path).tokens)
+        available = set(dataset.tokens).intersection(rewardable)
     if args.tokens_file is not None:
         requested_tokens = load_ordered_tokens(args.tokens_file)[: args.limit]
         missing_tokens = [token for token in requested_tokens if token not in available]
@@ -217,11 +289,39 @@ def main() -> None:
                 to_device(targets, args.device),
                 tokens,
             )
+            if args.collect_trust_calibration:
+                logits = predictions["final_poses_cls"]
+                trust_batch = extract_trust_batch(
+                    predictions,
+                    len(tokens),
+                    logits.shape[1],
+                )
+                for row, token in enumerate(tokens):
+                    records.append(
+                        {
+                            "token": token,
+                            "generation_trust": {
+                                metric: value[row].tolist()
+                                for metric, value in trust_batch.items()
+                            },
+                        }
+                    )
+                if (batch_idx + 1) % 32 == 0:
+                    print(
+                        f"collected={len(records)}/{len(dataset)}",
+                        flush=True,
+                    )
+                continue
             rewards = predictions["rewards"].float()
             valid = predictions["reward_valid_mask"].bool()
             logits = predictions["final_poses_cls"].float()
             trajectories = predictions["final_poses_reg"].float()
             components = predictions["reward_component_scores"].float()
+            trust_batch = {}
+            if trust_active:
+                trust_batch = extract_trust_batch(
+                    predictions, rewards.shape[0], rewards.shape[1]
+                )
             masked_logits = logits.masked_fill(~valid, torch.finfo(logits.dtype).min)
             selector_probs = torch.softmax(masked_logits, dim=-1) * valid.float()
 
@@ -304,12 +404,27 @@ def main() -> None:
                         "diversity": diversity_value,
                         "reward_logit_spearman": correlation,
                         "selected_components": component_record,
+                        **(
+                            {
+                                "generation_trust": {
+                                    metric: value[row].tolist()
+                                    for metric, value in trust_batch.items()
+                                }
+                            }
+                            if trust_active else {}
+                        ),
                     }
                 )
 
             if (batch_idx + 1) % 32 == 0:
                 print(f"evaluated={len(records)}/{len(dataset)}", flush=True)
 
+    if args.collect_trust_calibration:
+        selected_values = oracle_values = candidate_values = [0.0]
+        hit_values = entropy_values = diversity_values = rank_values = [0.0]
+        component_values = {
+            name: [0.0] for name in COMPONENT_NAMES
+        }
     summary = {
         "checkpoint": str(args.checkpoint),
         "num_tokens": len(records),
@@ -331,6 +446,76 @@ def main() -> None:
             "\n".join(record["token"] for record in records).encode("utf-8")
         ).hexdigest(),
     }
+    if args.collect_trust_calibration:
+        for key in (
+            "selected_reward",
+            "oracle_reward",
+            "selection_regret",
+            "candidate_reward",
+            "oracle_hit_rate",
+            "classification_entropy",
+            "trajectory_diversity",
+            "reward_logit_spearman",
+            "selected_component_means",
+        ):
+            summary.pop(key)
+    if trust_active:
+        trust_arrays = {
+            metric: np.asarray(
+                [
+                    record["generation_trust"][metric]
+                    for record in records
+                ]
+            )
+            for metric in (
+                "pre_distance",
+                "post_distance",
+                "alpha",
+                "projected",
+                "reference_coverage",
+            )
+        }
+        trust_steps = {}
+        radii = agent._transfuser_model._trajectory_head._generation_trust_radii
+        sigmas = (
+            agent._transfuser_model._trajectory_head.get_generation_trust_sigmas()
+        )
+        for step_index, step_name in enumerate(("transition", "final")):
+            pre = trust_arrays["pre_distance"][..., step_index].reshape(-1)
+            post = trust_arrays["post_distance"][..., step_index].reshape(-1)
+            alpha = trust_arrays["alpha"][..., step_index].reshape(-1)
+            projected = trust_arrays["projected"][..., step_index].reshape(-1)
+            coverage = trust_arrays["reference_coverage"][..., step_index].reshape(-1)
+            trust_steps[step_name] = {
+                "sigma": float(sigmas[step_name]),
+                "radius": (
+                    float(radii[step_name])
+                    if step_name in radii else None
+                ),
+                "pre_distance_mean": float(pre.mean()),
+                "pre_distance_p90": float(np.quantile(pre, 0.90)),
+                "pre_distance_p99": float(np.quantile(pre, 0.99)),
+                "pre_distance_max": float(pre.max()),
+                "post_distance_mean": float(post.mean()),
+                "post_distance_p90": float(np.quantile(post, 0.90)),
+                "post_distance_p99": float(np.quantile(post, 0.99)),
+                "post_distance_max": float(post.max()),
+                "projection_fraction": float(projected.mean()),
+                "alpha_mean": float(alpha.mean()),
+                "alpha_min": float(alpha.min()),
+                "reference_coverage": float(coverage.mean()),
+                "count": int(pre.size),
+            }
+        summary["generation_trust"] = {
+            "mode": args.generation_trust_projection_mode,
+            "collect_calibration": args.collect_trust_calibration,
+            "calibration_seed": (
+                20260719 if args.collect_trust_calibration else None
+            ),
+            "reference_checkpoint": str(args.reference_checkpoint),
+            "steps": trust_steps,
+        }
+
     if args.baseline_artifact is not None:
         baseline_payload = json.loads(
             args.baseline_artifact.read_text(encoding="utf-8")

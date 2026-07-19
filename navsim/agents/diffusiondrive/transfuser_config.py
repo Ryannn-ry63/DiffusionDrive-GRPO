@@ -103,6 +103,7 @@ class TransfuserConfig:
     grpo_checkpoint_save_top_k: int = 2
     grpo_checkpoint_every_n_train_steps: int = 0
     grpo_training_mode: str = "classification_shared"
+    grpo_decoder_gradient_scope: str = "last_layer"
     selection_temperature: float = 1.0
     selection_entropy_weight: float = 0.0
     selection_exploration_floor: float = 0.0
@@ -119,15 +120,23 @@ class TransfuserConfig:
     # selector distribution without adding a selection policy gradient.
     selector_consistency_kl_weight: float = 0.0
     grpo_reward_mode: str = "pdms"
+    # Selector GRPO updates the shared/regression decoder too, so constrain
+    # both denoising means to the independent frozen base decoder.
+    selector_generation_kl_weight: float = 0.0
+
     pdm_tiebreak_max_epsilon: float = 1e-3
     pdm_dense_weight: float = 0.1
     generation_policy_loss_weight: float = 1.0
     generation_kl_loss_weight: float = 0.1
-    # group_zscore/reference_centered use K=1; within_anchor/hierarchical use K=2.
+    # group_zscore/reference_centered use K=1; within_anchor/hierarchical use
+    # K=2; anchor_hierarchical supports K=2 or K=4; anchor_rloo requires K=2.
     generation_advantage_mode: str = "group_zscore"
     reference_advantage_margin: float = 0.01
     reference_advantage_scale: float = 0.10
     reference_advantage_clip: float = 2.0
+    rloo_advantage_margin: float = 0.01
+    rloo_advantage_scale: float = 0.20
+    rloo_advantage_clip: float = 1.0
     grpo_rollouts_per_mode: int = 1
     grpo_priority_manifest_path: str = ""
     grpo_priority_sample_fraction: float = 0.0
@@ -136,6 +145,10 @@ class TransfuserConfig:
     generation_ddim_eta: float = 1.0
     generation_final_std: float = 0.05
     generation_sigma_min: float = 1e-4
+    generation_trust_projection_mode: str = "none"
+    generation_trust_calibration_path: str = ""
+    generation_trust_collect_calibration: bool = False
+    generation_trust_calibration_seed: int = 20260719
     # Stage-0 audited schedule: the noise timestep matches the first DDIM step.
     diffusion_truncation_timestep: int = 8
     diffusion_roll_timesteps: Tuple[int, ...] = (8, 0)

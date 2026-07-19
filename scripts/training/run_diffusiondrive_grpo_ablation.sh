@@ -22,6 +22,16 @@ UPDATES="${13:-128}"
 ROLLOUTS_PER_MODE="${14:-1}"
 PYTHON_BIN="${PYTHON_BIN:-/root/miniconda3/envs/navsim/bin/python}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+GENERATION_TRUST_PROJECTION_MODE="${GENERATION_TRUST_PROJECTION_MODE:-none}"
+GENERATION_TRUST_CALIBRATION_PATH="${GENERATION_TRUST_CALIBRATION_PATH:-}"
+if [[ "$GENERATION_TRUST_PROJECTION_MODE" != "none" && "$GENERATION_TRUST_PROJECTION_MODE" != "reference_mean_ball" ]]; then
+  echo "GENERATION_TRUST_PROJECTION_MODE must be none or reference_mean_ball"
+  exit 2
+fi
+if [[ "$GENERATION_TRUST_PROJECTION_MODE" == "reference_mean_ball" && ! -f "$GENERATION_TRUST_CALIBRATION_PATH" ]]; then
+  echo "Immutable generation trust calibration does not exist: $GENERATION_TRUST_CALIBRATION_PATH"
+  exit 2
+fi
 
 case "$VARIANT" in
   D)
@@ -46,8 +56,8 @@ case "$VARIANT" in
     ;;
 esac
 
-if [[ "$ADVANTAGE_MODE" != "group_zscore" && "$ADVANTAGE_MODE" != "reference_centered" && "$ADVANTAGE_MODE" != "within_anchor" && "$ADVANTAGE_MODE" != "hierarchical" ]]; then
-  echo "ADVANTAGE_MODE must be group_zscore, reference_centered, within_anchor, or hierarchical"
+if [[ "$ADVANTAGE_MODE" != "group_zscore" && "$ADVANTAGE_MODE" != "reference_centered" && "$ADVANTAGE_MODE" != "within_anchor" && "$ADVANTAGE_MODE" != "hierarchical" && "$ADVANTAGE_MODE" != "anchor_hierarchical" && "$ADVANTAGE_MODE" != "anchor_rloo" ]]; then
+  echo "ADVANTAGE_MODE must be group_zscore, reference_centered, within_anchor, hierarchical, anchor_hierarchical, or anchor_rloo"
   exit 2
 fi
 if [[ ( "$ADVANTAGE_MODE" == "within_anchor" || "$ADVANTAGE_MODE" == "hierarchical" ) && "$ROLLOUTS_PER_MODE" != "2" ]]; then
@@ -57,6 +67,47 @@ fi
 if [[ ( "$ADVANTAGE_MODE" == "group_zscore" || "$ADVANTAGE_MODE" == "reference_centered" ) && "$ROLLOUTS_PER_MODE" != "1" ]]; then
   echo "group_zscore/reference_centered require ROLLOUTS_PER_MODE=1"
   exit 2
+fi
+if [[ "$ADVANTAGE_MODE" == "anchor_hierarchical" && "$ROLLOUTS_PER_MODE" != "2" && "$ROLLOUTS_PER_MODE" != "4" ]]; then
+  echo "anchor_hierarchical requires ROLLOUTS_PER_MODE=2 or 4"
+  exit 2
+fi
+if [[ "$ADVANTAGE_MODE" == "anchor_rloo" && "$ROLLOUTS_PER_MODE" != "2" ]]; then
+  echo "anchor_rloo requires ROLLOUTS_PER_MODE=2"
+  exit 2
+fi
+if [[ "$ADVANTAGE_MODE" == "anchor_rloo" && "$VARIANT" != "D" ]]; then
+  echo "anchor_rloo is preregistered for raw PDMS (variant D) only"
+  exit 2
+fi
+if [[ "$ADVANTAGE_MODE" == "anchor_rloo" && "$BATCH_SIZE" != "2" ]]; then
+  echo "anchor_rloo is preregistered with BATCH_SIZE=2"
+  exit 2
+fi
+if [[ "$ADVANTAGE_MODE" == "anchor_rloo" && "$MODE_WEIGHTING" != "uniform" ]]; then
+  echo "anchor_rloo is preregistered with uniform mode weighting"
+  exit 2
+fi
+if [[ "$ADVANTAGE_MODE" == "anchor_rloo" && "$PRIORITY_MANIFEST" != "none" ]]; then
+  echo "anchor_rloo is preregistered with uniform sampling"
+  exit 2
+fi
+if [[ "$ADVANTAGE_MODE" == "anchor_rloo" && "$GENERATION_KL" != "0.1" ]]; then
+  echo "anchor_rloo is preregistered with GENERATION_KL=0.1"
+  exit 2
+fi
+
+ACCUMULATE_GRAD_BATCHES=1
+FORWARD_BATCHES="$UPDATES"
+OLD_POLICY_SYNC_STEPS=32
+if [[ "$ROLLOUTS_PER_MODE" == "4" ]]; then
+  if [[ "$BATCH_SIZE" != "1" ]]; then
+    echo "K4 is preregistered with BATCH_SIZE=1 and gradient accumulation=2"
+    exit 2
+  fi
+  ACCUMULATE_GRAD_BATCHES=2
+  FORWARD_BATCHES=$((UPDATES * ACCUMULATE_GRAD_BATCHES))
+  OLD_POLICY_SYNC_STEPS=64
 fi
 
 PRIORITY_FRACTION=0.0
@@ -85,8 +136,10 @@ TRAIN_ARGS=(
   dataloader.params.batch_size="$BATCH_SIZE"
   dataloader.params.num_workers=4
   trainer.params.max_epochs="$EPOCHS"
-  trainer.params.limit_train_batches="$UPDATES"
-  trainer.params.limit_val_batches="$UPDATES"
+  +trainer.params.max_steps="$UPDATES"
+  trainer.params.limit_train_batches="$FORWARD_BATCHES"
+  trainer.params.limit_val_batches="$FORWARD_BATCHES"
+  trainer.params.accumulate_grad_batches="$ACCUMULATE_GRAD_BATCHES"
   trainer.params.accelerator=gpu
   trainer.params.strategy=auto
   trainer.params.precision=32-true
@@ -97,6 +150,7 @@ TRAIN_ARGS=(
   agent.config.grpo_training_mode=generation
   agent.config.grpo_checkpoint_save_top_k=-1
   agent.config.grpo_checkpoint_every_n_train_steps=64
+  agent.config.grpo_old_policy_sync_steps="$OLD_POLICY_SYNC_STEPS"
   agent.config.selector_consistency_kl_weight="$SELECTOR_KL"
   agent.config.grpo_reward_mode="$REWARD_MODE"
   agent.config.pdm_tiebreak_max_epsilon="$PDM_EPSILON"
@@ -104,12 +158,17 @@ TRAIN_ARGS=(
   agent.config.generation_policy_loss_weight=1.0
   agent.config.generation_kl_loss_weight="$GENERATION_KL"
   agent.config.generation_advantage_mode="$ADVANTAGE_MODE"
+  agent.config.rloo_advantage_margin=0.01
+  agent.config.rloo_advantage_scale=0.20
+  agent.config.rloo_advantage_clip=1.0
   agent.config.grpo_rollouts_per_mode="$ROLLOUTS_PER_MODE"
   agent.config.grpo_priority_manifest_path="$PRIORITY_CONFIG_PATH"
   agent.config.grpo_priority_sample_fraction="$PRIORITY_FRACTION"
   agent.config.generation_mode_weighting="$MODE_WEIGHTING"
   agent.config.generation_ddim_eta=1.0
   agent.config.generation_final_std=0.05
+  agent.config.generation_trust_projection_mode="$GENERATION_TRUST_PROJECTION_MODE"
+  agent.config.generation_trust_calibration_path="$GENERATION_TRUST_CALIBRATION_PATH"
   agent.config.selection_entropy_weight=0.0
   agent.config.kl_loss_weight=0.0
   agent.config.diffusion_truncation_timestep=8
