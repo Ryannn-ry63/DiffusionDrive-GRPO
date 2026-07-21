@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import copy
 import hashlib
+import json
 import lzma
 import math
 import pickle
@@ -27,6 +28,8 @@ from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
 from navsim.agents.diffusiondrive.diffusion_grpo import (
     diagonal_gaussian_kl_same_std,
     _decode_policy_step,
+    collect_full_chain_diffgrpo_trace,
+    collect_selected_anchor_diffgrpo_trace,
     collect_generation_trace,
     compute_pdm_dense_rewards,
     compute_pdm_tiebreak_rewards,
@@ -40,6 +43,15 @@ from navsim.agents.diffusiondrive.diffusion_grpo import (
     validate_inference_selector_source,
     validate_generation_trust_provenance,
 )
+from navsim.agents.diffusiondrive.trajectory_value_selector import (
+    TrajectoryValueSelector,
+    deterministic_bootstrap_mask,
+    select_conservative_top2,
+)
+from navsim.agents.diffusiondrive.paired_advantage_risk import (
+    PairedAdvantageRiskHead,
+    select_same_mode_with_base_fallback,
+)
 
 from navsim.common.dataclasses import Trajectory
 from navsim.common.dataloader import MetricCacheLoader
@@ -51,6 +63,48 @@ from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import (
     WeightedMetricIndex,
 )
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
+
+
+STAGE19_BASE_SHA256 = (
+    "59a8de460cfd8b1266c5cdd393372273da5c2465fa6707da551c4ecb1fbd019d"
+)
+STAGE19_FULL_SCHEDULE = {
+    "truncation_timestep": 32,
+    "roll_timesteps": [32, 24, 16, 8, 0],
+    "scheduler_num_inference_steps": 125,
+    "scheduler_step_stride": 8,
+    "transitions": [[32, 24], [24, 16], [16, 8], [8, 0], [0, -8]],
+}
+
+
+def load_selected_anchor_modes(path: str, expected_group_size: int) -> Dict[str, int]:
+    """Load a fail-closed Stage19 token-to-base-mode manifest."""
+    manifest_path = Path(path)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Stage19 selected-mode manifest missing: {path}")
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    summary = payload.get("summary", {})
+    if summary.get("base_checkpoint_sha256") != STAGE19_BASE_SHA256:
+        raise RuntimeError("Stage19 manifest base checkpoint SHA mismatch")
+    if summary.get("schedule") != STAGE19_FULL_SCHEDULE:
+        raise RuntimeError("Stage19 manifest schedule mismatch")
+    if summary.get("group_definition") != "same_token_same_selected_anchor":
+        raise RuntimeError("Stage19 manifest group definition mismatch")
+    if int(summary.get("group_size", -1)) != int(expected_group_size):
+        raise RuntimeError("Stage19 manifest group size mismatch")
+    records = payload.get("records")
+    if not isinstance(records, list) or not records:
+        raise RuntimeError("Stage19 manifest has no records")
+    result = {}
+    for record in records:
+        token = str(record["token"])
+        mode = int(record["selected_mode"])
+        if token in result or mode < 0 or mode >= 20:
+            raise RuntimeError(f"invalid Stage19 selected-mode record: {token}")
+        result[token] = mode
+    return result
+
+
 class V2TransfuserModel(nn.Module):
     """Torch module for Transfuser."""
 
@@ -448,6 +502,7 @@ class TrajectoryHead(nn.Module):
         """
         super(TrajectoryHead, self).__init__()
 
+        self._config = config
         self._num_poses = num_poses
         self._d_model = d_model
         self._d_ffn = d_ffn
@@ -492,6 +547,20 @@ class TrajectoryHead(nn.Module):
                 getattr(config, "grpo_decoder_gradient_scope", "last_layer")
             ),
         )
+        self.value_selector = TrajectoryValueSelector(
+            config, num_heads=int(getattr(config, "value_selector_num_heads", 3))
+        )
+        self.register_buffer(
+            "_value_selector_training_updates", torch.tensor(0, dtype=torch.long)
+        )
+        # Optional adapters must not perturb legacy decoder/training RNG streams.
+        with torch.random.fork_rng(devices=[]):
+            self.paired_risk_head = PairedAdvantageRiskHead(config)
+        self.register_buffer(
+            "_paired_risk_training_updates", torch.tensor(0, dtype=torch.long)
+        )
+        if int(getattr(config, "value_selector_top_k", 2)) != 2:
+            raise ValueError("Stage-15 value selector requires top_k=2")
         self.ref_policy = None
         self.old_policy = None
         self._old_policy_sync_steps = int(getattr(config, "grpo_old_policy_sync_steps", 32))
@@ -523,6 +592,23 @@ class TrajectoryHead(nn.Module):
         self._generation_ddim_eta = float(getattr(config, "generation_ddim_eta", 1.0))
         self._generation_final_std = float(getattr(config, "generation_final_std", 0.05))
         self._generation_sigma_min = float(getattr(config, "generation_sigma_min", 1e-4))
+        self._generation_policy_algorithm = str(
+            getattr(config, "generation_policy_algorithm", "legacy_ppo")
+        )
+        if self._generation_policy_algorithm not in {
+            "legacy_ppo", "diffgrpo_full_chain", "diffgrpo_selected_anchor"
+        }:
+            raise ValueError(
+                "generation_policy_algorithm must be legacy_ppo, "
+                "diffgrpo_full_chain, or diffgrpo_selected_anchor"
+            )
+        self._diffgrpo_bc_weight = float(getattr(config, "diffgrpo_bc_weight", 0.1))
+        self._diffgrpo_step_discount = float(
+            getattr(config, "diffgrpo_step_discount", 0.6)
+        )
+        self._diffgrpo_logprob_reduction = str(
+            getattr(config, "diffgrpo_logprob_reduction", "mean")
+        )
         self._generation_trust_projection_mode = str(
             getattr(config, "generation_trust_projection_mode", "none")
         )
@@ -540,6 +626,11 @@ class TrajectoryHead(nn.Module):
         self._generation_trust_calibration_seed = int(
             getattr(config, "generation_trust_calibration_seed", 20260719)
         )
+        self._evaluation_noise_namespace = int(
+            getattr(config, "evaluation_noise_namespace", -1)
+        )
+        if self._evaluation_noise_namespace < -1:
+            raise ValueError("evaluation_noise_namespace must be -1 or non-negative")
         if (
             self._generation_trust_collect_calibration
             and self._generation_trust_projection_mode != "none"
@@ -574,12 +665,13 @@ class TrajectoryHead(nn.Module):
             "hierarchical",
             "anchor_hierarchical",
             "anchor_rloo",
+            "collision_truncated_intra_anchor",
         }:
             raise ValueError(
                 "generation_advantage_mode must be one of "
                 "{'group_zscore', 'reference_centered', "
                 "'within_anchor', 'hierarchical', 'anchor_hierarchical', "
-                "'anchor_rloo'}; "
+                "'anchor_rloo', 'collision_truncated_intra_anchor'}; "
                 f"got {self._generation_advantage_mode!r}"
             )
         self._grpo_rollouts_per_mode = int(
@@ -592,10 +684,12 @@ class TrajectoryHead(nn.Module):
         legacy_hierarchical_mode = self._generation_advantage_mode in {
             "within_anchor",
             "hierarchical",
+            "collision_truncated_intra_anchor",
         }
         if legacy_hierarchical_mode and self._grpo_rollouts_per_mode != 2:
             raise ValueError(
-                "within_anchor/hierarchical require grpo_rollouts_per_mode=2; "
+                f"{self._generation_advantage_mode} requires "
+                "grpo_rollouts_per_mode=2; "
                 f"got {self._grpo_rollouts_per_mode}"
             )
         if (
@@ -621,6 +715,17 @@ class TrajectoryHead(nn.Module):
                 "group_zscore/reference_centered require "
                 "grpo_rollouts_per_mode=1"
             )
+        self._diffgrpo_group_size = int(
+            getattr(config, "diffgrpo_group_size", 8)
+        )
+        self._selected_anchor_modes = {}
+        selected_mode_manifest = str(
+            getattr(config, "diffgrpo_selected_mode_manifest_path", "")
+        )
+        if self._grpo_training_mode == "diffgrpo_selected_anchor":
+            self._selected_anchor_modes = load_selected_anchor_modes(
+                selected_mode_manifest, self._diffgrpo_group_size
+            )
         self._grpo_reward_mode = str(getattr(config, "grpo_reward_mode", "pdms"))
         if self._grpo_reward_mode not in {"pdms", "pdm_tiebreak", "pdm_dense"}:
             raise ValueError(
@@ -639,6 +744,56 @@ class TrajectoryHead(nn.Module):
         if self._pdm_dense_weight < 0:
             raise ValueError("pdm_dense_weight must be non-negative")
         self._validate_roll_schedule()
+        if self._grpo_training_mode == "diffgrpo_full_chain":
+            if self._generation_policy_algorithm != "diffgrpo_full_chain":
+                raise ValueError(
+                    "diffgrpo_full_chain mode requires matching generation algorithm"
+                )
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError(
+                    "Stage-16 full-chain schedule must be [32,24,16,8,0]"
+                )
+            if self._truncation_timestep != 32:
+                raise ValueError("Stage-16 truncation timestep must be 32")
+            if self._scheduler_num_inference_steps != 125:
+                raise ValueError("Stage-16 scheduler inference steps must be 125")
+            if self._generation_advantage_mode != "group_zscore":
+                raise ValueError("Stage-16 requires group_zscore advantages")
+            if self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage-16 requires one rollout per anchor mode")
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage-16 does not permit trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage-16 requires mean log-probability reduction")
+            if abs(self._diffgrpo_bc_weight - 0.1) > 1e-12:
+                raise ValueError("Stage-16 BC weight must be 0.1")
+            if abs(self._diffgrpo_step_discount - 0.6) > 1e-12:
+                raise ValueError("Stage-16 step discount must be 0.6")
+        if self._grpo_training_mode == "diffgrpo_selected_anchor":
+            if self._generation_policy_algorithm != "diffgrpo_selected_anchor":
+                raise ValueError(
+                    "selected-anchor mode requires matching generation algorithm"
+                )
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError("Stage19 schedule must be [32,24,16,8,0]")
+            if self._truncation_timestep != 32:
+                raise ValueError("Stage19 truncation timestep must be 32")
+            if self._scheduler_num_inference_steps != 125:
+                raise ValueError("Stage19 scheduler inference steps must be 125")
+            if self._generation_advantage_mode != "group_zscore":
+                raise ValueError("Stage19 requires group_zscore advantages")
+            if self._diffgrpo_group_size != 8:
+                raise ValueError("Stage19 requires selected-anchor group size 8")
+            if self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage19 does not use legacy per-mode rollouts")
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage19 does not permit trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage19 requires mean log-probability reduction")
+            if abs(self._diffgrpo_bc_weight - 0.1) > 1e-12:
+                raise ValueError("Stage19 BC weight must be 0.1")
+            if abs(self._diffgrpo_step_discount - 0.6) > 1e-12:
+                raise ValueError("Stage19 step discount must be 0.6")
 
         self.loss_computer = LossComputer(config)
 
@@ -811,6 +966,24 @@ class TrajectoryHead(nn.Module):
         odo_info_fut_y = (odo_info_fut_y + 1)/2 * 46 - 20
         odo_info_fut_head = (odo_info_fut_head + 1)/2 * 3.9 - 2
         return torch.cat([odo_info_fut_x, odo_info_fut_y, odo_info_fut_head], dim=-1)
+
+    def _lookup_selected_anchor_modes(self, tokens_list, device):
+        if tokens_list is None:
+            raise RuntimeError("Stage19 training requires scene tokens")
+        missing = [
+            str(token)
+            for token in tokens_list
+            if str(token) not in self._selected_anchor_modes
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Stage19 manifest has no selected mode for token {missing[0]}"
+            )
+        return torch.tensor(
+            [self._selected_anchor_modes[str(token)] for token in tokens_list],
+            dtype=torch.long,
+            device=device,
+        )
     
     def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,tokens_list=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
@@ -1151,8 +1324,205 @@ class TrajectoryHead(nn.Module):
             timesteps=trunc_timesteps,
         )
 
+        if self._grpo_training_mode == "paired_tail_risk_selector":
+            with torch.no_grad():
+                current_reg, current_cls = self._run_policy_rollout(
+                    self.diff_decoder, initial_sample, ego_query, agents_query,
+                    bev_feature, bev_spatial_shape, status_encoding, global_img,
+                )
+                base_reg, reference_cls = self._run_policy_rollout(
+                    self.ref_policy, initial_sample.detach(), ego_query.detach(),
+                    agents_query.detach(), bev_feature.detach(), bev_spatial_shape,
+                    status_encoding.detach(),
+                    global_img.detach() if global_img is not None else None,
+                )
+            pair_outputs = self.paired_risk_head(
+                current_reg.detach(), base_reg.detach(), bev_feature.detach(),
+                bev_spatial_shape, agents_query.detach(), ego_query.detach(),
+                status_encoding.detach(),
+            )
+            paired_trajectories = torch.cat(
+                (current_reg.detach(), base_reg.detach()), dim=1
+            )
+            reward_result = None
+            if tokens_list is not None:
+                if self._lazy_metric_cache is not None:
+                    reward_result = self._compute_rewards_from_lazy_cache(
+                        paired_trajectories, tokens_list,
+                        paired_trajectories.shape[1],
+                    )
+                elif self.metric_cache_loader is not None:
+                    reward_result = self._compute_rewards_from_disk(
+                        paired_trajectories, tokens_list,
+                        paired_trajectories.shape[1],
+                    )
+            if reward_result is None:
+                raise RuntimeError(
+                    "paired-risk training requires PDM rewards and scene tokens"
+                )
+            modes = current_reg.shape[1]
+            self._paired_risk_training_updates.add_(1)
+            mode_idx = reference_cls.argmax(dim=-1)
+            best_reg = current_reg[torch.arange(bs, device=device), mode_idx]
+            return {
+                "trajectory": best_reg,
+                "final_poses_reg": current_reg,
+                "final_poses_cls": current_cls,
+                "final_old_poses_cls": current_cls.detach(),
+                "final_ref_poses_cls": reference_cls.detach(),
+                "rewards": reward_result["training_rewards"][:, :modes],
+                "raw_rewards": reward_result["raw_rewards"][:, :modes],
+                "reward_valid_mask": reward_result["valid_mask"][:, :modes],
+                "component_scores": reward_result["component_scores"][:, :modes],
+                "paired_risk_event_logits": pair_outputs["event_logits"],
+                "paired_risk_delta_prediction": pair_outputs["delta_prediction"],
+                "paired_current_rewards": reward_result["raw_rewards"][:, :modes],
+                "paired_base_rewards": reward_result["raw_rewards"][:, modes:],
+                "paired_current_components": reward_result["component_scores"][:, :modes],
+                "paired_base_components": reward_result["component_scores"][:, modes:],
+                "paired_current_valid": reward_result["valid_mask"][:, :modes],
+                "paired_base_valid": reward_result["valid_mask"][:, modes:],
+                "paired_reference_logits": reference_cls.detach(),
+                "grpo_training_rollout": True,
+                "num_modes": modes,
+                "mode_idx": mode_idx,
+            }
+
+        if self._grpo_training_mode == "value_selector":
+            with torch.no_grad():
+                current_reg, _ = self._run_policy_rollout(
+                    self.diff_decoder, initial_sample, ego_query, agents_query,
+                    bev_feature, bev_spatial_shape, status_encoding, global_img,
+                )
+                reference_reg, reference_cls = self._run_policy_rollout(
+                    self.ref_policy, initial_sample.detach(), ego_query.detach(),
+                    agents_query.detach(), bev_feature.detach(), bev_spatial_shape,
+                    status_encoding.detach(),
+                    global_img.detach() if global_img is not None else None,
+                )
+                value_trajectories = torch.cat(
+                    [current_reg.detach(), reference_reg.detach()], dim=1
+                )
+                value_reference_logits = torch.cat(
+                    [reference_cls.detach(), reference_cls.detach()], dim=1
+                )
+            value_outputs = self.value_selector(
+                value_trajectories,
+                bev_feature.detach(),
+                bev_spatial_shape,
+                agents_query.detach(),
+                ego_query.detach(),
+                status_encoding.detach(),
+            )
+            reward_result = None
+            if tokens_list is not None:
+                if self._lazy_metric_cache is not None:
+                    reward_result = self._compute_rewards_from_lazy_cache(
+                        value_trajectories, tokens_list, value_trajectories.shape[1]
+                    )
+                elif self.metric_cache_loader is not None:
+                    reward_result = self._compute_rewards_from_disk(
+                        value_trajectories, tokens_list, value_trajectories.shape[1]
+                    )
+            if reward_result is None:
+                raise RuntimeError(
+                    "value-selector training requires PDM rewards and scene tokens"
+                )
+            bootstrap = deterministic_bootstrap_mask(
+                tokens_list,
+                self.value_selector.num_heads,
+                value_trajectories.device,
+                float(getattr(self._config, "value_selector_bootstrap_fraction", 0.8)),
+            )
+            self._value_selector_training_updates.add_(1)
+            fallback_mode = reference_cls.argmax(dim=-1)
+            best_reg = current_reg[
+                torch.arange(bs, device=device), fallback_mode
+            ]
+            return {
+                "trajectory": best_reg,
+                "final_poses_reg": value_trajectories,
+                "final_poses_cls": value_reference_logits,
+                "final_old_poses_cls": value_reference_logits,
+                "final_ref_poses_cls": value_reference_logits,
+                "rewards": reward_result["training_rewards"],
+                "raw_rewards": reward_result["raw_rewards"],
+                "reward_valid_mask": reward_result["valid_mask"],
+                "component_scores": reward_result["component_scores"],
+                "value_component_predictions": value_outputs[
+                    "component_predictions"
+                ],
+                "value_score_predictions": value_outputs["score_predictions"],
+                "value_bootstrap_mask": bootstrap,
+                "value_reference_logits": value_reference_logits,
+                "value_group_size": current_reg.shape[1],
+                "grpo_training_rollout": True,
+                "num_modes": value_trajectories.shape[1],
+                "mode_idx": fallback_mode,
+            }
+
         generation_outputs = {}
-        if self._grpo_training_mode in {
+        if self._grpo_training_mode == "diffgrpo_full_chain":
+            trace = collect_full_chain_diffgrpo_trace(
+                self,
+                initial_sample,
+                ego_query,
+                agents_query,
+                bev_feature,
+                bev_spatial_shape,
+                status_encoding,
+                global_img,
+            )
+            final_poses_reg = trace["trajectories"]
+            final_poses_cls = trace["current_cls"]
+            final_old_poses_cls = trace["current_cls"].detach()
+            final_ref_poses_cls = trace["reference_cls"].detach()
+            generation_outputs = {
+                "diffgrpo_current_log_probs": trace["current_log_probs"],
+                "diffgrpo_bc_log_probs": trace["bc_log_probs"],
+                "diffgrpo_num_denoising_steps": trace["num_denoising_steps"],
+            }
+        elif self._grpo_training_mode == "diffgrpo_selected_anchor":
+            selected_modes = self._lookup_selected_anchor_modes(
+                tokens_list, device
+            )
+            clean_anchors = self.plan_anchor.unsqueeze(0).expand(
+                bs, -1, -1, -1
+            )
+            gather_index = selected_modes[:, None, None, None].expand(
+                -1, 1, clean_anchors.shape[2], clean_anchors.shape[3]
+            )
+            selected_clean_sample = self.norm_odo(
+                clean_anchors.gather(1, gather_index)
+            )
+            trace = collect_selected_anchor_diffgrpo_trace(
+                self,
+                selected_clean_sample,
+                selected_modes,
+                self._diffgrpo_group_size,
+                ego_query,
+                agents_query,
+                bev_feature,
+                bev_spatial_shape,
+                status_encoding,
+                global_img,
+            )
+            final_poses_reg = trace["trajectories"]
+            final_poses_cls = trace["current_cls"]
+            final_old_poses_cls = trace["current_cls"].detach()
+            final_ref_poses_cls = trace["reference_cls"].detach()
+            generation_outputs = {
+                "diffgrpo_current_log_probs": trace["current_log_probs"],
+                "diffgrpo_bc_log_probs": trace["bc_log_probs"],
+                "diffgrpo_num_denoising_steps": trace[
+                    "num_denoising_steps"
+                ],
+                "diffgrpo_selected_anchor_modes": trace[
+                    "selected_anchor_modes"
+                ],
+                "diffgrpo_group_size": trace["group_size"],
+            }
+        elif self._grpo_training_mode in {
             "generation", "generation_group", "generation_group_adaptive", "joint"
         }:
             rollout_count = self._grpo_rollouts_per_mode
@@ -1263,6 +1633,7 @@ class TrajectoryHead(nn.Module):
         raw_rewards = None
         reward_valid_mask = None
         reward_tiebreak_epsilon = None
+        component_scores = None
         num_modes = final_poses_cls.shape[-1]
         if tokens_list is not None:
             if self._lazy_metric_cache is not None:
@@ -1280,6 +1651,7 @@ class TrajectoryHead(nn.Module):
                 raw_rewards = reward_result["raw_rewards"]
                 reward_valid_mask = reward_result["valid_mask"]
                 reward_tiebreak_epsilon = reward_result["tiebreak_epsilon"]
+                component_scores = reward_result["component_scores"]
         if rewards is None or reward_valid_mask is None:
             raise RuntimeError(
                 "GRPO training requires PDM rewards and scene tokens for every batch"
@@ -1330,10 +1702,16 @@ class TrajectoryHead(nn.Module):
                 tokens_list=tokens_list,
             )
 
-        mode_idx = final_poses_cls.argmax(dim=-1)
+        if self._grpo_training_mode == "diffgrpo_full_chain":
+            mode_idx = final_ref_poses_cls.argmax(dim=-1)
+        elif self._grpo_training_mode == "diffgrpo_selected_anchor":
+            mode_idx = torch.zeros(bs, dtype=torch.long, device=device)
+        else:
+            mode_idx = final_poses_cls.argmax(dim=-1)
         best_reg = final_poses_reg[torch.arange(bs, device=device), mode_idx]
         return {
             "trajectory": best_reg,
+            "final_poses_reg": final_poses_reg,
             "final_poses_cls": final_poses_cls,
             "final_old_poses_cls": final_old_poses_cls,
             "final_ref_poses_cls": final_ref_poses_cls,
@@ -1341,6 +1719,7 @@ class TrajectoryHead(nn.Module):
             "raw_rewards": raw_rewards,
             "reward_valid_mask": reward_valid_mask,
             "reward_tiebreak_epsilon": reward_tiebreak_epsilon,
+            "component_scores": component_scores,
             "reference_selected_reward": reference_selected_reward,
             "reference_reward_valid_mask": reference_reward_valid_mask,
             "reference_anchor_rewards": reference_anchor_rewards,
@@ -1497,11 +1876,12 @@ class TrajectoryHead(nn.Module):
         img = self.norm_odo(plan_anchor)
         if self._generation_trust_collect_calibration and tokens_list is None:
             raise RuntimeError("Trust calibration collection requires scene tokens")
-        noise_namespace = (
-            self._generation_trust_calibration_seed
-            if self._generation_trust_collect_calibration
-            else None
-        )
+        if self._generation_trust_collect_calibration:
+            noise_namespace = self._generation_trust_calibration_seed
+        elif self._evaluation_noise_namespace >= 0:
+            noise_namespace = self._evaluation_noise_namespace
+        else:
+            noise_namespace = None
         noise = self._sample_evaluation_noise(img, tokens_list, noise_namespace)
         trunc_timesteps = torch.full(
             (bs,), self._truncation_timestep, device=device, dtype=torch.long
@@ -1573,9 +1953,10 @@ class TrajectoryHead(nn.Module):
             if trust_active
             else final_poses_cls
         )
+        final_ref_poses_reg = None
         if not trust_active and self.ref_policy is not None:
             with torch.no_grad():
-                _, final_ref_poses_cls = self._run_policy_rollout(
+                final_ref_poses_reg, final_ref_poses_cls = self._run_policy_rollout(
                     self.ref_policy, initial_sample, ego_query, agents_query,
                     bev_feature, bev_spatial_shape, status_encoding, global_img,
                 )
@@ -1587,36 +1968,127 @@ class TrajectoryHead(nn.Module):
             raise RuntimeError(
                 "reference inference selector requires a frozen reference policy"
             )
-        mode_idx, inference_selector_logits = select_inference_mode(
-            final_poses_cls,
-            final_ref_poses_cls,
-            self._inference_selector_source,
-        )
+        value_diagnostics = {}
+        paired_diagnostics = {}
+        paired_selected_trajectory = None
+        if self._inference_selector_source == "value_top2":
+            margin = float(
+                getattr(self._config, "value_selector_calibration_margin", -1.0)
+            )
+            if int(self._value_selector_training_updates.item()) <= 0:
+                raise RuntimeError(
+                    "value_top2 requires a trained value-selector checkpoint"
+                )
+            value_outputs = self.value_selector(
+                final_poses_reg,
+                bev_feature,
+                bev_spatial_shape,
+                agents_query,
+                ego_query,
+                status_encoding,
+            )
+            mode_idx, value_diagnostics = select_conservative_top2(
+                final_ref_poses_cls,
+                value_outputs["component_mean"],
+                value_outputs["component_std"],
+                value_outputs["score_mean"],
+                margin=margin,
+                safety_threshold=float(
+                    getattr(self._config, "value_selector_safety_threshold", 0.9)
+                ),
+                confidence_z=float(
+                    getattr(self._config, "value_selector_confidence_z", 1.64)
+                ),
+            )
+            inference_selector_logits = torch.full_like(
+                final_ref_poses_cls, torch.finfo(final_ref_poses_cls.dtype).min
+            )
+            inference_selector_logits.scatter_(
+                1, mode_idx.unsqueeze(-1), torch.zeros_like(mode_idx, dtype=final_ref_poses_cls.dtype).unsqueeze(-1)
+            )
+            value_diagnostics.update(
+                {
+                    "component_predictions": value_outputs["component_predictions"],
+                    "score_predictions": value_outputs["score_predictions"],
+                    "component_mean": value_outputs["component_mean"],
+                    "component_std": value_outputs["component_std"],
+                    "score_mean": value_outputs["score_mean"],
+                    "score_std": value_outputs["score_std"],
+                }
+            )
+        elif self._inference_selector_source == "paired_tail_risk":
+            if final_ref_poses_reg is None:
+                raise RuntimeError(
+                    "paired_tail_risk requires frozen base trajectories"
+                )
+            if int(self._paired_risk_training_updates.item()) <= 0:
+                raise RuntimeError(
+                    "paired_tail_risk requires a trained adapter checkpoint"
+                )
+            threshold = float(
+                getattr(self._config, "paired_risk_threshold", -1.0)
+            )
+            risk_outputs = self.paired_risk_head(
+                final_poses_reg, final_ref_poses_reg, bev_feature,
+                bev_spatial_shape, agents_query, ego_query, status_encoding,
+            )
+            paired_selected_trajectory, paired_diagnostics = (
+                select_same_mode_with_base_fallback(
+                    final_poses_reg, final_ref_poses_reg,
+                    final_ref_poses_cls, risk_outputs["fallback_score"],
+                    threshold,
+                )
+            )
+            mode_idx = paired_diagnostics["mode"]
+            inference_selector_logits = final_ref_poses_cls.detach()
+            paired_diagnostics.update(risk_outputs)
+        else:
+            mode_idx, inference_selector_logits = select_inference_mode(
+                final_poses_cls,
+                final_ref_poses_cls,
+                self._inference_selector_source,
+            )
         batch_idx = torch.arange(bs, device=device)
         best_reg = final_poses_reg[batch_idx, mode_idx]
+        if paired_selected_trajectory is not None:
+            best_reg = paired_selected_trajectory
         current_mode_idx = final_poses_cls.argmax(dim=-1)
         reference_mode_idx = final_ref_poses_cls.argmax(dim=-1)
 
         rewards = None
         reward_valid_mask = None
         reward_component_scores = None
+        paired_base_rewards = None
+        paired_base_valid = None
+        paired_base_components = None
         if tokens_list is not None:
+            reward_trajectories = final_poses_reg
+            reward_modes = num_modes
+            if self._inference_selector_source == "paired_tail_risk":
+                reward_trajectories = torch.cat(
+                    (final_poses_reg, final_ref_poses_reg), dim=1
+                )
+                reward_modes = 2 * num_modes
             if self._lazy_metric_cache is not None:
                 reward_result = self._compute_rewards_from_lazy_cache(
-                    final_poses_reg, tokens_list, num_modes,
+                    reward_trajectories, tokens_list, reward_modes,
                 )
             elif self.metric_cache_loader is not None:
                 reward_result = self._compute_rewards_from_disk(
-                    final_poses_reg, tokens_list, num_modes,
+                    reward_trajectories, tokens_list, reward_modes,
                 )
             else:
                 reward_result = None
             if reward_result is not None:
                 # Evaluation and checkpoint selection always use aggregate
                 # PDMS, even when training used the component tie-break.
-                rewards = reward_result["raw_rewards"]
-                reward_valid_mask = reward_result["valid_mask"]
-                reward_component_scores = reward_result["component_scores"]
+                rewards = reward_result["raw_rewards"][:, :num_modes]
+                reward_valid_mask = reward_result["valid_mask"][:, :num_modes]
+                reward_component_scores = reward_result["component_scores"][:, :num_modes]
+                if self._inference_selector_source == "paired_tail_risk":
+                    paired_base_rewards = reward_result["raw_rewards"][:, num_modes:]
+                    paired_base_valid = reward_result["valid_mask"][:, num_modes:]
+                    paired_base_components = reward_result["component_scores"][:, num_modes:]
 
         output_dict = {
             "trajectory": best_reg,
@@ -1632,8 +2104,14 @@ class TrajectoryHead(nn.Module):
             "rewards": rewards,
             "reward_valid_mask": reward_valid_mask,
             "reward_component_scores": reward_component_scores,
+            "paired_base_poses_reg": final_ref_poses_reg,
+            "paired_base_rewards": paired_base_rewards,
+            "paired_base_valid": paired_base_valid,
+            "paired_base_components": paired_base_components,
             "num_modes": num_modes,
             "grpo_training_rollout": False,
+            **{f"value_selector_{key}": value for key, value in value_diagnostics.items()},
+            **{f"paired_risk_{key}": value for key, value in paired_diagnostics.items()},
             **trust_diagnostics,
         }
         #print(f"[TEST] 返回 - rewards: {output_dict['rewards']}, 其他keys: {list(output_dict.keys())}")

@@ -40,9 +40,19 @@ def build_from_configs(obj, cfg: DictConfig, **kwargs):
 
 STAGE9_GRPO_MODES = {"selector_group", "generation_group"}
 STAGE10_GRPO_MODES = {"generation_group_adaptive"}
-FORMAL_GRPO_MODES = STAGE9_GRPO_MODES | STAGE10_GRPO_MODES
+STAGE16_GRPO_MODES = {"diffgrpo_full_chain"}
+STAGE19_GRPO_MODES = {"diffgrpo_selected_anchor"}
+FORMAL_GRPO_MODES = (
+    STAGE9_GRPO_MODES
+    | STAGE10_GRPO_MODES
+    | STAGE16_GRPO_MODES
+    | STAGE19_GRPO_MODES
+)
 FORMAL_BASE_SHA256 = (
     "59a8de460cfd8b1266c5cdd393372273da5c2465fa6707da551c4ecb1fbd019d"
+)
+STAGE17_GENERATOR_SHA256 = (
+    "3a7641d4ac2a9d644eda4cb945d1902d4ac4bebfdad09b156676dc0cbed94e23"
 )
 
 
@@ -120,9 +130,44 @@ def validate_formal_grpo_config(config: TransfuserConfig) -> None:
             "generation_kl_upper_ratio": 1.5,
             "generation_kl_hard_limit_patience": 2,
         },
+        "diffgrpo_full_chain": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_full_chain",
+            "diffgrpo_bc_weight": 0.1,
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "inference_selector_source": "reference",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+        },
+        "diffgrpo_selected_anchor": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_selected_anchor",
+            "diffgrpo_bc_weight": 0.1,
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "diffgrpo_group_size": 8,
+            "inference_selector_source": "reference",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+        },
     }[mode]
     for name, wanted in {**expected, **route_expected}.items():
         actual = getattr(config, name, None)
+        if isinstance(wanted, tuple) and actual is not None:
+            actual = tuple(actual)
         matches = (
             math.isclose(float(actual), wanted, rel_tol=0.0, abs_tol=1e-12)
             if isinstance(wanted, float) else actual == wanted
@@ -208,17 +253,71 @@ class TransfuserAgent(AbstractAgent):
         if str(getattr(config, "grpo_training_mode", "")) in FORMAL_GRPO_MODES:
             if self._reference_checkpoint_sha256 != FORMAL_BASE_SHA256:
                 raise RuntimeError(
-                    "Formal Stage-9/10 reference checkpoint is not the registered base"
+                    "Formal GRPO reference checkpoint is not the registered base"
                 )
             if self._checkpoint_sha256 != self._reference_checkpoint_sha256:
                 raise RuntimeError(
-                    "Formal Stage-9/10 current policy must initialize from frozen base"
+                    "Formal GRPO current policy must initialize from frozen base"
                 )
             if not math.isclose(float(lr), 1e-6, rel_tol=0.0, abs_tol=1e-12):
-                raise ValueError("Formal Stage-9/10 layer-1 learning rate must be 1e-6")
+                raise ValueError("Formal GRPO decoder learning rate must be 1e-6")
+        stage17_training = (
+            str(getattr(config, "grpo_training_mode", ""))
+            == "paired_tail_risk_selector"
+        )
+        stage17_inference = (
+            str(getattr(config, "inference_selector_source", ""))
+            == "paired_tail_risk"
+        )
+        if stage17_training or stage17_inference:
+            expected_generator = str(
+                getattr(config, "paired_risk_expected_generator_sha256", "")
+                or STAGE17_GENERATOR_SHA256
+            )
+            expected_reference = str(
+                getattr(config, "paired_risk_expected_reference_sha256", "")
+                or FORMAL_BASE_SHA256
+            )
+            if self._checkpoint_sha256 != expected_generator:
+                raise RuntimeError("Stage-17 generator checkpoint SHA mismatch")
+            if self._reference_checkpoint_sha256 != expected_reference:
+                raise RuntimeError("Stage-17 reference checkpoint SHA mismatch")
+            schedule = tuple(
+                int(t) for t in getattr(config, "diffusion_roll_timesteps", ())
+            )
+            if (
+                schedule != (32, 24, 16, 8, 0)
+                or int(getattr(config, "diffusion_truncation_timestep", -1)) != 32
+                or int(getattr(config, "diffusion_scheduler_num_inference_steps", -1)) != 125
+                or str(getattr(config, "generation_policy_algorithm", ""))
+                not in {"diffgrpo_full_chain", "diffgrpo_selected_anchor"}
+            ):
+                raise ValueError("Stage-17 requires the locked full-chain schedule")
+            if stage17_training and not math.isclose(
+                float(lr), 1e-4, rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise ValueError("Stage-17 adapter learning rate must be 1e-4")
+            if stage17_inference and not 0.0 <= float(
+                getattr(config, "paired_risk_threshold", -1.0)
+            ) <= 1.0:
+                raise ValueError("Stage-17 inference requires a calibrated threshold")
         self._reference_checkpoint_path = reference_checkpoint_path
         self._transfuser_model = TransfuserModel(config)
         self.init_from_pretrained()
+        self._value_selector_checkpoint_sha256 = None
+        value_selector_checkpoint = str(
+            getattr(config, "value_selector_checkpoint_path", "")
+        )
+        if value_selector_checkpoint:
+            self.load_value_selector_checkpoint(value_selector_checkpoint)
+        self._paired_risk_checkpoint_sha256 = None
+        paired_risk_checkpoint = str(
+            getattr(config, "paired_risk_checkpoint_path", "")
+        )
+        if paired_risk_checkpoint:
+            self.load_paired_risk_checkpoint(paired_risk_checkpoint)
+        elif stage17_inference:
+            raise ValueError("paired_tail_risk inference requires an adapter checkpoint")
         self._adaptive_kl_controller = None
         if bool(getattr(config, "generation_adaptive_kl_enabled", False)):
             self._adaptive_kl_controller = AdaptiveKLController(
@@ -247,12 +346,18 @@ class TransfuserAgent(AbstractAgent):
             trajectory_head.diff_decoder.layers[-1].task_decoder.plan_cls_branch.requires_grad_(
                 True
             )
+        elif training_mode == "value_selector":
+            trajectory_head.value_selector.requires_grad_(True)
+        elif training_mode == "paired_tail_risk_selector":
+            trajectory_head.paired_risk_head.requires_grad_(True)
         elif training_mode in {
-            "generation", "generation_group", "generation_group_adaptive", "joint"
+            "generation", "generation_group", "generation_group_adaptive",
+            "diffgrpo_full_chain", "diffgrpo_selected_anchor", "joint"
         }:
             trajectory_head.diff_decoder.requires_grad_(True)
             if training_mode in {
-                "generation", "generation_group", "generation_group_adaptive"
+                "generation", "generation_group", "generation_group_adaptive",
+                "diffgrpo_full_chain", "diffgrpo_selected_anchor"
             }:
                 for layer in trajectory_head.diff_decoder.layers:
                     layer.task_decoder.plan_cls_branch.requires_grad_(False)
@@ -261,7 +366,9 @@ class TransfuserAgent(AbstractAgent):
                 "grpo_training_mode must be one of "
                 "{'classification_shared', 'classification_head', 'selector', "
                 "'generation', 'joint', 'selector_group', "
-                "'generation_group', 'generation_group_adaptive'}; "
+                "'generation_group', 'generation_group_adaptive', "
+                "'diffgrpo_full_chain', 'diffgrpo_selected_anchor', "
+                "'value_selector', 'paired_tail_risk_selector'}; "
                 f"got {training_mode!r}"
             )
         trainable_params = sum(
@@ -349,11 +456,85 @@ class TransfuserAgent(AbstractAgent):
                 "Checkpoint is missing critical pretrained weights: "
                 + ", ".join(critical_missing[:20])
             )
+        optional_missing_prefixes = (
+            "_transfuser_model._trajectory_head.value_selector.",
+            "_transfuser_model._trajectory_head._value_selector_training_updates",
+            "_transfuser_model._trajectory_head.paired_risk_head.",
+            "_transfuser_model._trajectory_head._paired_risk_training_updates",
+        )
+        missing_keys = [
+            key for key in missing_keys
+            if not key.startswith(optional_missing_prefixes)
+        ]
         if missing_keys:
             print(f"Non-critical missing keys: {missing_keys}")
         if unexpected_keys:
             print(f"Unexpected checkpoint keys: {unexpected_keys}")
         print(f"✓ Loaded pretrained checkpoint: {self._checkpoint_path}")
+
+    def load_value_selector_checkpoint(self, checkpoint_path: str) -> None:
+        """Load only the Stage-15 adapter so one selector serves every generator."""
+        path = Path(checkpoint_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Value-selector checkpoint is missing: {path}")
+        checkpoint = torch.load(path, map_location="cpu")
+        if "state_dict" not in checkpoint:
+            raise KeyError(f"Value-selector checkpoint has no state_dict: {path}")
+        normalized = {
+            (key[len("agent."):] if key.startswith("agent.") else key): value
+            for key, value in checkpoint["state_dict"].items()
+        }
+        prefix = "_transfuser_model._trajectory_head.value_selector."
+        selector_state = {
+            key[len(prefix):]: value
+            for key, value in normalized.items()
+            if key.startswith(prefix)
+        }
+        if not selector_state:
+            raise RuntimeError(f"Checkpoint contains no Stage-15 selector: {path}")
+        head = self._transfuser_model._trajectory_head
+        head.value_selector.load_state_dict(selector_state, strict=True)
+        update_key = (
+            "_transfuser_model._trajectory_head._value_selector_training_updates"
+        )
+        if update_key in normalized:
+            head._value_selector_training_updates.copy_(normalized[update_key])
+        else:
+            head._value_selector_training_updates.fill_(1)
+        self._value_selector_checkpoint_sha256 = file_sha256(path)
+        print(f"✓ Loaded Stage-15 value selector: {path}")
+
+    def load_paired_risk_checkpoint(self, checkpoint_path: str) -> None:
+        """Load only the Stage-17 adapter and its update provenance."""
+        path = Path(checkpoint_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Paired-risk checkpoint is missing: {path}")
+        checkpoint = torch.load(path, map_location="cpu")
+        if "state_dict" not in checkpoint:
+            raise KeyError(f"Paired-risk checkpoint has no state_dict: {path}")
+        normalized = {
+            (key[len("agent."):] if key.startswith("agent.") else key): value
+            for key, value in checkpoint["state_dict"].items()
+        }
+        prefix = "_transfuser_model._trajectory_head.paired_risk_head."
+        adapter_state = {
+            key[len(prefix):]: value
+            for key, value in normalized.items()
+            if key.startswith(prefix)
+        }
+        if not adapter_state:
+            raise RuntimeError(f"Checkpoint contains no Stage-17 adapter: {path}")
+        head = self._transfuser_model._trajectory_head
+        head.paired_risk_head.load_state_dict(adapter_state, strict=True)
+        update_key = (
+            "_transfuser_model._trajectory_head._paired_risk_training_updates"
+        )
+        if update_key in normalized:
+            head._paired_risk_training_updates.copy_(normalized[update_key])
+        else:
+            head._paired_risk_training_updates.fill_(1)
+        self._paired_risk_checkpoint_sha256 = file_sha256(path)
+        print(f"✓ Loaded Stage-17 paired-risk adapter: {path}")
     def name(self) -> str:
         """Inherited, see superclass."""
         return self.__class__.__name__
@@ -400,6 +581,20 @@ class TransfuserAgent(AbstractAgent):
         for module in frozen_modules:
             module.eval()
         model._trajectory_head.diff_decoder.eval()
+        model._trajectory_head.value_selector.eval()
+        model._trajectory_head.paired_risk_head.eval()
+        if (
+            self.training
+            and str(getattr(self._config, "grpo_training_mode", ""))
+            == "value_selector"
+        ):
+            model._trajectory_head.value_selector.train()
+        if (
+            self.training
+            and str(getattr(self._config, "grpo_training_mode", ""))
+            == "paired_tail_risk_selector"
+        ):
+            model._trajectory_head.paired_risk_head.train()
         if model._trajectory_head.ref_policy is not None:
             model._trajectory_head.ref_policy.eval()
         if model._trajectory_head.old_policy is not None:
@@ -520,7 +715,14 @@ class TransfuserAgent(AbstractAgent):
     def get_training_callbacks(self) -> List[pl.Callback]:
         """Inherited, see superclass."""
         training_mode = str(getattr(self._config, "grpo_training_mode", ""))
-        if training_mode in FORMAL_GRPO_MODES:
+        checkpoint_save_top_k = int(
+            getattr(self._config, "grpo_checkpoint_save_top_k", 2)
+        )
+        if (
+            training_mode in FORMAL_GRPO_MODES
+            or training_mode in {"value_selector", "paired_tail_risk_selector"}
+            or checkpoint_save_top_k == -1
+        ):
             # Stage 9 has no on-policy validation rollout: PDMS selection is
             # performed by the independent fixed-set evaluator. Preserve each
             # completed epoch instead of monitoring an undefined val metric.
@@ -536,9 +738,7 @@ class TransfuserAgent(AbstractAgent):
                 filename="grpo-{epoch:02d}-{step}",
                 monitor="val/selected_reward_epoch",
                 mode="max",
-                save_top_k=int(
-                    getattr(self._config, "grpo_checkpoint_save_top_k", 2)
-                ),
+                save_top_k=checkpoint_save_top_k,
                 save_last=True,
                 auto_insert_metric_name=False,
             )

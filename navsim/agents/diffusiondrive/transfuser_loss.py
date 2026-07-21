@@ -1,4 +1,5 @@
 from typing import Dict
+import math
 from scipy.optimize import linear_sum_assignment
 
 import torch
@@ -6,6 +7,12 @@ import torch.nn.functional as F
 
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 from navsim.agents.diffusiondrive.transfuser_features import BoundingBox2DIndex
+from navsim.agents.diffusiondrive.trajectory_value_selector import (
+    compute_value_selector_loss,
+)
+from navsim.agents.diffusiondrive.paired_advantage_risk import (
+    compute_paired_advantage_risk_loss,
+)
 
 
 def compute_group_relative_advantages(
@@ -399,6 +406,7 @@ def compute_generation_grpo_objective(
     rloo_scale: float = 0.20,
     rloo_clip: float = 1.0,
     rollouts_per_mode: int = 1,
+    no_collision_scores: torch.Tensor = None,
 ):
     """Clipped policy objective over sampled denoising actions.
 
@@ -410,6 +418,9 @@ def compute_generation_grpo_objective(
     for the matching anchor and supports K=2 or K=4. anchor_rloo replaces
     within-anchor standardization with a magnitude-aware K2 leave-one-out
     signal while retaining the matching fixed-reference anchor term.
+    collision_truncated_intra_anchor keeps only positive K2 within-anchor
+    advantages for safe candidates and assigns -1 to every valid candidate
+    whose PDM no-collision component is below one.
     """
     if current_log_probs.shape != old_log_probs.shape:
         raise ValueError("current and old generation log-probs must have identical shapes")
@@ -451,11 +462,13 @@ def compute_generation_grpo_objective(
         "hierarchical",
         "anchor_hierarchical",
         "anchor_rloo",
+        "collision_truncated_intra_anchor",
     }:
         within_anchor_mode = advantage_mode in {
             "within_anchor",
             "hierarchical",
             "anchor_hierarchical",
+            "collision_truncated_intra_anchor",
         }
         rloo_mode = advantage_mode == "anchor_rloo"
         if rloo_mode:
@@ -523,11 +536,16 @@ def compute_generation_grpo_objective(
             }
         if within_anchor_mode:
             if (
-                advantage_mode in {"within_anchor", "hierarchical"}
+                advantage_mode
+                in {
+                    "within_anchor",
+                    "hierarchical",
+                    "collision_truncated_intra_anchor",
+                }
                 and rollouts_per_mode != 2
             ):
                 raise ValueError(
-                    "within_anchor/hierarchical generation advantage requires "
+                    f"{advantage_mode} generation advantage requires "
                     "rollouts_per_mode=2"
                 )
             if (
@@ -705,6 +723,52 @@ def compute_generation_grpo_objective(
         elif advantage_mode == "within_anchor":
             advantages = within_advantages.clamp(-2.0, 2.0).detach()
             optimize_mode_mask = within_valid_mask & (advantages != 0)
+        elif advantage_mode == "collision_truncated_intra_anchor":
+            if no_collision_scores is None:
+                raise ValueError(
+                    "collision_truncated_intra_anchor requires no_collision_scores"
+                )
+            if no_collision_scores.shape != rewards.shape:
+                raise ValueError("no_collision_scores must match generation rewards")
+            no_collision_scores = no_collision_scores.detach().float()
+            if not torch.isfinite(no_collision_scores[valid_mask]).all():
+                raise ValueError("valid no_collision_scores must all be finite")
+            collision_mask = valid_mask & (no_collision_scores < 1.0)
+            safe_positive_mask = (
+                valid_mask
+                & ~collision_mask
+                & within_valid_mask
+                & (within_advantages > 0)
+            )
+            advantages = torch.where(
+                safe_positive_mask,
+                within_advantages.clamp(max=2.0),
+                torch.zeros_like(within_advantages),
+            )
+            advantages = torch.where(
+                collision_mask, -torch.ones_like(advantages), advantages
+            ).detach()
+            optimize_mode_mask = collision_mask | safe_positive_mask
+            valid_count_for_truncation = valid_mask.float().sum().clamp_min(1.0)
+            safe_zero_mask = valid_mask & ~collision_mask & ~safe_positive_mask
+            within_anchor_metrics.update(
+                {
+                    "truncated_positive_fraction": (
+                        safe_positive_mask.float().sum() / valid_count_for_truncation
+                    ).detach(),
+                    "truncated_safe_zero_fraction": (
+                        safe_zero_mask.float().sum() / valid_count_for_truncation
+                    ).detach(),
+                    "collision_penalty_fraction": (
+                        collision_mask.float().sum() / valid_count_for_truncation
+                    ).detach(),
+                    "collision_candidate_count": collision_mask.float().sum().detach(),
+                    "optimized_candidate_count": (
+                        optimize_mode_mask.float().sum().detach()
+                    ),
+                    "valid_candidate_count": valid_mask.float().sum().detach(),
+                }
+            )
         elif advantage_mode == "anchor_rloo":
             advantages = (
                 0.5 * within_advantages
@@ -731,7 +795,7 @@ def compute_generation_grpo_objective(
             "generation advantage mode must be one of "
             "{'group_zscore', 'reference_centered', "
             "'within_anchor', 'hierarchical', 'anchor_hierarchical', "
-            "'anchor_rloo'}"
+            "'anchor_rloo', 'collision_truncated_intra_anchor'}"
         )
     log_ratio = (current_log_probs - old_log_probs.detach()).clamp(-20.0, 20.0)
     ratio = log_ratio.exp()
@@ -812,6 +876,87 @@ def compute_generation_grpo_objective(
     return result
 
 
+def compute_full_chain_diffgrpo_objective(
+    current_log_probs: torch.Tensor,
+    bc_log_probs: torch.Tensor,
+    rewards: torch.Tensor,
+    valid_mask: torch.Tensor,
+    advantage_eps: float = 1e-3,
+    bc_weight: float = 0.1,
+    step_discount: float = 0.6,
+) -> Dict[str, torch.Tensor]:
+    """ReCogDrive-style on-policy objective for a complete denoising chain."""
+    if current_log_probs.ndim != 3:
+        raise ValueError("full-chain log probabilities must have shape [B,M,S]")
+    if (
+        bc_log_probs.ndim != 3
+        or bc_log_probs.shape[0] != current_log_probs.shape[0]
+        or bc_log_probs.shape[-1] != current_log_probs.shape[-1]
+        or bc_log_probs.shape[1] not in {1, current_log_probs.shape[1]}
+    ):
+        raise ValueError(
+            "full-chain current/BC steps must match; BC shape is [B,1,S] or [B,M,S]"
+        )
+    if rewards.shape != current_log_probs.shape[:2] or valid_mask.shape != rewards.shape:
+        raise ValueError("full-chain rewards/valid mask must have shape [B,M]")
+    if not math.isfinite(float(bc_weight)) or bc_weight < 0:
+        raise ValueError("diffgrpo BC weight must be finite and non-negative")
+    if not math.isfinite(float(step_discount)) or not 0 < step_discount <= 1:
+        raise ValueError("diffgrpo step discount must satisfy 0 < gamma <= 1")
+    if not torch.isfinite(current_log_probs).all() or not torch.isfinite(bc_log_probs).all():
+        raise FloatingPointError("full-chain log probabilities must be finite")
+
+    advantages, finite_valid, group_valid, reward_mean, reward_std = (
+        compute_group_relative_advantages(rewards, valid_mask, advantage_eps)
+    )
+    optimize_mode = finite_valid & group_valid.unsqueeze(-1)
+    num_steps = current_log_probs.shape[-1]
+    indices = torch.arange(
+        num_steps, device=current_log_probs.device, dtype=current_log_probs.dtype
+    )
+    discounts = step_discount ** (num_steps - indices - 1)
+    weighted_advantage = advantages.unsqueeze(-1) * discounts.view(1, 1, -1)
+    optimize_mask = optimize_mode.unsqueeze(-1).expand_as(current_log_probs)
+    policy_terms = -(current_log_probs * weighted_advantage)
+    policy_loss = (
+        policy_terms[optimize_mask].mean()
+        if optimize_mask.any()
+        else current_log_probs.sum() * 0.0
+    )
+    bc_mask = torch.isfinite(bc_log_probs)
+    bc_loss = (
+        -bc_log_probs[bc_mask].mean()
+        if bc_mask.any()
+        else bc_log_probs.sum() * 0.0
+    )
+    total_loss = policy_loss + float(bc_weight) * bc_loss
+    valid_count = finite_valid.float().sum().clamp_min(1.0)
+    return {
+        "loss": total_loss,
+        "policy_loss": policy_loss,
+        "bc_loss": bc_loss,
+        "reward_mean": (
+            rewards.float()[finite_valid].mean().detach()
+            if finite_valid.any() else rewards.sum() * 0.0
+        ),
+        "reward_std": (
+            reward_std[group_valid].mean().detach()
+            if group_valid.any() else rewards.sum() * 0.0
+        ),
+        "policy_active_scene_fraction": group_valid.float().mean().detach(),
+        "positive_advantage_fraction": (
+            ((advantages > 0) & finite_valid).float().sum() / valid_count
+        ).detach(),
+        "negative_advantage_fraction": (
+            ((advantages < 0) & finite_valid).float().sum() / valid_count
+        ).detach(),
+        "discount_first": discounts[0].detach(),
+        "discount_last": discounts[-1].detach(),
+        "mean_current_log_prob": current_log_probs.mean().detach(),
+        "mean_bc_log_prob": bc_log_probs.mean().detach(),
+    }
+
+
 def compute_reference_headroom_scene_weights(
     raw_rewards: torch.Tensor,
     valid_mask: torch.Tensor,
@@ -885,6 +1030,37 @@ def transfuser_loss(
 ):
     """Pure GRPO objective for selection, generation, or their joint policy."""
     current_logits = predictions["final_poses_cls"]
+    training_mode = getattr(config, "grpo_training_mode", "classification_shared")
+    if training_mode == "paired_tail_risk_selector":
+        if not predictions.get("grpo_training_rollout", True):
+            zero = current_logits.sum() * 0.0
+            return {"loss": zero, "paired_risk_loss": zero.detach()}
+        result = compute_paired_advantage_risk_loss(
+            predictions,
+            positive_weights=getattr(
+                config, "paired_risk_positive_weights", (1.0,) * 6
+            ),
+            selected_mode_weight=float(
+                getattr(config, "paired_risk_selected_mode_weight", 4.0)
+            ),
+            delta_loss_weight=float(
+                getattr(config, "paired_risk_delta_loss_weight", 0.25)
+            ),
+        )
+        result["paired_risk_loss"] = result["loss"].detach()
+        return result
+    if training_mode == "value_selector":
+        if not predictions.get("grpo_training_rollout", True):
+            zero = current_logits.sum() * 0.0
+            return {"loss": zero, "value_selector_loss": zero.detach()}
+        result = compute_value_selector_loss(
+            predictions,
+            reward_gap=float(
+                getattr(config, "value_selector_pair_reward_gap", 0.01)
+            ),
+        )
+        result["value_selector_loss"] = result["loss"].detach()
+        return result
     grpo_weight = getattr(config, "policy_loss_weight", 1.0)
     kl_weight = getattr(config, "kl_loss_weight", 0.01)
     entropy_weight = getattr(config, "selection_entropy_weight", 0.0)
@@ -909,6 +1085,46 @@ def transfuser_loss(
             "loss": zero,
             "grpo_loss": zero.detach(),
             "kl_loss": zero.detach(),
+        }
+
+    if training_mode in {"diffgrpo_full_chain", "diffgrpo_selected_anchor"}:
+        required = (
+            "diffgrpo_current_log_probs",
+            "diffgrpo_bc_log_probs",
+            "raw_rewards",
+            "reward_valid_mask",
+        )
+        missing = [name for name in required if predictions.get(name) is None]
+        if missing:
+            raise ValueError(f"Missing full-chain DiffGRPO tensors: {missing}")
+        objective = compute_full_chain_diffgrpo_objective(
+            current_log_probs=predictions["diffgrpo_current_log_probs"],
+            bc_log_probs=predictions["diffgrpo_bc_log_probs"],
+            rewards=predictions["raw_rewards"],
+            valid_mask=predictions["reward_valid_mask"],
+            advantage_eps=float(getattr(config, "grpo_advantage_eps", 1e-3)),
+            bc_weight=float(getattr(config, "diffgrpo_bc_weight", 0.1)),
+            step_discount=float(getattr(config, "diffgrpo_step_discount", 0.6)),
+        )
+        return {
+            "loss": objective["loss"],
+            "generation_grpo_loss": objective["policy_loss"],
+            "diffgrpo_bc_loss": objective["bc_loss"],
+            "raw_reward_mean": objective["reward_mean"],
+            "raw_reward_std": objective["reward_std"],
+            "generation_policy_active_scene_fraction": objective[
+                "policy_active_scene_fraction"
+            ],
+            "generation_positive_advantage_fraction": objective[
+                "positive_advantage_fraction"
+            ],
+            "generation_negative_advantage_fraction": objective[
+                "negative_advantage_fraction"
+            ],
+            "diffgrpo_discount_first": objective["discount_first"],
+            "diffgrpo_discount_last": objective["discount_last"],
+            "diffgrpo_mean_current_log_prob": objective["mean_current_log_prob"],
+            "diffgrpo_mean_bc_log_prob": objective["mean_bc_log_prob"],
         }
 
     if predictions.get("final_old_poses_cls") is None:
@@ -998,7 +1214,6 @@ def transfuser_loss(
             behavior_weighting=behavior_weighting,
         )
 
-    training_mode = getattr(config, "grpo_training_mode", "classification_shared")
     generation_only = training_mode in {
         "generation", "generation_group", "generation_group_adaptive"
     }
@@ -1179,6 +1394,11 @@ def transfuser_loss(
             rollouts_per_mode=getattr(
                 config, "grpo_rollouts_per_mode", 1
             ),
+            no_collision_scores=(
+                predictions.get("component_scores")[..., 0]
+                if predictions.get("component_scores") is not None
+                else None
+            ),
         )
         generation_kl_coefficient = predictions.get("generation_kl_coefficient")
         if generation_kl_coefficient is None:
@@ -1278,6 +1498,12 @@ def transfuser_loss(
             "rloo_dead_zone_fraction",
             "rloo_clip_fraction",
             "rloo_active_fraction",
+            "truncated_positive_fraction",
+            "truncated_safe_zero_fraction",
+            "collision_penalty_fraction",
+            "collision_candidate_count",
+            "optimized_candidate_count",
+            "valid_candidate_count",
         ):
             if key in generation_objective:
                 result[f"generation_{key}"] = generation_objective[key]

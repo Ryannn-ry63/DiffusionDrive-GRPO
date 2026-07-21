@@ -19,6 +19,25 @@ config:
   policy_loss_weight: 1.0
   grpo_clip_ratio: 0.2
   inference_selector_source: current
+  value_selector_num_heads: 3
+  value_selector_top_k: 2
+  value_selector_pair_reward_gap: 0.01
+  value_selector_bootstrap_fraction: 0.8
+  value_selector_checkpoint_path: ""
+  value_selector_train_manifest_path: ""
+  value_selector_calibration_margin: -1.0
+  value_selector_safety_threshold: 0.9
+  value_selector_confidence_z: 1.64
+  paired_risk_checkpoint_path: ""
+  paired_risk_train_manifest_path: ""
+  paired_risk_validation_manifest_path: ""
+  paired_risk_calibration_path: ""
+  paired_risk_threshold: -1.0
+  paired_risk_positive_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  paired_risk_selected_mode_weight: 4.0
+  paired_risk_delta_loss_weight: 0.25
+  paired_risk_expected_generator_sha256: ""
+  paired_risk_expected_reference_sha256: ""
   grpo_advantage_eps: 0.001
   grpo_checkpoint_every_n_train_steps: 0
   grpo_old_policy_sync_steps: 32
@@ -40,6 +59,13 @@ config:
   pdm_dense_weight: 0.1
   generation_policy_loss_weight: 1.0
   generation_kl_loss_weight: 0.1
+  generation_policy_algorithm: legacy_ppo
+  diffgrpo_bc_weight: 0.1
+  diffgrpo_step_discount: 0.6
+  diffgrpo_logprob_reduction: mean
+  diffgrpo_train_manifest_path: ""
+  diffgrpo_selected_mode_manifest_path: ""
+  diffgrpo_group_size: 8
   generation_adaptive_kl_enabled: false
   generation_kl_initial_coefficient: 0.1
   generation_kl_min_coefficient: 0.1
@@ -72,6 +98,7 @@ config:
   generation_trust_calibration_path: ""
   generation_trust_collect_calibration: false
   generation_trust_calibration_seed: 20260719
+  evaluation_noise_namespace: -1
   kl_loss_weight: 0.01
   diffusion_truncation_timestep: 8
   diffusion_roll_timesteps: [8, 0]

@@ -588,12 +588,13 @@ failed`, not passed.
 
 The unchecked state below is intentional: formal execution has not started.
 
-- [ ] Re-read this entire handoff in the new session
-- [ ] Branch, commit, worktree diff, environment, and RTX 4090 availability verified
-- [ ] Stage-10 U128 resume preflight re-run and recorded
-- [ ] Base selector equivalence re-run and passed
-- [ ] Stage-9 U128/U512/U1024/U2048 diagnostic artifacts completed sequentially
+- [x] Re-read this entire handoff in the new session
+- [x] Branch, commit, worktree diff, environment, and RTX 4090 availability verified
+- [x] Stage-10 U128 resume preflight re-run and recorded
+- [x] Base selector equivalence re-run and passed
+- [x] Stage-9 U128/U512/U1024/U2048 diagnostic artifacts completed sequentially
 - [ ] Diagnostic gate passed and explicitly authorized U256
+  - Formal run completed 2026-07-20: gate exited `1`, `passed=false`, and Stage 12 stopped; U256 was not authorized.
 - [ ] Seed-0 U128-to-U256 continuation completed without KL hard-stop
 - [ ] Seed-0 fixed-256 runtime smoke completed
 - [ ] Seed-0 fixed-1024 gate passed
@@ -609,3 +610,141 @@ The unchecked state below is intentional: formal execution has not started.
 ## 14. Execution log
 
 No formal Stage-12 entries at handoff. Append Section-12 blocks here during the run.
+
+### 2026-07-20 08:37 UTC - new-session provenance and environment preflight
+
+- Git branch / commit / dirty diff: `experiment-after-stage9` / `db8ed812567d2754d57c8faa00d60c9fec9ce561`; no tracked worktree diff before logging, historical untracked files preserved. HEAD is the pushed documentation-only follow-up to Stage-12 implementation commit `24d6287`.
+- Exact command: `git status -sb; git rev-parse --abbrev-ref HEAD; git rev-parse HEAD; git log -2 --oneline; nvidia-smi --query-gpu=index,name,memory.free,memory.used,utilization.gpu --format=csv`
+- GPU index / model: GPUs 0-7, all `NVIDIA GeForce RTX 4090`; GPU 0 had 48,619 MiB free and 0% utilization, GPUs 1-7 had 48,622-48,627 MiB free and 0% utilization.
+- Exit code and completion state: Git and GPU checks exited `0`; no active Stage-12, GRPO training, or schedule-evaluation process was found. Two initial concurrent read-only commands hit `bwrap: Failed to make / slave: Permission denied`; both were rerun sequentially/outside the failed sandbox and completed.
+- Decision: CONTINUE to Stage-10 U128 resume preflight.
+- Recovery notes or reused-artifact identity proof: `artifacts/grpo_stage12` did not exist before this run. Locked base, Stage-10 U128, and all four Stage-9 diagnostic checkpoints exist. No code changed after `24d6287`; `db8ed81` changes only this handoff, so the handoff's passing 53-test implementation verification remains applicable.
+
+### 2026-07-20 08:37 UTC - Stage-10 U128 resume preflight
+
+- Git branch / commit / dirty diff: `experiment-after-stage9` / `db8ed812567d2754d57c8faa00d60c9fec9ce561`; only this formal execution log/checklist became a tracked worktree modification.
+- Exact command: `/root/miniconda3/envs/navsim/bin/python scripts/training/check_grpo_stage12_resume.py --checkpoint /inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/stage10_layer0_01_u128/2026.07.19.04.43.02/lightning_logs/version_0/checkpoints/grpo-step-128.ckpt --expected-global-step 128`
+- GPU index / model: CPU checkpoint inspection; formal evaluation GPU remains GPU 0 / `NVIDIA GeForce RTX 4090`.
+- Exit code and completion state: exit `0`, `passed=true`.
+- Input checkpoint: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/stage10_layer0_01_u128/2026.07.19.04.43.02/lightning_logs/version_0/checkpoints/grpo-step-128.ckpt`
+- Resume checkpoint and expected global step: same checkpoint; expected `128`, observed `128`.
+- Adaptive-KL coefficient / rolling mean / hard-stop: `0.1` / `3.3324385640298715e-05` / `false`.
+- Gate JSON / gate exit code / failure reasons: resume checker stdout; exit `0`; `optimizer_state_count=1`, `lr_scheduler_state_count=1`, failures `[]`.
+- Decision: CONTINUE to fresh base selector equivalence.
+- Recovery notes or reused-artifact identity proof: none; the formal preflight was rerun in this session as required.
+
+### 2026-07-20 08:46 UTC - base selector equivalence
+
+- Git branch / commit / dirty diff: `experiment-after-stage9` / `db8ed812567d2754d57c8faa00d60c9fec9ce561`; tracked diff is this execution log/checklist only; historical untracked files preserved.
+- Exact command: `bash scripts/evaluation/run_diffusiondrive_grpo_stage11_base_equivalence.sh 256 0`
+- GPU index / model: GPU 0 / `NVIDIA GeForce RTX 4090`.
+- Exit code and completion state: initial sandbox launch exited `1` before running with `bwrap: Failed to make / slave: Permission denied`; exact command rerun outside the failed sandbox exited `0`; both evaluator jobs completed `256/256` and gate completed.
+- Input checkpoint: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2026.04.14.03.49.58/lightning_logs/version_0/checkpoints/eval_model`
+- Output checkpoint or artifact: `artifacts/grpo_stage11/base_equivalence/base_current_256.json`; `artifacts/grpo_stage11/base_equivalence/base_reference_256.json`.
+- Baseline artifact: `artifacts/grpo_stage11/base_equivalence/base_current_256.json`.
+- Token count / token-set SHA / log split: both artifacts `256`, `d3c9f56e66c13bead6950141acc3a6bf44cafc98a27c7b49bd8126cc405e6113`, `val`; direct audit found `summary.num_tokens == len(records) == unique_tokens == 256` in both.
+- Selector source / schedule / caches: baseline `current`, candidate `reference`; `8 -> 0`, 125 inference steps; default feature and metric caches.
+- Selected PDMS delta: `0.0`.
+- Gate JSON / gate exit code / failure reasons: `artifacts/grpo_stage11/base_equivalence/gate_256.json`; exit `0`; `passed=true`, mode agreement `1.0`, trajectory max error `0.0`, failures `[]`.
+- Decision: CONTINUE to Phase-A Stage-9 U128 diagnostic evaluation.
+- Recovery notes or reused-artifact identity proof: the complete prior July-19 artifacts were preserved before the protocol-required fresh rerun under `artifacts/grpo_stage11/base_equivalence/pre_stage12_session_20260720_0837/`; no records were merged across attempts.
+
+### 2026-07-20 08:53 UTC - Phase A Stage-9 U128 frozen-selector fixed-1024
+
+- Git branch / commit / dirty diff: `experiment-after-stage9` / `db8ed812567d2754d57c8faa00d60c9fec9ce561`; tracked diff is this execution log/checklist only.
+- Exact command: `bash scripts/evaluation/run_diffusiondrive_grpo_stage12_eval.sh /inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/stage9_generation_epoch1_seed0/2026.07.18.15.58.29/lightning_logs/version_0/checkpoints/grpo-step-128.ckpt /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/stage9_u128_reference_1024.json /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json 1024 /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json default default val 0`
+- GPU index / model: GPU 0 / `NVIDIA GeForce RTX 4090`.
+- Exit code and completion state: initial sandbox launch exited `1` before running due the known `bwrap` mount failure; exact command rerun outside that sandbox exited `0`, completed `1024/1024`.
+- Input checkpoint: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/stage9_generation_epoch1_seed0/2026.07.18.15.58.29/lightning_logs/version_0/checkpoints/grpo-step-128.ckpt`
+- Output checkpoint or artifact: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/stage9_u128_reference_1024.json`
+- Baseline artifact: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json`
+- Token count / token-set SHA / log split: `1024`, `fc2f4c607de003688f5fbfc1ab5f97568b3c334e4a34c3cb4ae2fe3de994df25`, `val`; direct audit found `summary.num_tokens == len(records) == unique_tokens == 1024`.
+- Selector source / schedule / caches: `reference`; `8 -> 0`, 125 inference steps; default feature and metric caches.
+- Selected PDMS delta: `0.0030900143610779196`.
+- Candidate-mean delta / oracle delta: `0.0017440853662265` / `0.0004205663572065532`.
+- Paired or seed-stratified CI95: `[0.0007709306919423399, 0.00612509441707516]`.
+- Collision / drivable / progress / TTC deltas: `0.0 / 0.001953125 / 0.0014444317876041168 / 0.0048828125`.
+- Safety-pass bucket delta / worst-token delta: `-6.7307424228803244e-06` / `-0.057477355003356934`.
+- Gate JSON / gate exit code / failure reasons: deferred until all four registered diagnostic checkpoints complete.
+- Decision: CONTINUE to Phase-A Stage-9 U512 diagnostic evaluation.
+- Recovery notes or reused-artifact identity proof: newly generated artifact; no prior Stage-12 artifact existed and no records were reused or merged.
+
+### 2026-07-20 08:58 UTC - Phase A Stage-9 U512 frozen-selector fixed-1024
+
+- Git branch / commit / dirty diff: `experiment-after-stage9` / `db8ed812567d2754d57c8faa00d60c9fec9ce561`; tracked diff is this execution log/checklist only.
+- Exact command: `bash scripts/evaluation/run_diffusiondrive_grpo_stage12_eval.sh /inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/stage9_generation_epoch1_seed0/2026.07.18.15.58.29/lightning_logs/version_0/checkpoints/grpo-step-512.ckpt /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/stage9_u512_reference_1024.json /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json 1024 /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json default default val 0`
+- GPU index / model: GPU 0 / `NVIDIA GeForce RTX 4090`.
+- Exit code and completion state: exit `0`, completed `1024/1024`.
+- Input checkpoint: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/stage9_generation_epoch1_seed0/2026.07.18.15.58.29/lightning_logs/version_0/checkpoints/grpo-step-512.ckpt`
+- Output checkpoint or artifact: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/stage9_u512_reference_1024.json`
+- Baseline artifact: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json`
+- Token count / token-set SHA / log split: `1024`, `fc2f4c607de003688f5fbfc1ab5f97568b3c334e4a34c3cb4ae2fe3de994df25`, `val`; direct audit found `summary.num_tokens == len(records) == unique_tokens == 1024`.
+- Selector source / schedule / caches: `reference`; `8 -> 0`, 125 inference steps; default feature and metric caches.
+- Selected PDMS delta: `0.0037984511873219162`.
+- Candidate-mean delta / oracle delta: `0.0037482837396964896` / `-0.00033859445829875767`.
+- Paired or seed-stratified CI95: `[-0.0014479406512691638, 0.009217475495825056]`.
+- Collision / drivable / progress / TTC deltas: `-0.0009765625 / 0.00390625 / 0.0014768991404707776 / 0.00390625`.
+- Safety-pass bucket delta / worst-token delta: `-0.00274491230998419` / `-0.8505653142929077`.
+- Gate JSON / gate exit code / failure reasons: deferred until all four registered diagnostic checkpoints complete.
+- Decision: CONTINUE to Phase-A Stage-9 U1024 diagnostic evaluation; no checkpoint is evaluated in isolation for the registered gate.
+- Recovery notes or reused-artifact identity proof: newly generated complete artifact; no records were reused or merged.
+
+### 2026-07-20 09:03 UTC - Phase A Stage-9 U1024 frozen-selector fixed-1024
+
+- Git branch / commit / dirty diff: `experiment-after-stage9` / `db8ed812567d2754d57c8faa00d60c9fec9ce561`; tracked diff is this execution log/checklist only.
+- Exact command: `bash scripts/evaluation/run_diffusiondrive_grpo_stage12_eval.sh /inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/stage9_generation_epoch1_seed0/2026.07.18.15.58.29/lightning_logs/version_0/checkpoints/grpo-step-1024.ckpt /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/stage9_u1024_reference_1024.json /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json 1024 /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json default default val 0`
+- GPU index / model: GPU 0 / `NVIDIA GeForce RTX 4090`.
+- Exit code and completion state: exit `0`, completed `1024/1024`.
+- Input checkpoint: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/stage9_generation_epoch1_seed0/2026.07.18.15.58.29/lightning_logs/version_0/checkpoints/grpo-step-1024.ckpt`
+- Output checkpoint or artifact: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/stage9_u1024_reference_1024.json`
+- Baseline artifact: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json`
+- Token count / token-set SHA / log split: `1024`, `fc2f4c607de003688f5fbfc1ab5f97568b3c334e4a34c3cb4ae2fe3de994df25`, `val`; direct audit found `summary.num_tokens == len(records) == unique_tokens == 1024`.
+- Selector source / schedule / caches: `reference`; `8 -> 0`, 125 inference steps; default feature and metric caches.
+- Selected PDMS delta: `0.003897509363014251`.
+- Candidate-mean delta / oracle delta: `0.006558172317454591` / `-0.0004785839410033077`.
+- Paired or seed-stratified CI95: `[-0.00262141449493356, 0.010576725391001672]`.
+- Collision / drivable / progress / TTC deltas: `-0.001953125 / 0.0048828125 / 0.002133579962901422 / 0.00390625`.
+- Safety-pass bucket delta / worst-token delta: `-0.005200242079728473` / `-0.8599309325218201`.
+- Gate JSON / gate exit code / failure reasons: deferred until all four registered diagnostic checkpoints complete.
+- Decision: CONTINUE to Phase-A Stage-9 U2048 diagnostic evaluation; no checkpoint is evaluated in isolation for the registered gate.
+- Recovery notes or reused-artifact identity proof: newly generated complete artifact; no records were reused or merged.
+
+### 2026-07-20 09:08 UTC - Phase A Stage-9 U2048 frozen-selector fixed-1024
+
+- Git branch / commit / dirty diff: `experiment-after-stage9` / `db8ed812567d2754d57c8faa00d60c9fec9ce561`; tracked diff is this execution log/checklist only.
+- Exact command: `bash scripts/evaluation/run_diffusiondrive_grpo_stage12_eval.sh /inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/stage9_generation_epoch1_seed0/2026.07.18.15.58.29/lightning_logs/version_0/checkpoints/grpo-step-2048.ckpt /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/stage9_u2048_reference_1024.json /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json 1024 /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json default default val 0`
+- GPU index / model: GPU 0 / `NVIDIA GeForce RTX 4090`.
+- Exit code and completion state: exit `0`, completed `1024/1024`.
+- Input checkpoint: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/stage9_generation_epoch1_seed0/2026.07.18.15.58.29/lightning_logs/version_0/checkpoints/grpo-step-2048.ckpt`
+- Output checkpoint or artifact: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/stage9_u2048_reference_1024.json`
+- Baseline artifact: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json`
+- Token count / token-set SHA / log split: `1024`, `fc2f4c607de003688f5fbfc1ab5f97568b3c334e4a34c3cb4ae2fe3de994df25`, `val`; direct audit found `summary.num_tokens == len(records) == unique_tokens == 1024`. A final four-artifact audit confirmed the same count, SHA, selector source, and registered checkpoint identity for every diagnostic artifact.
+- Selector source / schedule / caches: `reference`; `8 -> 0`, 125 inference steps; default feature and metric caches.
+- Selected PDMS delta: `0.006810275051975623`.
+- Candidate-mean delta / oracle delta: `0.008875055245880503` / `-0.0016392350080423057`.
+- Paired or seed-stratified CI95: `[-0.002037906461919192, 0.015922316799697]`.
+- Collision / drivable / progress / TTC deltas: `-0.0009765625 / 0.0078125 / 0.004839187000470702 / 0.00390625`.
+- Safety-pass bucket delta / worst-token delta: `-0.00929519573671628` / `-1.0`.
+- Gate JSON / gate exit code / failure reasons: deferred to the immediately following registered diagnostic gate.
+- Decision: CONTINUE to Phase-A diagnostic gate only; U256 training remains unauthorized.
+- Recovery notes or reused-artifact identity proof: newly generated complete artifact; all four evaluations ran sequentially in registered order U128, U512, U1024, U2048, with no records reused or merged.
+
+### 2026-07-20 09:09 UTC - Phase A diagnostic gate
+
+- Git branch / commit / dirty diff: `experiment-after-stage9` / `db8ed812567d2754d57c8faa00d60c9fec9ce561`; tracked diff is this execution log/checklist only; historical untracked files preserved.
+- Exact command: `/root/miniconda3/envs/navsim/bin/python scripts/evaluation/check_grpo_stage12_gate.py --gate diagnostic --baseline-artifacts /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json --stage10-u128-artifact /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_candidate_reference_1024.json --candidate-artifacts /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/stage9_u128_reference_1024.json /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/stage9_u512_reference_1024.json /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/stage9_u1024_reference_1024.json /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/stage9_u2048_reference_1024.json --candidate-steps 128 512 1024 2048 --output /inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/gate.json`
+- GPU index / model: CPU gate computation after four sequential GPU-0 / `NVIDIA GeForce RTX 4090` evaluations.
+- Exit code and completion state: exit `1`; valid scientific gate failure, output JSON parsed successfully.
+- Input checkpoint: Stage-9 U128/U512/U1024/U2048 artifacts from the four locked checkpoints; Stage-10 comparison artifact from the registered U128 checkpoint.
+- Output checkpoint or artifact: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage12/diagnostic/gate.json`
+- Baseline artifact: `/inspire/hdd/global_user/wangcaojun-240208020180/nry/DiffusionDrive/artifacts/grpo_stage11/backtrack_base_reference_1024.json`
+- Token count / token-set SHA / log split: gate reports `1024`; all audited input artifacts have SHA `fc2f4c607de003688f5fbfc1ab5f97568b3c334e4a34c3cb4ae2fe3de994df25`, split `val`, and `1024/1024` unique aligned tokens.
+- Selector source / schedule / caches: all candidates `reference`; `8 -> 0`, 125 inference steps; default feature and metric caches.
+- Stage-10 U128 registered row: selected delta `0.0026683249743655324`, gate CI95 `[0.00047456770917051475, 0.005617414171138079]`, candidate delta `0.0013691200183529872`, oracle delta `0.0008774464367888868`, worst token `-0.03775966167449951`.
+- Stage-9 U128 row: selected delta `0.0030900143610779196`, gate CI95 `[0.0008036552339035553, 0.006081308615830493]`, U128-relative delta `0.0004216893867123872`, candidate/oracle `0.0017440853662265 / 0.0004205663572065532`, worst token `-0.057477355003356934`; ineligible because it is below U512+ and improvement over Stage-10 U128 is `<+0.0005`.
+- Stage-9 U512 row: selected delta `0.0037984511873219162`, gate CI95 `[-0.0013423811971733808, 0.009296068496041697]`, U128-relative delta `0.0011301262129563838`, candidate/oracle `0.0037482837396964896 / -0.00033859445829875767`, worst token `-0.8505653142929077`; ineligible because CI lower is not `>0`, oracle is negative, and worst token is not `>-0.5`.
+- Stage-9 U1024 row: selected delta `0.003897509363014251`, gate CI95 `[-0.0027464356608106755, 0.010519266568007878]`, U128-relative delta `0.0012291843886487186`, candidate/oracle `0.006558172317454591 / -0.0004785839410033077`, worst token `-0.8599309325218201`; ineligible because CI lower is not `>0`, oracle is negative, collision delta is `-0.001953125 < -0.001`, and worst token is not `>-0.5`.
+- Stage-9 U2048 row: selected delta `0.006810275051975623`, gate CI95 `[-0.0020775724668055775, 0.01585598153978935]`, U128-relative delta `0.00414195007761009`, candidate/oracle `0.008875055245880503 / -0.0016392350080423057`, worst token `-1.0`; ineligible because CI lower is not `>0`, oracle is negative, and worst token is not `>-0.5`.
+- Gate JSON / gate exit code / failure reasons: `artifacts/grpo_stage12/diagnostic/gate.json`; exit `1`; `passed=false`; exact `eligible_stage9_steps=[]`; exact aggregate failure `no Stage-9 U512+ checkpoint demonstrates continuation headroom`.
+- Decision: STOP Stage 12. Do not train U256 and do not run seed, dev, or navtest phases.
+- Recovery notes or reused-artifact identity proof: direct post-gate JSON audit confirmed `gate=stage12_diagnostic`, `passed=false`, `num_tokens=1024`, four checkpoint rows, and the empty eligible list. Post-stop process audit found no residual training or evaluation job; all eight RTX 4090s were at 0% utilization and GPU 0 had 48,619 MiB free.

@@ -68,7 +68,17 @@ class AgentLightningModule(pl.LightningModule):
         """
         model = getattr(self.agent, "_transfuser_model", None)
         head = getattr(model, "_trajectory_head", None)
-        if head is not None and hasattr(head, "maybe_sync_old_policy"):
+        training_mode = getattr(
+            getattr(self.agent, "_config", None), "grpo_training_mode", None
+        )
+        if (
+            training_mode not in {
+                "diffgrpo_full_chain", "diffgrpo_selected_anchor",
+                "paired_tail_risk_selector",
+            }
+            and head is not None
+            and hasattr(head, "maybe_sync_old_policy")
+        ):
             head.maybe_sync_old_policy(self.global_step)
 
     def validation_step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], batch_idx: int):
@@ -180,19 +190,58 @@ class AgentLightningModule(pl.LightningModule):
                         + parameter.grad.detach().float().square().sum()
                     )
         perception_grad_norm = perception_squared_norm.sqrt()
+        value_squared_norm = torch.zeros((), device=self.device)
+        value_selector = getattr(trajectory_head, "value_selector", None)
+        if value_selector is not None:
+            for parameter in value_selector.parameters():
+                if parameter.grad is not None:
+                    value_squared_norm = (
+                        value_squared_norm
+                        + parameter.grad.detach().float().square().sum()
+                    )
+        value_selector_grad_norm = value_squared_norm.sqrt()
+        paired_squared_norm = torch.zeros((), device=self.device)
+        paired_risk = getattr(trajectory_head, "paired_risk_head", None)
+        if paired_risk is not None:
+            for parameter in paired_risk.parameters():
+                if parameter.grad is not None:
+                    paired_squared_norm = (
+                        paired_squared_norm
+                        + parameter.grad.detach().float().square().sum()
+                    )
+        paired_risk_grad_norm = paired_squared_norm.sqrt()
         training_mode = getattr(
             getattr(self.agent, "_config", None), "grpo_training_mode", None
         )
         if training_mode in {
-            "generation", "generation_group", "generation_group_adaptive"
+            "generation", "generation_group", "generation_group_adaptive",
+            "diffgrpo_full_chain", "diffgrpo_selected_anchor"
         } and (
             grad_norms["classification"] != 0 or perception_grad_norm != 0
         ):
             raise RuntimeError(
                 "Generation-only GRPO produced classification/perception gradients"
             )
+        if training_mode == "value_selector" and (
+            total_grad_norm != 0
+            or perception_grad_norm != 0
+            or value_selector_grad_norm <= 0
+        ):
+            raise RuntimeError(
+                "Value-selector training violated its frozen boundary or has zero gradient"
+            )
+        if training_mode == "paired_tail_risk_selector" and (
+            total_grad_norm != 0
+            or perception_grad_norm != 0
+            or value_selector_grad_norm != 0
+            or paired_risk_grad_norm <= 0
+        ):
+            raise RuntimeError(
+                "Paired-risk training violated its frozen boundary or has zero gradient"
+            )
         if not all(torch.isfinite(value) for value in (
-            *grad_norms.values(), total_grad_norm, perception_grad_norm
+            *grad_norms.values(), total_grad_norm, perception_grad_norm,
+            value_selector_grad_norm, paired_risk_grad_norm,
         )):
             raise FloatingPointError("Non-finite diff_decoder gradient norm")
         self.log(
@@ -202,6 +251,14 @@ class AgentLightningModule(pl.LightningModule):
         self.log(
             "train/perception_grad_norm", perception_grad_norm,
             on_step=True, on_epoch=True, prog_bar=False, sync_dist=True,
+        )
+        self.log(
+            "train/value_selector_grad_norm", value_selector_grad_norm,
+            on_step=True, on_epoch=True, prog_bar=True, sync_dist=True,
+        )
+        self.log(
+            "train/paired_risk_grad_norm", paired_risk_grad_norm,
+            on_step=True, on_epoch=True, prog_bar=True, sync_dist=True,
         )
         for group, grad_norm in grad_norms.items():
             self.log(

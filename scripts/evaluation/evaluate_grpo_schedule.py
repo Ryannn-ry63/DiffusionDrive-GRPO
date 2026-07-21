@@ -96,10 +96,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roll-timesteps", type=int, nargs="+", required=True)
     parser.add_argument("--scheduler-num-inference-steps", type=int, required=True)
     parser.add_argument(
+        "--generation-policy-algorithm",
+        choices=(
+            "legacy_ppo",
+            "diffgrpo_full_chain",
+            "diffgrpo_selected_anchor",
+        ),
+        default="legacy_ppo",
+        help="Record and validate the generation algorithm associated with the schedule",
+    )
+    parser.add_argument(
+        "--evaluation-noise-namespace",
+        type=int,
+        default=-1,
+        help="-1 uses the default token hash; non-negative values add a namespace",
+    )
+    parser.add_argument(
         "--selector-logits-source",
-        choices=("current", "reference"),
+        choices=("current", "reference", "value_top2", "paired_tail_risk"),
         default="current",
-        help="Choose current candidates with current or frozen-reference logits",
+        help="Choose current candidates with current, frozen-reference, or Stage-15 logits",
+    )
+    parser.add_argument("--value-selector-checkpoint", type=Path)
+    parser.add_argument("--value-selector-calibration-margin", type=float, default=-1.0)
+    parser.add_argument("--paired-risk-checkpoint", type=Path)
+    parser.add_argument("--paired-risk-threshold", type=float, default=-1.0)
+    parser.add_argument("--paired-risk-calibration-path", type=Path)
+    parser.add_argument(
+        "--paired-risk-expected-generator-sha256",
+        default="",
+        help="Fail closed unless the evaluated generator has this SHA256",
     )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -209,6 +235,26 @@ def main() -> None:
         raise ValueError("reference_mean_ball requires a calibration artifact")
     if args.collect_trust_calibration and args.baseline_artifact is not None:
         raise ValueError("calibration collection cannot read a reward baseline")
+    if args.selector_logits_source == "value_top2":
+        if args.value_selector_checkpoint is None:
+            raise ValueError("value_top2 requires --value-selector-checkpoint")
+        if not args.value_selector_checkpoint.is_file():
+            raise FileNotFoundError(args.value_selector_checkpoint)
+        if args.value_selector_calibration_margin < 0:
+            raise ValueError("value_top2 requires a non-negative calibration margin")
+    elif args.value_selector_checkpoint is not None:
+        raise ValueError(
+            "--value-selector-checkpoint is valid only with value_top2"
+        )
+    if args.selector_logits_source == "paired_tail_risk":
+        if args.paired_risk_checkpoint is None or not args.paired_risk_checkpoint.is_file():
+            raise ValueError("paired_tail_risk requires --paired-risk-checkpoint")
+        if not 0.0 <= args.paired_risk_threshold <= 1.0:
+            raise ValueError("paired_tail_risk requires a threshold in [0,1]")
+    elif args.paired_risk_checkpoint is not None:
+        raise ValueError(
+            "--paired-risk-checkpoint is valid only with paired_tail_risk"
+        )
 
     config = replace(
         TransfuserConfig(),
@@ -218,7 +264,17 @@ def main() -> None:
         diffusion_truncation_timestep=args.truncation_timestep,
         diffusion_roll_timesteps=tuple(args.roll_timesteps),
         diffusion_scheduler_num_inference_steps=args.scheduler_num_inference_steps,
+        generation_policy_algorithm=args.generation_policy_algorithm,
+        evaluation_noise_namespace=args.evaluation_noise_namespace,
         inference_selector_source=args.selector_logits_source,
+        value_selector_checkpoint_path=str(args.value_selector_checkpoint or ""),
+        value_selector_calibration_margin=args.value_selector_calibration_margin,
+        paired_risk_checkpoint_path=str(args.paired_risk_checkpoint or ""),
+        paired_risk_threshold=args.paired_risk_threshold,
+        paired_risk_calibration_path=str(args.paired_risk_calibration_path or ""),
+        paired_risk_expected_generator_sha256=(
+            args.paired_risk_expected_generator_sha256
+        ),
         generation_trust_projection_mode=args.generation_trust_projection_mode,
         generation_trust_calibration_path=str(
             args.generation_trust_calibration_path or ""
@@ -287,6 +343,8 @@ def main() -> None:
     rank_values = []
     component_values = {name: [] for name in COMPONENT_NAMES}
     current_reference_agreement_values = []
+    value_switch_values = []
+    value_switch_gain_values = []
 
     with torch.inference_mode():
         for batch_idx, (features, targets, tokens) in enumerate(loader):
@@ -325,6 +383,44 @@ def main() -> None:
             logits = predictions["inference_selector_logits"].float()
             trajectories = predictions["final_poses_reg"].float()
             components = predictions["reward_component_scores"].float()
+            value_active = args.selector_logits_source == "value_top2"
+            paired_active = args.selector_logits_source == "paired_tail_risk"
+            value_batch = {}
+            if value_active:
+                for name in (
+                    "fallback_mode",
+                    "challenger_mode",
+                    "switch",
+                    "predicted_advantage",
+                    "fallback_score",
+                    "challenger_score",
+                    "fallback_safety_lower",
+                    "challenger_safety_lower",
+                    "score_mean",
+                    "score_std",
+                    "component_mean",
+                    "component_std",
+                    "component_predictions",
+                    "score_predictions",
+                ):
+                    key = f"value_selector_{name}"
+                    if key not in predictions:
+                        raise RuntimeError(f"Missing Stage-15 diagnostic: {key}")
+                    value_batch[name] = predictions[key]
+            paired_batch = {}
+            if paired_active:
+                for name in (
+                    "fallback", "selected_score", "event_probabilities",
+                    "fallback_score", "delta_prediction", "current_trajectory",
+                    "base_trajectory",
+                ):
+                    key = f"paired_risk_{name}"
+                    if key not in predictions:
+                        raise RuntimeError(f"Missing Stage-17 diagnostic: {key}")
+                    paired_batch[name] = predictions[key]
+                paired_batch["base_rewards"] = predictions["paired_base_rewards"]
+                paired_batch["base_valid"] = predictions["paired_base_valid"]
+                paired_batch["base_components"] = predictions["paired_base_components"]
             trust_batch = {}
             if trust_active:
                 trust_batch = extract_trust_batch(
@@ -343,6 +439,19 @@ def main() -> None:
                 1,
                 selected_idx[:, None, None].expand(-1, 1, len(COMPONENT_NAMES)),
             ).squeeze(1)
+            if paired_active:
+                base_selected = paired_batch["base_rewards"].gather(
+                    1, selected_idx[:, None]
+                ).squeeze(1)
+                base_selected_components = paired_batch["base_components"].gather(
+                    1,
+                    selected_idx[:, None, None].expand(-1, 1, len(COMPONENT_NAMES)),
+                ).squeeze(1)
+                fallback = paired_batch["fallback"].bool()
+                selected = torch.where(fallback, base_selected, selected)
+                selected_components = torch.where(
+                    fallback[:, None], base_selected_components, selected_components
+                )
             oracle_idx = rewards.masked_fill(~valid, float("-inf")).argmax(dim=-1)
             oracle = rewards.gather(1, oracle_idx[:, None]).squeeze(1)
             entropy = torch.distributions.Categorical(logits=logits).entropy()
@@ -351,7 +460,10 @@ def main() -> None:
             for row, token in enumerate(tokens):
                 mask = valid[row]
                 reward_np = rewards[row, mask].cpu().numpy()
-                logit_np = logits[row, mask].cpu().numpy()
+                diagnostic_logits = (
+                    value_batch["score_mean"] if value_active else logits
+                )
+                logit_np = diagnostic_logits[row, mask].cpu().numpy()
                 if np.ptp(reward_np) == 0 or np.ptp(logit_np) == 0:
                     correlation = 0.0
                 else:
@@ -391,6 +503,113 @@ def main() -> None:
                 }
                 for name, value in component_record.items():
                     component_values[name].append(value)
+                value_record = {}
+                if value_active:
+                    fallback_mode = int(value_batch["fallback_mode"][row].item())
+                    challenger_mode = int(value_batch["challenger_mode"][row].item())
+                    switched = bool(value_batch["switch"][row].item())
+                    switch_gain = float(
+                        rewards[row, challenger_mode].item()
+                        - rewards[row, fallback_mode].item()
+                    )
+                    value_switch_values.append(float(switched))
+                    value_switch_gain_values.append(switch_gain if switched else 0.0)
+                    value_record = {
+                        "value_selector": {
+                            "fallback_mode": fallback_mode,
+                            "challenger_mode": challenger_mode,
+                            "switched": switched,
+                            "true_challenger_minus_fallback": switch_gain,
+                            "fallback_components": components[
+                                row, fallback_mode
+                            ].detach().cpu().tolist(),
+                            "challenger_components": components[
+                                row, challenger_mode
+                            ].detach().cpu().tolist(),
+                            "predicted_advantage": float(
+                                value_batch["predicted_advantage"][row].item()
+                            ),
+                            "fallback_score": float(
+                                value_batch["fallback_score"][row].item()
+                            ),
+                            "challenger_score": float(
+                                value_batch["challenger_score"][row].item()
+                            ),
+                            "fallback_safety_lower": value_batch[
+                                "fallback_safety_lower"
+                            ][row].detach().cpu().tolist(),
+                            "challenger_safety_lower": value_batch[
+                                "challenger_safety_lower"
+                            ][row].detach().cpu().tolist(),
+                            "score_mean": value_batch["score_mean"][row]
+                            .detach().cpu().tolist(),
+                            "score_std": value_batch["score_std"][row]
+                            .detach().cpu().tolist(),
+                            "component_mean": value_batch["component_mean"][row]
+                            .detach().cpu().tolist(),
+                            "component_std": value_batch["component_std"][row]
+                            .detach().cpu().tolist(),
+                            "component_predictions": value_batch[
+                                "component_predictions"
+                            ][row].detach().cpu().tolist(),
+                            "score_predictions": value_batch[
+                                "score_predictions"
+                            ][row].detach().cpu().tolist(),
+                            "reference_logits": reference_logits[row]
+                            .detach().cpu().tolist(),
+                            "candidate_components": components[row]
+                            .detach().cpu().tolist(),
+                        }
+                    }
+                paired_record = {}
+                if paired_active:
+                    fallback_used = bool(paired_batch["fallback"][row].item())
+                    base_reward = float(base_selected[row].item())
+                    current_reward = float(rewards[row, selected_mode].item())
+                    paired_record = {
+                        "paired_risk": {
+                            "fallback": fallback_used,
+                            "threshold": float(args.paired_risk_threshold),
+                            "fallback_score": float(
+                                paired_batch["selected_score"][row].item()
+                            ),
+                            "event_probabilities": paired_batch[
+                                "event_probabilities"
+                            ][row, selected_mode].detach().cpu().tolist(),
+                            "event_probabilities_all": paired_batch[
+                                "event_probabilities"
+                            ][row].detach().cpu().tolist(),
+                            "delta_prediction": float(
+                                paired_batch["delta_prediction"][row, selected_mode].item()
+                            ),
+                            "current_reward": current_reward,
+                            "base_reward": base_reward,
+                            "true_current_minus_base": current_reward - base_reward,
+                            "current_components": components[
+                                row, selected_mode
+                            ].detach().cpu().tolist(),
+                            "base_components": paired_batch["base_components"][
+                                row, selected_mode
+                            ].detach().cpu().tolist(),
+                            "current_candidate_components": components[row]
+                            .detach().cpu().tolist(),
+                            "base_candidate_components": paired_batch[
+                                "base_components"
+                            ][row].detach().cpu().tolist(),
+                            "base_candidate_rewards": [
+                                float(paired_batch["base_rewards"][row, mode].item())
+                                if bool(paired_batch["base_valid"][row, mode])
+                                else None
+                                for mode in range(rewards.shape[1])
+                            ],
+                            "current_trajectory": paired_batch["current_trajectory"][
+                                row
+                            ].detach().cpu().tolist(),
+                            "base_trajectory": paired_batch["base_trajectory"][
+                                row
+                            ].detach().cpu().tolist(),
+                        }
+                    }
                 records.append(
                     {
                         "token": token,
@@ -405,9 +624,8 @@ def main() -> None:
                         "selector_margin": selector_margin,
                         "current_mode": current_mode,
                         "reference_mode": reference_mode,
-                        "selected_trajectory": trajectories[
-                            row, selected_mode
-                        ].detach().cpu().tolist(),
+                        "selected_trajectory": predictions["trajectory"][row]
+                        .detach().cpu().tolist(),
                         "selected_probability": float(
                             selector_probs[row, selected_mode].item()
                         ),
@@ -427,6 +645,8 @@ def main() -> None:
                         "diversity": diversity_value,
                         "reward_logit_spearman": correlation,
                         "selected_components": component_record,
+                        **value_record,
+                        **paired_record,
                         **(
                             {
                                 "generation_trust": {
@@ -451,7 +671,18 @@ def main() -> None:
         }
     summary = {
         "checkpoint": str(args.checkpoint),
+        "checkpoint_sha256": agent._checkpoint_sha256,
+        "reference_checkpoint": str(args.reference_checkpoint),
+        "reference_checkpoint_sha256": agent._reference_checkpoint_sha256,
+        "generation_policy_algorithm": args.generation_policy_algorithm,
+        "evaluation_noise_namespace": args.evaluation_noise_namespace,
+        "cache_path": str(args.cache_path),
+        "metric_cache_path": str(args.metric_cache_path),
+        "tokens_file": str(args.tokens_file),
+        "requested_limit": int(args.limit),
         "num_tokens": len(records),
+        "num_failures": 0,
+        "completed": len(records) == min(int(args.limit), len(dataset)),
         "log_split": args.log_split,
         "selector_logits_source": args.selector_logits_source,
         "schedule": agent._transfuser_model._trajectory_head.get_roll_schedule(),
@@ -474,6 +705,55 @@ def main() -> None:
             "\n".join(record["token"] for record in records).encode("utf-8")
         ).hexdigest(),
     }
+    if args.selector_logits_source == "value_top2":
+        switch_array = np.asarray(value_switch_values, dtype=bool)
+        gain_array = np.asarray(value_switch_gain_values, dtype=np.float64)
+        switched_gain = gain_array[switch_array]
+        summary["value_selector"] = {
+            "checkpoint": str(args.value_selector_checkpoint),
+            "checkpoint_sha256": agent._value_selector_checkpoint_sha256,
+            "calibration_margin": args.value_selector_calibration_margin,
+            "switch_count": int(switch_array.sum()),
+            "switch_rate": float(switch_array.mean()),
+            "switched_gain_mean": (
+                float(switched_gain.mean()) if switched_gain.size else 0.0
+            ),
+            "beneficial_switches": int((switched_gain > 0).sum()),
+            "neutral_switches": int((switched_gain == 0).sum()),
+            "harmful_switches": int((switched_gain < 0).sum()),
+            "beneficial_gain_sum": float(switched_gain[switched_gain > 0].sum()),
+            "harmful_loss_sum": float(-switched_gain[switched_gain < 0].sum()),
+            "worst_switch_gain": (
+                float(switched_gain.min()) if switched_gain.size else 0.0
+            ),
+        }
+    if args.selector_logits_source == "paired_tail_risk":
+        paired_records = [record["paired_risk"] for record in records]
+        fallback_array = np.asarray(
+            [record["fallback"] for record in paired_records], dtype=bool
+        )
+        delta_array = np.asarray(
+            [record["true_current_minus_base"] for record in paired_records],
+            dtype=np.float64,
+        )
+        tail_count = max(1, int(np.ceil(0.01 * delta_array.size)))
+        summary["paired_risk"] = {
+            "checkpoint": str(args.paired_risk_checkpoint),
+            "checkpoint_sha256": agent._paired_risk_checkpoint_sha256,
+            "calibration_path": str(args.paired_risk_calibration_path),
+            "threshold": float(args.paired_risk_threshold),
+            "fallback_count": int(fallback_array.sum()),
+            "fallback_rate": float(fallback_array.mean()),
+            "current_minus_base_mean": float(delta_array.mean()),
+            "current_minus_base_minimum": float(delta_array.min()),
+            "current_minus_base_bottom_1pct_cvar": float(
+                np.sort(delta_array)[:tail_count].mean()
+            ),
+            "catastrophic_current_count": int((delta_array <= -0.5).sum()),
+            "admitted_catastrophic_count": int(
+                ((~fallback_array) & (delta_array <= -0.5)).sum()
+            ),
+        }
     if args.collect_trust_calibration:
         for key in (
             "selected_reward",

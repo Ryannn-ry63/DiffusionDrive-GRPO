@@ -105,8 +105,28 @@ class TransfuserConfig:
     grpo_training_mode: str = "classification_shared"
     grpo_decoder_gradient_scope: str = "last_layer"
     # Deployment-only selector. Reference logits choose among current generator
-    # candidates and never participate in the training objective.
+    # candidates and never participate in the training objective. value_top2
+    # conservatively reranks only the frozen-reference selector's first two modes.
     inference_selector_source: str = "current"
+    value_selector_num_heads: int = 3
+    value_selector_top_k: int = 2
+    value_selector_pair_reward_gap: float = 0.01
+    value_selector_bootstrap_fraction: float = 0.8
+    value_selector_checkpoint_path: str = ""
+    value_selector_train_manifest_path: str = ""
+    value_selector_calibration_margin: float = -1.0
+    value_selector_safety_threshold: float = 0.9
+    value_selector_confidence_z: float = 1.64
+    paired_risk_checkpoint_path: str = ""
+    paired_risk_train_manifest_path: str = ""
+    paired_risk_validation_manifest_path: str = ""
+    paired_risk_calibration_path: str = ""
+    paired_risk_threshold: float = -1.0
+    paired_risk_positive_weights: Tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    paired_risk_selected_mode_weight: float = 4.0
+    paired_risk_delta_loss_weight: float = 0.25
+    paired_risk_expected_generator_sha256: str = ""
+    paired_risk_expected_reference_sha256: str = ""
     selection_temperature: float = 1.0
     selection_entropy_weight: float = 0.0
     selection_exploration_floor: float = 0.0
@@ -131,6 +151,13 @@ class TransfuserConfig:
     pdm_dense_weight: float = 0.1
     generation_policy_loss_weight: float = 1.0
     generation_kl_loss_weight: float = 0.1
+    generation_policy_algorithm: str = "legacy_ppo"
+    diffgrpo_bc_weight: float = 0.1
+    diffgrpo_step_discount: float = 0.6
+    diffgrpo_logprob_reduction: str = "mean"
+    diffgrpo_train_manifest_path: str = ""
+    diffgrpo_selected_mode_manifest_path: str = ""
+    diffgrpo_group_size: int = 8
     generation_adaptive_kl_enabled: bool = False
     generation_kl_initial_coefficient: float = 0.1
     generation_kl_min_coefficient: float = 0.1
@@ -145,7 +172,8 @@ class TransfuserConfig:
     generation_kl_hard_limit_patience: int = 2
     grpo_decoder_layer0_lr_mult: float = 1.0
     # group_zscore/reference_centered use K=1; within_anchor/hierarchical use
-    # K=2; anchor_hierarchical supports K=2 or K=4; anchor_rloo requires K=2.
+    # K=2; collision_truncated_intra_anchor also requires K=2;
+    # anchor_hierarchical supports K=2 or K=4; anchor_rloo requires K=2.
     generation_advantage_mode: str = "group_zscore"
     reference_advantage_margin: float = 0.01
     reference_advantage_scale: float = 0.10
@@ -165,6 +193,7 @@ class TransfuserConfig:
     generation_trust_calibration_path: str = ""
     generation_trust_collect_calibration: bool = False
     generation_trust_calibration_seed: int = 20260719
+    evaluation_noise_namespace: int = -1
     # Stage-0 audited schedule: the noise timestep matches the first DDIM step.
     diffusion_truncation_timestep: int = 8
     diffusion_roll_timesteps: Tuple[int, ...] = (8, 0)

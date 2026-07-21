@@ -12,7 +12,9 @@ from torch import nn
 
 TRUST_PROJECTION_FORMULA_VERSION = "reference_mean_ball_v1"
 TRUST_PROJECTION_POST_TOLERANCE = 1e-6
-INFERENCE_SELECTOR_SOURCES = ("current", "reference")
+INFERENCE_SELECTOR_SOURCES = (
+    "current", "reference", "value_top2", "paired_tail_risk"
+)
 
 
 def validate_inference_selector_source(source: str) -> str:
@@ -20,7 +22,8 @@ def validate_inference_selector_source(source: str) -> str:
     source = str(source)
     if source not in INFERENCE_SELECTOR_SOURCES:
         raise ValueError(
-            "inference_selector_source must be 'current' or 'reference'; "
+            "inference_selector_source must be current, reference, value_top2, "
+            "or paired_tail_risk; "
             f"got {source!r}"
         )
     return source
@@ -33,6 +36,11 @@ def select_inference_mode(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return the deployed mode and logits without touching candidate trajectories."""
     source = validate_inference_selector_source(source)
+    if source in {"value_top2", "paired_tail_risk"}:
+        raise ValueError(
+            f"{source} requires trajectory-conditioned predictions and must be "
+            "resolved by TrajectoryHead"
+        )
     if current_logits.ndim != 2:
         raise ValueError("selector logits must have shape [batch, modes]")
     if source == "reference":
@@ -529,6 +537,21 @@ def diagonal_gaussian_log_prob(
     return log_prob.flatten(start_dim=2).sum(dim=-1)
 
 
+def diagonal_gaussian_log_prob_mean(
+    value: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> torch.Tensor:
+    """Return a dimension-normalized log probability per [batch, mode]."""
+    std = torch.as_tensor(std, device=mean.device, dtype=mean.dtype)
+    if torch.any(std <= 0):
+        raise ValueError("Gaussian standard deviation must be positive")
+    log_prob = -0.5 * (
+        ((value - mean) / std).square() + 2.0 * std.log() + math.log(2.0 * math.pi)
+    )
+    return log_prob.flatten(start_dim=2).mean(dim=-1)
+
+
 def diagonal_gaussian_kl_same_std(
     mean: torch.Tensor,
     reference_mean: torch.Tensor,
@@ -614,6 +637,252 @@ def _decode_policy_step(
         global_img,
     )
     return regression[-1], classification[-1]
+
+
+@torch.no_grad()
+def _sample_full_chain_actions(
+    head,
+    policy,
+    initial_sample,
+    ego_query,
+    agents_query,
+    bev_feature,
+    bev_spatial_shape,
+    status_encoding,
+    global_img,
+):
+    """Sample and detach one complete Stage-16 denoising action chain."""
+    timesteps = tuple(int(t) for t in head._roll_timesteps)
+    if len(timesteps) < 2 or timesteps[-1] != 0:
+        raise ValueError("full-chain DiffGRPO requires at least two steps ending at 0")
+    scheduler = head.diffusion_scheduler
+    scheduler.set_timesteps(head._scheduler_num_inference_steps, initial_sample.device)
+    states = []
+    actions = []
+    sample = initial_sample.detach()
+    for timestep in timesteps[:-1]:
+        states.append(sample)
+        regression, _ = _decode_policy_step(
+            head, policy, sample, timestep, ego_query, agents_query,
+            bev_feature, bev_spatial_shape, status_encoding, global_img,
+        )
+        action, _, _, _ = ddim_transition_with_log_prob(
+            scheduler,
+            head.norm_odo(regression[..., :2]),
+            timestep,
+            sample,
+            eta=head._generation_ddim_eta,
+            sigma_min=head._generation_sigma_min,
+        )
+        sample = action.detach()
+        actions.append(sample)
+
+    states.append(sample)
+    final_regression, final_classification = _decode_policy_step(
+        head, policy, sample, timesteps[-1], ego_query, agents_query,
+        bev_feature, bev_spatial_shape, status_encoding, global_img,
+    )
+    final_mean = head.norm_odo(final_regression)
+    final_std = final_mean.new_tensor(head._generation_final_std)
+    final_action = (final_mean + final_std * torch.randn_like(final_mean)).detach()
+    actions.append(final_action)
+    return tuple(states), tuple(actions), final_action, final_classification.detach()
+
+
+def _replay_full_chain_actions(
+    head,
+    policy,
+    states,
+    actions,
+    ego_query,
+    agents_query,
+    bev_feature,
+    bev_spatial_shape,
+    status_encoding,
+    global_img,
+):
+    """Evaluate a detached full chain under one policy with mean log-probability."""
+    timesteps = tuple(int(t) for t in head._roll_timesteps)
+    if len(states) != len(timesteps) or len(actions) != len(timesteps):
+        raise ValueError("full-chain replay state/action count does not match schedule")
+    scheduler = head.diffusion_scheduler
+    scheduler.set_timesteps(head._scheduler_num_inference_steps, states[0].device)
+    log_probs = []
+    final_classification = None
+    for index, timestep in enumerate(timesteps):
+        regression, classification = _decode_policy_step(
+            head, policy, states[index], timestep, ego_query, agents_query,
+            bev_feature, bev_spatial_shape, status_encoding, global_img,
+        )
+        if index < len(timesteps) - 1:
+            _, _, mean, std = ddim_transition_with_log_prob(
+                scheduler,
+                head.norm_odo(regression[..., :2]),
+                timestep,
+                states[index],
+                eta=head._generation_ddim_eta,
+                action=actions[index],
+                sigma_min=head._generation_sigma_min,
+            )
+            log_prob = diagonal_gaussian_log_prob_mean(actions[index], mean, std)
+        else:
+            mean = head.norm_odo(regression)
+            std = mean.new_tensor(head._generation_final_std)
+            log_prob = diagonal_gaussian_log_prob_mean(actions[index], mean, std)
+            final_classification = classification
+        log_probs.append(log_prob)
+    if final_classification is None:
+        raise RuntimeError("full-chain replay produced no final classification logits")
+    return torch.stack(log_probs, dim=-1), final_classification
+
+
+def collect_full_chain_diffgrpo_trace(
+    head,
+    initial_sample,
+    ego_query,
+    agents_query,
+    bev_feature,
+    bev_spatial_shape,
+    status_encoding,
+    global_img,
+):
+    """Collect on-policy actions and frozen-reference teacher actions for Stage 16."""
+    if head.ref_policy is None:
+        raise RuntimeError("full-chain DiffGRPO requires a frozen reference policy")
+    if head._generation_trust_projection_mode != "none":
+        raise ValueError("full-chain DiffGRPO does not support trust projection")
+
+    behavior_states, behavior_actions, final_action, _ = _sample_full_chain_actions(
+        head, head.diff_decoder, initial_sample, ego_query, agents_query,
+        bev_feature, bev_spatial_shape, status_encoding, global_img,
+    )
+    current_log_probs, current_cls = _replay_full_chain_actions(
+        head, head.diff_decoder, behavior_states, behavior_actions,
+        ego_query, agents_query, bev_feature, bev_spatial_shape,
+        status_encoding, global_img,
+    )
+    with torch.no_grad():
+        _, reference_cls = _replay_full_chain_actions(
+            head, head.ref_policy, behavior_states, behavior_actions,
+            ego_query, agents_query, bev_feature, bev_spatial_shape,
+            status_encoding, global_img,
+        )
+        teacher_states, teacher_actions, _, _ = _sample_full_chain_actions(
+            head, head.ref_policy, initial_sample, ego_query, agents_query,
+            bev_feature, bev_spatial_shape, status_encoding, global_img,
+        )
+    bc_log_probs, _ = _replay_full_chain_actions(
+        head, head.diff_decoder, teacher_states, teacher_actions,
+        ego_query, agents_query, bev_feature, bev_spatial_shape,
+        status_encoding, global_img,
+    )
+    if not torch.isfinite(current_log_probs).all() or not torch.isfinite(bc_log_probs).all():
+        raise FloatingPointError("full-chain DiffGRPO produced non-finite log probabilities")
+    return {
+        "trajectories": head.denorm_odo(final_action),
+        "current_log_probs": current_log_probs,
+        "bc_log_probs": bc_log_probs,
+        "current_cls": current_cls,
+        "reference_cls": reference_cls,
+        "num_denoising_steps": current_log_probs.new_tensor(
+            float(current_log_probs.shape[-1])
+        ),
+    }
+
+
+def collect_selected_anchor_diffgrpo_trace(
+    head,
+    selected_clean_sample,
+    selected_modes,
+    group_size,
+    ego_query,
+    agents_query,
+    bev_feature,
+    bev_spatial_shape,
+    status_encoding,
+    global_img,
+):
+    """Collect G same-anchor rollouts and one frozen-base BC teacher chain."""
+    if head.ref_policy is None:
+        raise RuntimeError("selected-anchor DiffGRPO requires a frozen reference policy")
+    if selected_clean_sample.ndim != 4 or selected_clean_sample.shape[1] != 1:
+        raise ValueError("selected clean sample must have shape [B,1,T,D]")
+    if selected_modes.shape != (selected_clean_sample.shape[0],):
+        raise ValueError("selected modes must have shape [B]")
+    if int(group_size) != 8:
+        raise ValueError("Stage19 selected-anchor group size must be 8")
+    if head._generation_trust_projection_mode != "none":
+        raise ValueError("selected-anchor DiffGRPO does not support trust projection")
+
+    batch_size = selected_clean_sample.shape[0]
+    scheduler = head.diffusion_scheduler
+    timesteps = torch.full(
+        (batch_size,),
+        int(head._truncation_timestep),
+        device=selected_clean_sample.device,
+        dtype=torch.long,
+    )
+    clean_group = selected_clean_sample.expand(
+        -1, int(group_size), -1, -1
+    ).contiguous()
+    behavior_initial = scheduler.add_noise(
+        original_samples=clean_group,
+        noise=torch.randn_like(clean_group),
+        timesteps=timesteps,
+    ).detach()
+    behavior_states, behavior_actions, final_action, _ = (
+        _sample_full_chain_actions(
+            head, head.diff_decoder, behavior_initial, ego_query, agents_query,
+            bev_feature, bev_spatial_shape, status_encoding, global_img,
+        )
+    )
+    current_log_probs, current_cls = _replay_full_chain_actions(
+        head, head.diff_decoder, behavior_states, behavior_actions,
+        ego_query, agents_query, bev_feature, bev_spatial_shape,
+        status_encoding, global_img,
+    )
+    with torch.no_grad():
+        _, reference_cls = _replay_full_chain_actions(
+            head, head.ref_policy, behavior_states, behavior_actions,
+            ego_query, agents_query, bev_feature, bev_spatial_shape,
+            status_encoding, global_img,
+        )
+        teacher_initial = scheduler.add_noise(
+            original_samples=selected_clean_sample,
+            noise=torch.randn_like(selected_clean_sample),
+            timesteps=timesteps,
+        ).detach()
+        teacher_states, teacher_actions, _, _ = _sample_full_chain_actions(
+            head, head.ref_policy, teacher_initial, ego_query, agents_query,
+            bev_feature, bev_spatial_shape, status_encoding, global_img,
+        )
+    bc_log_probs, _ = _replay_full_chain_actions(
+        head, head.diff_decoder, teacher_states, teacher_actions,
+        ego_query, agents_query, bev_feature, bev_spatial_shape,
+        status_encoding, global_img,
+    )
+    if current_log_probs.shape[:2] != (batch_size, int(group_size)):
+        raise RuntimeError("selected-anchor current rollout group shape drifted")
+    if bc_log_probs.shape[:2] != (batch_size, 1):
+        raise RuntimeError("selected-anchor BC teacher must have one chain per scene")
+    if not torch.isfinite(current_log_probs).all() or not torch.isfinite(
+        bc_log_probs
+    ).all():
+        raise FloatingPointError(
+            "selected-anchor DiffGRPO produced non-finite log probabilities"
+        )
+    return {
+        "trajectories": head.denorm_odo(final_action),
+        "current_log_probs": current_log_probs,
+        "bc_log_probs": bc_log_probs,
+        "current_cls": current_cls,
+        "reference_cls": reference_cls,
+        "selected_anchor_modes": selected_modes.detach(),
+        "group_size": current_log_probs.new_tensor(float(group_size)),
+        "num_denoising_steps": current_log_probs.new_tensor(
+            float(current_log_probs.shape[-1])
+        ),
+    }
 
 
 def _collect_generation_trace_legacy(

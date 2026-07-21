@@ -169,6 +169,129 @@ def main(cfg: DictConfig) -> None:
         assert len(train_data) > 0, "No training token overlaps metric_cache_path!"
         assert len(val_data) > 0, "No validation token overlaps metric_cache_path!"
 
+    value_manifest_path = str(
+        getattr(agent_config, "value_selector_train_manifest_path", "")
+    )
+    if str(getattr(agent_config, "grpo_training_mode", "")) == "value_selector":
+        if not value_manifest_path:
+            raise ValueError(
+                "value_selector training requires value_selector_train_manifest_path"
+            )
+        value_token_list = load_manifest_tokens(Path(value_manifest_path))
+        value_tokens = set(value_token_list)
+        available_tokens = set(train_data.tokens)
+        missing_tokens = sorted(value_tokens - available_tokens)
+        if missing_tokens:
+            raise RuntimeError(
+                f"Value-selector manifest has {len(missing_tokens)} unavailable tokens; "
+                f"first={missing_tokens[0]}"
+            )
+        train_data.tokens = [
+            token for token in train_data.tokens if token in value_tokens
+        ]
+        if len(train_data.tokens) != len(value_token_list):
+            raise RuntimeError("Value-selector manifest filtering changed token count")
+        logger.info(
+            "Stage-15 selector manifest: %d training tokens from %s",
+            len(train_data.tokens), value_manifest_path,
+        )
+    elif value_manifest_path:
+        raise ValueError(
+            "value_selector_train_manifest_path is valid only in value_selector mode"
+        )
+
+    diffgrpo_manifest_path = str(
+        getattr(agent_config, "diffgrpo_train_manifest_path", "")
+    )
+    if diffgrpo_manifest_path:
+        if str(getattr(agent_config, "grpo_training_mode", "")) != "diffgrpo_full_chain":
+            raise ValueError(
+                "diffgrpo_train_manifest_path is valid only in diffgrpo_full_chain mode"
+            )
+        diffgrpo_token_list = load_manifest_tokens(Path(diffgrpo_manifest_path))
+        diffgrpo_tokens = set(diffgrpo_token_list)
+        available_tokens = set(train_data.tokens)
+        missing_tokens = sorted(diffgrpo_tokens - available_tokens)
+        if missing_tokens:
+            raise RuntimeError(
+                f"Stage-16 manifest has {len(missing_tokens)} unavailable tokens; "
+                f"first={missing_tokens[0]}"
+            )
+        train_data.tokens = [
+            token for token in train_data.tokens if token in diffgrpo_tokens
+        ]
+        if len(train_data.tokens) != len(diffgrpo_token_list):
+            raise RuntimeError("Stage-16 manifest filtering changed token count")
+        logger.info(
+            "Stage-16 DiffGRPO manifest: %d training tokens from %s",
+            len(train_data.tokens), diffgrpo_manifest_path,
+        )
+
+    selected_anchor_manifest_path = str(
+        getattr(agent_config, "diffgrpo_selected_mode_manifest_path", "")
+    )
+    selected_anchor_training = (
+        str(getattr(agent_config, "grpo_training_mode", ""))
+        == "diffgrpo_selected_anchor"
+    )
+    if selected_anchor_training:
+        if not selected_anchor_manifest_path:
+            raise ValueError(
+                "selected-anchor training requires its selected-mode manifest"
+            )
+        selected_tokens = load_manifest_tokens(
+            Path(selected_anchor_manifest_path)
+        )
+        selected_token_set = set(selected_tokens)
+        available_tokens = set(train_data.tokens)
+        missing_tokens = sorted(selected_token_set - available_tokens)
+        if missing_tokens:
+            raise RuntimeError(
+                f"Stage19 manifest has {len(missing_tokens)} unavailable tokens; "
+                f"first={missing_tokens[0]}"
+            )
+        train_data.tokens = [
+            token for token in train_data.tokens if token in selected_token_set
+        ]
+        if len(train_data.tokens) != len(selected_tokens):
+            raise RuntimeError("Stage19 manifest filtering changed token count")
+        logger.info(
+            "Stage19 selected-anchor manifest: %d training tokens from %s",
+            len(train_data.tokens), selected_anchor_manifest_path,
+        )
+    elif selected_anchor_manifest_path:
+        raise ValueError(
+            "diffgrpo_selected_mode_manifest_path is valid only in Stage19 mode"
+        )
+
+    paired_risk_manifest_path = str(
+        getattr(agent_config, "paired_risk_train_manifest_path", "")
+    )
+    if paired_risk_manifest_path:
+        if str(getattr(agent_config, "grpo_training_mode", "")) != "paired_tail_risk_selector":
+            raise ValueError(
+                "paired_risk_train_manifest_path is valid only in paired-risk mode"
+            )
+        paired_token_list = load_manifest_tokens(Path(paired_risk_manifest_path))
+        paired_tokens = set(paired_token_list)
+        missing_tokens = sorted(paired_tokens - set(train_data.tokens))
+        if missing_tokens:
+            raise RuntimeError(
+                f"Stage-17 manifest has {len(missing_tokens)} unavailable tokens; "
+                f"first={missing_tokens[0]}"
+            )
+        train_data.tokens = [
+            token for token in train_data.tokens if token in paired_tokens
+        ]
+        if len(train_data.tokens) != len(paired_token_list):
+            raise RuntimeError("Stage-17 manifest filtering changed token count")
+        logger.info(
+            "Stage-17 paired-risk manifest: %d training tokens from %s",
+            len(train_data.tokens), paired_risk_manifest_path,
+        )
+    elif str(getattr(agent_config, "grpo_training_mode", "")) == "paired_tail_risk_selector":
+        raise ValueError("paired-risk training requires paired_risk_train_manifest_path")
+
     logger.info("Building Datasets")
     priority_manifest_path = str(
         getattr(agent_config, "grpo_priority_manifest_path", "")
