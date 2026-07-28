@@ -53,7 +53,7 @@ class GridSampleCrossBEVAttention(nn.Module):
 
 
         self.value_proj = nn.Sequential(
-            nn.Conv2d(in_bev_dims, 256, kernel_size=(3, 3), stride=(1, 1), padding=1,bias=True),
+            nn.Conv2d(in_bev_dims, embed_dims, kernel_size=(3, 3), stride=(1, 1), padding=1,bias=True),
             nn.ReLU(inplace=True),
         )
 

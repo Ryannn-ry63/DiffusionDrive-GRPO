@@ -29,7 +29,12 @@ from navsim.agents.diffusiondrive.diffusion_grpo import (
     diagonal_gaussian_kl_same_std,
     _decode_policy_step,
     collect_full_chain_diffgrpo_trace,
+    collect_paired_residual_diffgrpo_trace,
     collect_selected_anchor_diffgrpo_trace,
+    collect_selected_set_diffgrpo_trace,
+    collect_deployed_selected_set_diffgrpo_trace,
+    collect_selector_aware_frontier_diffgrpo_trace,
+    collect_mode_coverage_diffgrpo_trace,
     collect_generation_trace,
     compute_pdm_dense_rewards,
     compute_pdm_tiebreak_rewards,
@@ -48,9 +53,42 @@ from navsim.agents.diffusiondrive.trajectory_value_selector import (
     deterministic_bootstrap_mask,
     select_conservative_top2,
 )
+from navsim.agents.diffusiondrive.stage23_trajectory_selector import (
+    Stage23TrajectorySelector,
+    load_stage23_candidate_banks,
+    load_stage23_token_log_map,
+    member_training_mask,
+    select_stage23_trajectory,
+)
+from navsim.agents.diffusiondrive.stage24_safety_value_selector import (
+    Stage24SafetyValueSelector,
+    compute_stage24_positive_weights,
+    load_stage24_candidate_banks,
+    load_stage24_token_log_map,
+    select_stage24_trajectory,
+    stage24_member_training_mask,
+)
+from navsim.agents.diffusiondrive.stage25_relative_harm_selector import (
+    Stage25RelativeHarmSelector,
+    compute_stage25_positive_weights,
+    select_stage25_trajectory,
+)
 from navsim.agents.diffusiondrive.paired_advantage_risk import (
     PairedAdvantageRiskHead,
     select_same_mode_with_base_fallback,
+)
+from navsim.agents.diffusiondrive.stage30_mode_coverage import (
+    load_stage30_bucket_manifest,
+)
+from navsim.agents.diffusiondrive.stage34_trace import (
+    build_stage34_trace_diagnostics,
+)
+from navsim.agents.diffusiondrive.stage35_nested_trace import (
+    collect_nested_counterfactual_deployment_trace,
+)
+from navsim.agents.diffusiondrive.stage36_trace import (
+    collect_stage36_sampling_trace,
+    finalize_stage36_reward_dependent_replay,
 )
 
 from navsim.common.dataclasses import Trajectory
@@ -75,6 +113,58 @@ STAGE19_FULL_SCHEDULE = {
     "scheduler_step_stride": 8,
     "transitions": [[32, 24], [24, 16], [16, 8], [8, 0], [0, -8]],
 }
+SELECTED_SET_TRAINING_MODES = {
+    "diffgrpo_selected_set",
+    "stage27_public_diffgrpo_selected_set",
+    "stage28_public_paired_uplift_multi",
+    "stage28_public_paired_uplift_explore",
+    "stage29_public_headroom_hybrid",
+    "stage29_public_headroom_conditional",
+}
+MODE_COVERAGE_TRAINING_MODES = {
+    "stage30_public_mode_coverage",
+    "stage30_public_mode_coverage_constrained",
+}
+DEPLOYED_SET_TRAINING_MODES = {
+    "stage31_public_deployed_pair",
+    "stage31_public_deployed_frontier",
+    "stage32_public_deployed_extended",
+    # Stage33 CDC pilot reuses the selected-set common-noise trace until the
+    # candidate-level collector is enabled by its manifest.
+    "stage33_cdc_grpo",
+}
+STAGE32_FRONTIER_TRAINING_MODES = {
+    "stage32_selector_aware_frontier",
+}
+STAGE34_MODE_ALIGNED_TRAINING_MODES = {
+    "stage34_mode_aligned_frontier_grpo",
+}
+STAGE35_NCD_TRAINING_MODES = {
+    "stage35_nested_counterfactual_deployment_grpo",
+}
+STAGE36_RGT_NCD_TRAINING_MODES = {
+    "stage36_reference_gated_tail_ncd_grpo",
+}
+
+def resolve_mode_coverage_bucket_manifest(config, training_mode: str):
+    """Resolve the frozen bucket manifest owned by the active training stage."""
+    if training_mode in STAGE36_RGT_NCD_TRAINING_MODES:
+        stage = "Stage36"
+        path = str(getattr(config, "stage36_bucket_manifest_path", ""))
+    elif training_mode in STAGE35_NCD_TRAINING_MODES:
+        stage = "Stage35"
+        path = str(getattr(config, "stage35_bucket_manifest_path", ""))
+    elif training_mode in STAGE34_MODE_ALIGNED_TRAINING_MODES:
+        stage = "Stage34"
+        path = str(getattr(config, "stage34_bucket_manifest_path", ""))
+    else:
+        stage = "Stage30"
+        path = str(getattr(config, "stage30_bucket_manifest_path", ""))
+    if not path:
+        raise ValueError(f"{stage} requires its frozen bucket manifest")
+    return stage, path
+
+
 
 
 def load_selected_anchor_modes(path: str, expected_group_size: int) -> Dict[str, int]:
@@ -102,6 +192,117 @@ def load_selected_anchor_modes(path: str, expected_group_size: int) -> Dict[str,
         if token in result or mode < 0 or mode >= 20:
             raise RuntimeError(f"invalid Stage19 selected-mode record: {token}")
         result[token] = mode
+    return result
+
+
+def load_base_preserve_manifest(path: str, expected_group_size: int) -> Dict[str, Dict[str, Any]]:
+    """Load the fail-closed Stage21 base-relative training metadata."""
+    manifest_path = Path(path)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Stage21 base-preserve manifest missing: {path}")
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    summary = payload.get("summary", {})
+    expected = {
+        "base_checkpoint_sha256": STAGE19_BASE_SHA256,
+        "schedule": STAGE19_FULL_SCHEDULE,
+        "group_definition": "same_token_same_selected_anchor",
+        "group_size": int(expected_group_size),
+        "stage21_objective": "base_anchored_log_robust_v1",
+        "base_noise_namespaces": [-1, 20260728],
+    }
+    for key, wanted in expected.items():
+        if summary.get(key) != wanted:
+            raise RuntimeError(
+                f"Stage21 manifest {key} mismatch: {summary.get(key)!r} != {wanted!r}"
+            )
+    records = payload.get("records")
+    if not isinstance(records, list) or not records:
+        raise RuntimeError("Stage21 manifest has no records")
+    result: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        token = str(record["token"])
+        mode = int(record["selected_mode"])
+        base_reward = float(record["base_reward_mean"])
+        base_safety = tuple(
+            float(record[name])
+            for name in (
+                "base_collision_mean",
+                "base_drivable_mean",
+                "base_ttc_mean",
+            )
+        )
+        scene_weight = float(record["scene_weight"])
+        bc_weight = float(record["bc_weight"])
+        finite = all(
+            math.isfinite(value)
+            for value in (base_reward, *base_safety, scene_weight, bc_weight)
+        )
+        if (
+            token in result
+            or mode < 0
+            or mode >= 20
+            or not finite
+            or not 0.0 <= base_reward <= 1.0
+            or any(not 0.0 <= value <= 1.0 for value in base_safety)
+            or not 0.25 <= scene_weight <= 4.0
+            or not 0.1 <= bc_weight <= 0.3
+        ):
+            raise RuntimeError(f"invalid Stage21 base-preserve record: {token}")
+        result[token] = {
+            "selected_mode": mode,
+            "base_reward": base_reward,
+            "base_safety": base_safety,
+            "scene_weight": scene_weight,
+            "bc_weight": bc_weight,
+        }
+    return result
+
+
+def load_paired_residual_manifest(
+    path: str, expected_group_size: int
+) -> Dict[str, Dict[str, Any]]:
+    """Load fail-closed Stage22 selected anchors and inverse-log weights."""
+    manifest_path = Path(path)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Stage22 paired-residual manifest missing: {path}")
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    summary = payload.get("summary", {})
+    expected = {
+        "base_checkpoint_sha256": STAGE19_BASE_SHA256,
+        "schedule": STAGE19_FULL_SCHEDULE,
+        "group_definition": "same_token_same_selected_anchor_common_random",
+        "group_size": int(expected_group_size),
+        "stage22_objective": "paired_delta_bootstrap_exact_kl_lora_v2",
+        "scene_weight_definition": "inverse_log_frequency_clip_0.5_2_unit_mean",
+    }
+    for key, wanted in expected.items():
+        if summary.get(key) != wanted:
+            raise RuntimeError(
+                f"Stage22 manifest {key} mismatch: {summary.get(key)!r} != {wanted!r}"
+            )
+    records = payload.get("records")
+    if not isinstance(records, list) or not records:
+        raise RuntimeError("Stage22 manifest has no records")
+    result: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        token = str(record["token"])
+        mode = int(record["selected_mode"])
+        scene_weight = float(record["scene_weight"])
+        if (
+            token in result
+            or mode < 0
+            or mode >= 20
+            or not math.isfinite(scene_weight)
+            or not 0.5 <= scene_weight <= 2.0
+        ):
+            raise RuntimeError(f"invalid Stage22 paired-residual record: {token}")
+        result[token] = {
+            "selected_mode": mode,
+            "scene_weight": scene_weight,
+        }
+    mean_weight = sum(item["scene_weight"] for item in result.values()) / len(result)
+    if not math.isclose(mean_weight, 1.0, rel_tol=0.0, abs_tol=1e-6):
+        raise RuntimeError(f"Stage22 scene weights are not unit mean: {mean_weight}")
     return result
 
 
@@ -553,6 +754,36 @@ class TrajectoryHead(nn.Module):
         self.register_buffer(
             "_value_selector_training_updates", torch.tensor(0, dtype=torch.long)
         )
+        self.stage23_selector = Stage23TrajectorySelector(config)
+        self.register_buffer(
+            "_stage23_selector_training_updates", torch.tensor(0, dtype=torch.long)
+        )
+        self.stage24_selector = Stage24SafetyValueSelector(config)
+        self.register_buffer(
+            "_stage24_selector_training_updates", torch.tensor(0, dtype=torch.long)
+        )
+        self.register_buffer(
+            "_stage24_ood_mean", torch.zeros(self.stage24_selector.selector_dim)
+        )
+        self.register_buffer(
+            "_stage24_ood_variance", torch.ones(self.stage24_selector.selector_dim)
+        )
+        self.register_buffer(
+            "_stage24_calibration_loaded", torch.tensor(False, dtype=torch.bool)
+        )
+        self.register_buffer(
+            "_stage24_embedding_count", torch.tensor(0, dtype=torch.long)
+        )
+        self.register_buffer(
+            "_stage24_embedding_sum", torch.zeros(self.stage24_selector.selector_dim, dtype=torch.float64)
+        )
+        self.register_buffer(
+            "_stage24_embedding_sum_sq", torch.zeros(self.stage24_selector.selector_dim, dtype=torch.float64)
+        )
+        self.stage25_selector = Stage25RelativeHarmSelector(config)
+        self.register_buffer(
+            "_stage25_selector_training_updates", torch.tensor(0, dtype=torch.long)
+        )
         # Optional adapters must not perturb legacy decoder/training RNG streams.
         with torch.random.fork_rng(devices=[]):
             self.paired_risk_head = PairedAdvantageRiskHead(config)
@@ -596,11 +827,21 @@ class TrajectoryHead(nn.Module):
             getattr(config, "generation_policy_algorithm", "legacy_ppo")
         )
         if self._generation_policy_algorithm not in {
-            "legacy_ppo", "diffgrpo_full_chain", "diffgrpo_selected_anchor"
+            "legacy_ppo", "diffgrpo_full_chain", "diffgrpo_selected_anchor",
+            "diffgrpo_selected_anchor_base_preserve", "diffgrpo_paired_residual",
+            "diffgrpo_selected_set", "diffgrpo_mode_coverage",
+            "diffgrpo_deployed_selected_set", "diffgrpo_mode_aligned_frontier",
+            "diffgrpo_nested_counterfactual_deployment",
+            "diffgrpo_reference_gated_tail_ncd",
         }:
             raise ValueError(
                 "generation_policy_algorithm must be legacy_ppo, "
-                "diffgrpo_full_chain, or diffgrpo_selected_anchor"
+                "diffgrpo_full_chain, diffgrpo_selected_anchor, or "
+                "diffgrpo_selected_anchor_base_preserve/diffgrpo_paired_residual, "
+                "or diffgrpo_selected_set/diffgrpo_mode_coverage/"
+                "diffgrpo_deployed_selected_set/diffgrpo_mode_aligned_frontier"
+                "/diffgrpo_nested_counterfactual_deployment"
+                "/diffgrpo_reference_gated_tail_ncd"
             )
         self._diffgrpo_bc_weight = float(getattr(config, "diffgrpo_bc_weight", 0.1))
         self._diffgrpo_step_discount = float(
@@ -719,6 +960,59 @@ class TrajectoryHead(nn.Module):
             getattr(config, "diffgrpo_group_size", 8)
         )
         self._selected_anchor_modes = {}
+        self._base_preserve_metadata = {}
+        self._paired_residual_metadata = {}
+        self._stage30_bucket_by_token = {}
+        self._stage23_token_logs = {}
+        self._stage23_candidate_bank = {}
+        stage23_manifest = str(
+            getattr(config, "stage23_selector_train_manifest_path", "")
+        )
+        if self._grpo_training_mode == "stage23_selector":
+            if not stage23_manifest:
+                raise ValueError("stage23_selector requires its train manifest")
+            self._stage23_token_logs = load_stage23_token_log_map(stage23_manifest)
+            bank_paths = tuple(getattr(config, "stage23_candidate_bank_paths", ()))
+            self._stage23_candidate_bank = load_stage23_candidate_banks(
+                bank_paths, STAGE19_BASE_SHA256
+            )
+            if set(self._stage23_candidate_bank) != set(self._stage23_token_logs):
+                raise RuntimeError(
+                    "Stage23 candidate-bank tokens differ from the fit manifest"
+                )
+        self._stage24_token_logs = {}
+        self._stage24_candidate_bank = {}
+        self._stage24_bank_combinations = ()
+        self._stage24_positive_weights = ((1.0, 1.0, 1.0), 1.0)
+        self._stage25_positive_weights = (1.0, 1.0, 1.0, 1.0)
+        stage24_manifest = str(
+            getattr(config, "stage24_selector_train_manifest_path", "")
+        )
+        if self._grpo_training_mode in {
+            "stage24_selector", "stage25_relative_harm_selector"
+        }:
+            if not stage24_manifest:
+                raise ValueError("stage24_selector requires its train manifest")
+            self._stage24_token_logs = load_stage24_token_log_map(stage24_manifest)
+            bank_paths = tuple(getattr(config, "stage24_candidate_bank_paths", ()))
+            (
+                self._stage24_candidate_bank,
+                self._stage24_bank_combinations,
+            ) = load_stage24_candidate_banks(
+                bank_paths, tuple(self._stage24_token_logs)
+            )
+            if set(self._stage24_candidate_bank) != set(self._stage24_token_logs):
+                raise RuntimeError(
+                    "Stage24 candidate-bank tokens differ from the train manifest"
+                )
+            self._stage24_positive_weights = compute_stage24_positive_weights(
+                self._stage24_candidate_bank
+            )
+            self._stage25_positive_weights = compute_stage25_positive_weights(
+                self._stage24_candidate_bank
+            )
+            if int(getattr(config, "stage24_selector_steps_per_epoch", 0)) <= 0:
+                raise ValueError("Stage24 requires positive steps_per_epoch")
         selected_mode_manifest = str(
             getattr(config, "diffgrpo_selected_mode_manifest_path", "")
         )
@@ -726,6 +1020,33 @@ class TrajectoryHead(nn.Module):
             self._selected_anchor_modes = load_selected_anchor_modes(
                 selected_mode_manifest, self._diffgrpo_group_size
             )
+        elif self._grpo_training_mode == "diffgrpo_selected_anchor_base_preserve":
+            self._base_preserve_metadata = load_base_preserve_manifest(
+                selected_mode_manifest, self._diffgrpo_group_size
+            )
+            self._selected_anchor_modes = {
+                token: int(metadata["selected_mode"])
+                for token, metadata in self._base_preserve_metadata.items()
+            }
+        elif self._grpo_training_mode == "diffgrpo_paired_residual":
+            self._paired_residual_metadata = load_paired_residual_manifest(
+                selected_mode_manifest, self._diffgrpo_group_size
+            )
+            self._selected_anchor_modes = {
+                token: int(metadata["selected_mode"])
+                for token, metadata in self._paired_residual_metadata.items()
+            }
+        if self._grpo_training_mode in (
+            MODE_COVERAGE_TRAINING_MODES | STAGE34_MODE_ALIGNED_TRAINING_MODES
+            | STAGE35_NCD_TRAINING_MODES | STAGE36_RGT_NCD_TRAINING_MODES
+        ):
+            bucket_stage, bucket_manifest = resolve_mode_coverage_bucket_manifest(
+                config, self._grpo_training_mode
+            )
+            self._stage30_bucket_by_token = load_stage30_bucket_manifest(
+                bucket_manifest, require_full=True
+            )
+            self._mode_coverage_bucket_stage = bucket_stage
         self._grpo_reward_mode = str(getattr(config, "grpo_reward_mode", "pdms"))
         if self._grpo_reward_mode not in {"pdms", "pdm_tiebreak", "pdm_dense"}:
             raise ValueError(
@@ -794,6 +1115,235 @@ class TrajectoryHead(nn.Module):
                 raise ValueError("Stage19 BC weight must be 0.1")
             if abs(self._diffgrpo_step_discount - 0.6) > 1e-12:
                 raise ValueError("Stage19 step discount must be 0.6")
+        if self._grpo_training_mode == "diffgrpo_selected_anchor_base_preserve":
+            if self._generation_policy_algorithm != "diffgrpo_selected_anchor_base_preserve":
+                raise ValueError("Stage21 mode requires its matching generation algorithm")
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError("Stage21 schedule must be [32,24,16,8,0]")
+            if self._truncation_timestep != 32 or self._scheduler_num_inference_steps != 125:
+                raise ValueError("Stage21 requires truncation=32 and scheduler steps=125")
+            if self._generation_advantage_mode != "group_zscore":
+                raise ValueError("Stage21 requires group_zscore evidence")
+            if self._diffgrpo_group_size != 8 or self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage21 requires G=8 and one legacy rollout per mode")
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage21 does not permit trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage21 requires mean log-probability reduction")
+            if abs(self._diffgrpo_bc_weight - 0.1) > 1e-12:
+                raise ValueError("Stage21 minimum BC weight must be 0.1")
+            if abs(self._diffgrpo_step_discount - 0.6) > 1e-12:
+                raise ValueError("Stage21 step discount must be 0.6")
+        if self._grpo_training_mode == "diffgrpo_paired_residual":
+            if self._generation_policy_algorithm != "diffgrpo_paired_residual":
+                raise ValueError("Stage22 mode requires its matching algorithm")
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError("Stage22 schedule must be [32,24,16,8,0]")
+            if self._truncation_timestep != 32 or self._scheduler_num_inference_steps != 125:
+                raise ValueError("Stage22 requires truncation=32 and scheduler steps=125")
+            if self._generation_advantage_mode != "group_zscore":
+                raise ValueError("Stage22 requires paired-delta group z-score")
+            if self._diffgrpo_group_size != 8 or self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage22 requires G=8")
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage22 does not permit trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage22 requires mean log-probability reduction")
+            if abs(self._diffgrpo_step_discount - 0.6) > 1e-12:
+                raise ValueError("Stage22 step discount must be 0.6")
+        if self._grpo_training_mode in SELECTED_SET_TRAINING_MODES:
+            if self._generation_policy_algorithm != "diffgrpo_selected_set":
+                raise ValueError("Stage23 mode requires diffgrpo_selected_set")
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError("Stage23 schedule must be [32,24,16,8,0]")
+            if self._truncation_timestep != 32 or self._scheduler_num_inference_steps != 125:
+                raise ValueError("Stage23 requires truncation=32 and scheduler steps=125")
+            if self._diffgrpo_group_size != 8 or self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage23 requires G=8 and legacy rollout multiplier 1")
+            if self._generation_advantage_mode != "group_zscore":
+                raise ValueError("Stage23 requires within-set group z-score")
+            if self._inference_selector_source not in {
+                "trajectory_oof", "trajectory_relative_harm_v3"
+            }:
+                raise ValueError(
+                    "selected-set GRPO requires a frozen trajectory selector"
+                )
+            if self._inference_selector_source == "trajectory_oof":
+                if float(getattr(
+                    config, "stage23_selector_residual_margin", -1.0
+                )) < 0:
+                    raise ValueError(
+                        "Stage23 generator requires calibrated selector margin"
+                    )
+            elif any(float(getattr(config, name, -1.0)) < 0 for name in (
+                "stage24_selector_residual_margin",
+                "stage24_selector_ood_threshold",
+                "stage25_selector_risk_threshold",
+            )):
+                raise ValueError(
+                    "Stage25 generator requires calibrated value, OOD, and risk "
+                    "thresholds"
+                )
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage23 does not permit trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage23 requires mean log probabilities")
+            if abs(self._diffgrpo_bc_weight - 0.1) > 1e-12:
+                raise ValueError("Stage23 BC weight must be 0.1")
+        if self._grpo_training_mode in DEPLOYED_SET_TRAINING_MODES:
+            if (
+                self._generation_policy_algorithm
+                != "diffgrpo_deployed_selected_set"
+            ):
+                raise ValueError(
+                    "Stage31 requires diffgrpo_deployed_selected_set"
+                )
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError("Stage31 schedule must be [32,24,16,8,0]")
+            if (
+                self._truncation_timestep != 32
+                or self._scheduler_num_inference_steps != 125
+            ):
+                raise ValueError(
+                    "Stage31 requires truncation=32 and scheduler steps=125"
+                )
+            if self._diffgrpo_group_size != 8 or self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage31 requires G=8")
+            if self._generation_advantage_mode != "group_zscore":
+                raise ValueError("Stage31 requires group_zscore configuration")
+            if self._inference_selector_source != "trajectory_relative_harm_v3":
+                raise ValueError("Stage31 requires the frozen S-multi selector")
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage31 does not permit trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage31 requires mean log probabilities")
+            if abs(self._diffgrpo_bc_weight - 0.1) > 1e-12:
+                raise ValueError("Stage31 BC weight must be 0.1")
+            if abs(self._diffgrpo_step_discount - 0.6) > 1e-12:
+                raise ValueError("Stage31 step discount must be 0.6")
+        if self._grpo_training_mode in STAGE32_FRONTIER_TRAINING_MODES:
+            if self._generation_policy_algorithm != "diffgrpo_deployed_selected_set":
+                raise ValueError("Stage32 requires diffgrpo_deployed_selected_set")
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError("Stage32 schedule must be [32,24,16,8,0]")
+            if self._truncation_timestep != 32 or self._scheduler_num_inference_steps != 125:
+                raise ValueError("Stage32 requires truncation=32 and scheduler steps=125")
+            if self._diffgrpo_group_size != 8 or self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage32 requires G=8")
+            if self._generation_advantage_mode != "group_zscore":
+                raise ValueError("Stage32 requires group_zscore configuration")
+            if self._inference_selector_source != "trajectory_relative_harm_v3":
+                raise ValueError("Stage32 requires the frozen S-multi selector")
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage32 does not permit trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage32 requires mean log probabilities")
+            if abs(self._diffgrpo_bc_weight - 0.1) > 1e-12:
+                raise ValueError("Stage32 BC weight must be 0.1")
+            if abs(self._diffgrpo_step_discount - 0.6) > 1e-12:
+                raise ValueError("Stage32 step discount must be 0.6")
+            if int(getattr(config, "stage32_frontier_pool_size", -1)) != 4:
+                raise ValueError("Stage32 requires frontier pool size=4")
+        if self._grpo_training_mode in STAGE34_MODE_ALIGNED_TRAINING_MODES:
+            if self._generation_policy_algorithm != "diffgrpo_mode_aligned_frontier":
+                raise ValueError("Stage34 requires diffgrpo_mode_aligned_frontier")
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError("Stage34 schedule must be [32,24,16,8,0]")
+            if self._truncation_timestep != 32 or self._scheduler_num_inference_steps != 125:
+                raise ValueError("Stage34 requires truncation=32 and scheduler steps=125")
+            if self._diffgrpo_group_size != 20:
+                raise ValueError("Stage34 requires one complete 20-mode group")
+            if self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage34 requires one rollout per anchor")
+            if self._generation_advantage_mode != "group_zscore":
+                raise ValueError("Stage34 requires the locked GRPO route")
+            if self._inference_selector_source != "trajectory_relative_harm_v3":
+                raise ValueError("Stage34 requires the frozen S-multi selector")
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage34 does not permit trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage34 requires mean log probabilities")
+            if abs(self._diffgrpo_bc_weight - 0.1) > 1e-12:
+                raise ValueError("Stage34 BC weight must be 0.1")
+            if abs(self._diffgrpo_step_discount - 0.6) > 1e-12:
+                raise ValueError("Stage34 step discount must be 0.6")
+        if self._grpo_training_mode in STAGE35_NCD_TRAINING_MODES:
+            if self._generation_policy_algorithm != "diffgrpo_nested_counterfactual_deployment":
+                raise ValueError("Stage35 requires its nested counterfactual algorithm")
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError("Stage35 schedule must be [32,24,16,8,0]")
+            if self._truncation_timestep != 32 or self._scheduler_num_inference_steps != 125:
+                raise ValueError("Stage35 requires truncation=32 and scheduler steps=125")
+            if self._diffgrpo_group_size != 8 or self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage35 requires G=8")
+            if self._generation_advantage_mode != "group_zscore":
+                raise ValueError("Stage35 requires the locked DPEL outer route")
+            if self._inference_selector_source != "trajectory_relative_harm_v3":
+                raise ValueError("Stage35 requires the frozen S-multi selector")
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage35 does not permit trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage35 requires mean log probabilities")
+            if abs(self._diffgrpo_bc_weight - 0.1) > 1e-12:
+                raise ValueError("Stage35 BC weight must be 0.1")
+            if abs(self._diffgrpo_step_discount - 0.6) > 1e-12:
+                raise ValueError("Stage35 step discount must be 0.6")
+            if int(getattr(config, "stage35_active_pool_width", -1)) != 4:
+                raise ValueError("Stage35 active pool width must be four")
+            if int(getattr(config, "stage35_selector_micro_batch_size", 0)) <= 0:
+                raise ValueError("Stage35 selector micro-batch must be positive")
+            if float(getattr(config, "stage35_counterfactual_weight", 0.0)) <= 0:
+                raise ValueError("Stage35 counterfactual weight must be positive")
+        if self._grpo_training_mode in STAGE36_RGT_NCD_TRAINING_MODES:
+            if self._generation_policy_algorithm != "diffgrpo_reference_gated_tail_ncd":
+                raise ValueError("Stage36 requires its reference-gated tail algorithm")
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError("Stage36 schedule must be [32,24,16,8,0]")
+            if self._truncation_timestep != 32 or self._scheduler_num_inference_steps != 125:
+                raise ValueError("Stage36 requires truncation=32 and scheduler steps=125")
+            if self._diffgrpo_group_size != 8 or self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage36 requires G=8")
+            if self._generation_advantage_mode != "group_zscore":
+                raise ValueError("Stage36 requires the locked DPEL outer route")
+            if self._inference_selector_source != "trajectory_relative_harm_v3":
+                raise ValueError("Stage36 requires the frozen S-multi selector")
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage36 does not permit trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage36 requires mean log probabilities")
+            if abs(self._diffgrpo_bc_weight - 0.1) > 1e-12:
+                raise ValueError("Stage36 BC weight must be 0.1")
+            if abs(self._diffgrpo_step_discount - 0.6) > 1e-12:
+                raise ValueError("Stage36 step discount must be 0.6")
+            if int(getattr(config, "stage36_active_pool_width", -1)) != 4:
+                raise ValueError("Stage36 active pool width must be four")
+            if int(getattr(config, "stage36_selector_micro_batch_size", 0)) <= 0:
+                raise ValueError("Stage36 selector micro-batch must be positive")
+            if int(getattr(config, "stage36_frontier_width", -1)) != 5:
+                raise ValueError("Stage36 public frontier width must be five")
+            if int(getattr(config, "stage36_tail_elite_count", -1)) != 2:
+                raise ValueError("Stage36 same-anchor elite count must be two")
+        if self._grpo_training_mode in MODE_COVERAGE_TRAINING_MODES:
+            if self._generation_policy_algorithm != "diffgrpo_mode_coverage":
+                raise ValueError("Stage30 requires diffgrpo_mode_coverage")
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError("Stage30 schedule must be [32,24,16,8,0]")
+            if self._truncation_timestep != 32 or self._scheduler_num_inference_steps != 125:
+                raise ValueError("Stage30 requires truncation=32 and scheduler steps=125")
+            if self._diffgrpo_group_size != 20:
+                raise ValueError("Stage30 requires one complete 20-mode group")
+            if self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage30 requires one rollout per anchor")
+            if self._generation_advantage_mode != "group_zscore":
+                raise ValueError("Stage30 requires group_zscore configuration")
+            if self._inference_selector_source != "trajectory_relative_harm_v3":
+                raise ValueError("Stage30 requires the frozen S-multi selector")
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage30 does not permit trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage30 requires mean log probabilities")
+            if abs(self._diffgrpo_step_discount - 0.6) > 1e-12:
+                raise ValueError("Stage23 step discount must be 0.6")
 
         self.loss_computer = LossComputer(config)
 
@@ -981,6 +1531,81 @@ class TrajectoryHead(nn.Module):
             )
         return torch.tensor(
             [self._selected_anchor_modes[str(token)] for token in tokens_list],
+            dtype=torch.long,
+            device=device,
+        )
+
+    def _lookup_base_preserve_metadata(self, tokens_list, device):
+        if tokens_list is None:
+            raise RuntimeError("Stage21 training requires scene tokens")
+        missing = [
+            str(token)
+            for token in tokens_list
+            if str(token) not in self._base_preserve_metadata
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Stage21 manifest has no base metadata for token {missing[0]}"
+            )
+        records = [self._base_preserve_metadata[str(token)] for token in tokens_list]
+        return {
+            "base_rewards": torch.tensor(
+                [record["base_reward"] for record in records],
+                dtype=torch.float32,
+                device=device,
+            ),
+            "base_safety": torch.tensor(
+                [record["base_safety"] for record in records],
+                dtype=torch.float32,
+                device=device,
+            ),
+            "scene_weights": torch.tensor(
+                [record["scene_weight"] for record in records],
+                dtype=torch.float32,
+                device=device,
+            ),
+            "bc_weights": torch.tensor(
+                [record["bc_weight"] for record in records],
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+
+    def _lookup_paired_residual_weights(self, tokens_list, device):
+        if tokens_list is None:
+            raise RuntimeError("Stage22 training requires scene tokens")
+        missing = [
+            str(token) for token in tokens_list
+            if str(token) not in self._paired_residual_metadata
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Stage22 manifest has no metadata for token {missing[0]}"
+            )
+        return torch.tensor(
+            [
+                self._paired_residual_metadata[str(token)]["scene_weight"]
+                for token in tokens_list
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+
+    def _lookup_stage30_buckets(self, tokens_list, device):
+        if tokens_list is None:
+            stage = getattr(self, "_mode_coverage_bucket_stage", "Stage30")
+            raise RuntimeError(f"{stage} training requires scene tokens")
+        missing = [
+            str(token) for token in tokens_list
+            if str(token) not in self._stage30_bucket_by_token
+        ]
+        if missing:
+            stage = getattr(self, "_mode_coverage_bucket_stage", "Stage30")
+            raise RuntimeError(
+                f"{stage} bucket manifest has no token {missing[0]}"
+            )
+        return torch.tensor(
+            [self._stage30_bucket_by_token[str(token)] for token in tokens_list],
             dtype=torch.long,
             device=device,
         )
@@ -1388,6 +2013,240 @@ class TrajectoryHead(nn.Module):
                 "mode_idx": mode_idx,
             }
 
+        if self._grpo_training_mode in {
+            "stage24_selector", "stage25_relative_harm_selector"
+        }:
+            stage25_training = (
+                self._grpo_training_mode == "stage25_relative_harm_selector"
+            )
+            if tokens_list is None:
+                raise RuntimeError("Stage24 selector training requires scene tokens")
+            missing = [
+                token for token in tokens_list
+                if token not in self._stage24_candidate_bank
+            ]
+            if missing:
+                raise RuntimeError(f"Stage24 candidate bank lacks token: {missing[0]}")
+            steps_per_epoch = int(
+                getattr(self._config, "stage24_selector_steps_per_epoch", 0)
+            )
+            training_updates = (
+                self._stage25_selector_training_updates
+                if stage25_training
+                else self._stage24_selector_training_updates
+            )
+            epoch_index = int(training_updates.item()) // steps_per_epoch
+            combination_index = epoch_index % len(self._stage24_bank_combinations)
+            bank_records = [
+                self._stage24_candidate_bank[token][combination_index]
+                for token in tokens_list
+            ]
+            reference_reg = torch.as_tensor(
+                [record["candidate_trajectories"] for record in bank_records],
+                device=device, dtype=bev_feature.dtype,
+            )
+            reference_cls = torch.as_tensor(
+                [record["candidate_reference_logits"] for record in bank_records],
+                device=device, dtype=bev_feature.dtype,
+            )
+            raw_reward_rows = [record["candidate_rewards"] for record in bank_records]
+            valid = torch.as_tensor(
+                [[value is not None for value in row] for row in raw_reward_rows],
+                device=device, dtype=torch.bool,
+            )
+            raw_rewards = torch.as_tensor(
+                [
+                    [
+                        float(value) if value is not None else float("nan")
+                        for value in row
+                    ]
+                    for row in raw_reward_rows
+                ],
+                device=device, dtype=torch.float32,
+            )
+            component_scores = torch.as_tensor(
+                [record["candidate_components"] for record in bank_records],
+                device=device, dtype=torch.float32,
+            )
+            selector_outputs = self.stage24_selector(
+                reference_reg, reference_cls, bev_feature.detach(),
+                bev_spatial_shape, agents_query.detach(), ego_query.detach(),
+                status_encoding.detach(),
+            )
+            log_ids = tuple(self._stage24_token_logs[token] for token in tokens_list)
+            train_members = stage24_member_training_mask(
+                log_ids, self.stage24_selector.num_members,
+                float(getattr(
+                    self._config, "stage24_selector_subbag_fraction", 0.8
+                )),
+                reference_reg.device,
+            )
+            if stage25_training:
+                stage25_outputs = self.stage25_selector(
+                    selector_outputs["embedding_predictions"].detach()
+                )
+                self._stage25_selector_training_updates.add_(1)
+            else:
+                embedding_rows = selector_outputs[
+                    "embedding_mean"
+                ].detach().double().reshape(
+                    -1, self.stage24_selector.selector_dim
+                )
+                finite_embedding = torch.isfinite(embedding_rows).all(dim=-1)
+                embedding_rows = embedding_rows[finite_embedding]
+                self._stage24_embedding_count.add_(embedding_rows.shape[0])
+                self._stage24_embedding_sum.add_(embedding_rows.sum(dim=0))
+                self._stage24_embedding_sum_sq.add_(
+                    embedding_rows.square().sum(dim=0)
+                )
+                self._stage24_selector_training_updates.add_(1)
+            fallback_mode = selector_outputs["fallback_mode"]
+            batch_index = torch.arange(reference_reg.shape[0], device=device)
+            best_reg = reference_reg[batch_index, fallback_mode]
+            safety_weights, any_weight = self._stage24_positive_weights
+            result = {
+                "trajectory": best_reg,
+                "final_poses_reg": reference_reg,
+                "final_poses_cls": reference_cls,
+                "final_old_poses_cls": reference_cls.detach(),
+                "final_ref_poses_cls": reference_cls.detach(),
+                "rewards": raw_rewards,
+                "raw_rewards": raw_rewards,
+                "reward_valid_mask": valid,
+                "component_scores": component_scores,
+                "stage24_safety_logits": selector_outputs["safety_logits"],
+                "stage24_safety_probabilities": selector_outputs[
+                    "safety_probabilities"
+                ],
+                "stage24_any_unsafe_logits": selector_outputs[
+                    "any_unsafe_logits"
+                ],
+                "stage24_any_unsafe_probabilities": selector_outputs[
+                    "any_unsafe_probabilities"
+                ],
+                "stage24_component_delta_predictions": selector_outputs[
+                    "component_delta_predictions"
+                ],
+                "stage24_delta_predictions": selector_outputs[
+                    "delta_predictions"
+                ],
+                "stage24_embedding_predictions": selector_outputs[
+                    "embedding_predictions"
+                ],
+                "stage24_embedding_mean": selector_outputs["embedding_mean"],
+                "stage24_member_training_mask": train_members,
+                "stage24_fallback_mode": fallback_mode,
+                "stage24_safety_positive_weights": torch.tensor(
+                    safety_weights, device=device, dtype=torch.float32,
+                ),
+                "stage24_any_unsafe_positive_weight": torch.tensor(
+                    any_weight, device=device, dtype=torch.float32,
+                ),
+                "stage24_bank_combination_index": torch.tensor(
+                    combination_index, device=device, dtype=torch.long,
+                ),
+                "grpo_training_rollout": True,
+                "num_modes": 20,
+                "mode_idx": fallback_mode,
+            }
+            if stage25_training:
+                result.update({
+                    "stage25_harm_logits": stage25_outputs["harm_logits"],
+                    "stage25_catastrophe_logits": stage25_outputs[
+                        "catastrophe_logits"
+                    ],
+                    "stage25_positive_weights": torch.tensor(
+                        self._stage25_positive_weights,
+                        device=device, dtype=torch.float32,
+                    ),
+                })
+            return result
+        if self._grpo_training_mode == "stage23_selector":
+            if tokens_list is None:
+                raise RuntimeError("Stage23 selector training requires scene tokens")
+            missing = [token for token in tokens_list if token not in self._stage23_candidate_bank]
+            if missing:
+                raise RuntimeError(f"Stage23 candidate bank lacks token: {missing[0]}")
+            bank_records = [
+                record
+                for token in tokens_list
+                for record in self._stage23_candidate_bank[token]
+            ]
+            reference_reg = torch.as_tensor(
+                [record["candidate_trajectories"] for record in bank_records],
+                device=device, dtype=bev_feature.dtype,
+            )
+            reference_cls = torch.as_tensor(
+                [record["candidate_reference_logits"] for record in bank_records],
+                device=device, dtype=bev_feature.dtype,
+            )
+            raw_reward_rows = [record["candidate_rewards"] for record in bank_records]
+            valid = torch.as_tensor(
+                [[value is not None for value in row] for row in raw_reward_rows],
+                device=device, dtype=torch.bool,
+            )
+            raw_rewards = torch.as_tensor(
+                [
+                    [float(value) if value is not None else float("nan") for value in row]
+                    for row in raw_reward_rows
+                ],
+                device=device, dtype=torch.float32,
+            )
+            component_scores = torch.as_tensor(
+                [record["candidate_components"] for record in bank_records],
+                device=device, dtype=torch.float32,
+            )
+            namespaces_per_scene = len(self._stage23_candidate_bank[tokens_list[0]])
+            repeated_bev = bev_feature.detach().repeat_interleave(
+                namespaces_per_scene, dim=0
+            )
+            repeated_agents = agents_query.detach().repeat_interleave(
+                namespaces_per_scene, dim=0
+            )
+            repeated_ego = ego_query.detach().repeat_interleave(
+                namespaces_per_scene, dim=0
+            )
+            repeated_status = status_encoding.detach().repeat_interleave(
+                namespaces_per_scene, dim=0
+            )
+            selector_outputs = self.stage23_selector(
+                reference_reg, reference_cls, repeated_bev, bev_spatial_shape,
+                repeated_agents, repeated_ego, repeated_status,
+            )
+            log_ids = tuple(
+                self._stage23_token_logs[token]
+                for token in tokens_list
+                for _ in range(namespaces_per_scene)
+            )
+            train_members = member_training_mask(
+                log_ids, self.stage23_selector.num_members, reference_reg.device
+            )
+            self._stage23_selector_training_updates.add_(1)
+            fallback_mode = reference_cls.argmax(dim=-1)
+            bank_batch = reference_reg.shape[0]
+            best_reg = reference_reg[
+                torch.arange(bank_batch, device=device), fallback_mode
+            ]
+            return {
+                "trajectory": best_reg,
+                "final_poses_reg": reference_reg,
+                "final_poses_cls": reference_cls,
+                "final_old_poses_cls": reference_cls.detach(),
+                "final_ref_poses_cls": reference_cls.detach(),
+                "rewards": raw_rewards,
+                "raw_rewards": raw_rewards,
+                "reward_valid_mask": valid,
+                "component_scores": component_scores,
+                "stage23_component_logits": selector_outputs["component_logits"],
+                "stage23_component_predictions": selector_outputs["component_predictions"],
+                "stage23_score_predictions": selector_outputs["score_predictions"],
+                "stage23_member_training_mask": train_members,
+                "stage23_log_buckets": (~train_members).to(torch.long).argmax(dim=-1),
+                "grpo_training_rollout": True,
+                "num_modes": 20,
+                "mode_idx": fallback_mode,
+            }
+
         if self._grpo_training_mode == "value_selector":
             with torch.no_grad():
                 current_reg, _ = self._run_policy_rollout(
@@ -1462,6 +2321,8 @@ class TrajectoryHead(nn.Module):
             }
 
         generation_outputs = {}
+        paired_base_poses_reg = None
+        stage36_deferred_trace = None
         if self._grpo_training_mode == "diffgrpo_full_chain":
             trace = collect_full_chain_diffgrpo_trace(
                 self,
@@ -1482,7 +2343,10 @@ class TrajectoryHead(nn.Module):
                 "diffgrpo_bc_log_probs": trace["bc_log_probs"],
                 "diffgrpo_num_denoising_steps": trace["num_denoising_steps"],
             }
-        elif self._grpo_training_mode == "diffgrpo_selected_anchor":
+        elif self._grpo_training_mode in {
+            "diffgrpo_selected_anchor",
+            "diffgrpo_selected_anchor_base_preserve",
+        }:
             selected_modes = self._lookup_selected_anchor_modes(
                 tokens_list, device
             )
@@ -1521,6 +2385,282 @@ class TrajectoryHead(nn.Module):
                     "selected_anchor_modes"
                 ],
                 "diffgrpo_group_size": trace["group_size"],
+            }
+            if self._grpo_training_mode == "diffgrpo_selected_anchor_base_preserve":
+                metadata = self._lookup_base_preserve_metadata(tokens_list, device)
+                generation_outputs.update(
+                    {
+                        "diffgrpo_base_rewards": metadata["base_rewards"],
+                        "diffgrpo_base_safety": metadata["base_safety"],
+                        "diffgrpo_scene_weights": metadata["scene_weights"],
+                        "diffgrpo_bc_weights": metadata["bc_weights"],
+                    }
+                )
+        elif self._grpo_training_mode == "diffgrpo_paired_residual":
+            selected_modes = self._lookup_selected_anchor_modes(
+                tokens_list, device
+            )
+            clean_anchors = self.plan_anchor.unsqueeze(0).expand(
+                bs, -1, -1, -1
+            )
+            gather_index = selected_modes[:, None, None, None].expand(
+                -1, 1, clean_anchors.shape[2], clean_anchors.shape[3]
+            )
+            selected_clean_sample = self.norm_odo(
+                clean_anchors.gather(1, gather_index)
+            )
+            trace = collect_paired_residual_diffgrpo_trace(
+                self,
+                selected_clean_sample,
+                selected_modes,
+                self._diffgrpo_group_size,
+                ego_query,
+                agents_query,
+                bev_feature,
+                bev_spatial_shape,
+                status_encoding,
+                global_img,
+            )
+            final_poses_reg = trace["trajectories"]
+            paired_base_poses_reg = trace["base_trajectories"]
+            final_poses_cls = trace["current_cls"]
+            final_old_poses_cls = trace["current_cls"].detach()
+            final_ref_poses_cls = trace["reference_cls"].detach()
+            generation_outputs = {
+                "diffgrpo_current_log_probs": trace["current_log_probs"],
+                "diffgrpo_reference_mean_kl": trace["reference_mean_kl"],
+                "diffgrpo_num_denoising_steps": trace["num_denoising_steps"],
+                "diffgrpo_selected_anchor_modes": trace[
+                    "selected_anchor_modes"
+                ],
+                "diffgrpo_group_size": trace["group_size"],
+                "diffgrpo_scene_weights": self._lookup_paired_residual_weights(
+                    tokens_list, device
+                ),
+            }
+        elif self._grpo_training_mode in STAGE36_RGT_NCD_TRAINING_MODES:
+            trace = collect_stage36_sampling_trace(
+                self, self._diffgrpo_group_size, ego_query, agents_query,
+                bev_feature, bev_spatial_shape, status_encoding, global_img,
+            )
+            stage36_deferred_trace = trace
+            final_poses_reg = self.denorm_odo(trace["current_final"])
+            paired_base_poses_reg = self.denorm_odo(trace["public_final"])
+            final_poses_cls = trace["current_cls"]
+            final_old_poses_cls = trace["current_cls"].detach()
+            final_ref_poses_cls = trace["reference_cls"].detach()
+            generation_outputs = {
+                "diffgrpo_group_size": trace["group_size"],
+                "stage36_current_selected_modes": trace["current_selected_modes"],
+                "stage36_public_selected_modes": trace["public_selected_modes"],
+                "stage36_active_modes": trace["active_modes"],
+                "stage36_active_valid": trace["active_valid"],
+                "stage36_hybrid_selected_modes": trace["hybrid_selected_modes"],
+                "stage36_donor_indices": trace["donor_indices"],
+                "stage36_scene_buckets": self._lookup_stage30_buckets(
+                    tokens_list, device
+                ),
+                "stage36_selector_mode_disagreement": trace[
+                    "selector_mode_disagreement"
+                ],
+                "stage36_current_selector_switch_rate": trace[
+                    "current_selector_switch_rate"
+                ],
+                "stage36_public_selector_switch_rate": trace[
+                    "public_selector_switch_rate"
+                ],
+                "stage36_sampled_chain_count": trace["sampled_chain_count"],
+                "stage36_counterfactual_selector_count": trace[
+                    "counterfactual_selector_count"
+                ],
+            }
+        elif self._grpo_training_mode in DEPLOYED_SET_TRAINING_MODES:
+            trace = collect_deployed_selected_set_diffgrpo_trace(
+                self, self._diffgrpo_group_size, ego_query, agents_query,
+                bev_feature, bev_spatial_shape, status_encoding, global_img,
+            )
+            final_poses_reg = trace["trajectories"]
+            paired_base_poses_reg = trace["base_trajectories"]
+            final_poses_cls = trace["current_cls"]
+            final_old_poses_cls = trace["current_cls"].detach()
+            final_ref_poses_cls = trace["reference_cls"].detach()
+            generation_outputs = {
+                "diffgrpo_current_log_probs": trace["current_log_probs"],
+                "diffgrpo_bc_log_probs": trace["bc_log_probs"],
+                "diffgrpo_reference_mean_kl": trace["reference_mean_kl"],
+                "diffgrpo_num_denoising_steps": trace["num_denoising_steps"],
+                "diffgrpo_group_size": trace["group_size"],
+                "stage31_current_selected_modes": trace[
+                    "current_selected_modes"
+                ],
+                "stage31_public_selected_modes": trace[
+                    "public_selected_modes"
+                ],
+                "stage31_selector_mode_disagreement": trace[
+                    "selector_mode_disagreement"
+                ],
+                "stage31_current_selector_switch_rate": trace[
+                    "current_selector_switch_rate"
+                ],
+                "stage31_public_selector_switch_rate": trace[
+                    "public_selector_switch_rate"
+                ],
+                "stage31_current_sampled_chain_count": trace[
+                    "current_sampled_chain_count"
+                ],
+                "stage31_public_sampled_chain_count": trace[
+                    "public_sampled_chain_count"
+                ],
+                "stage31_current_replayed_chain_count": trace[
+                    "current_replayed_chain_count"
+                ],
+                "stage31_public_replayed_chain_count": trace[
+                    "public_replayed_chain_count"
+                ],
+            }
+        elif self._grpo_training_mode in STAGE32_FRONTIER_TRAINING_MODES:
+            trace = collect_selector_aware_frontier_diffgrpo_trace(
+                self, self._diffgrpo_group_size, ego_query, agents_query,
+                bev_feature, bev_spatial_shape, status_encoding, global_img,
+            )
+            final_poses_reg = trace["trajectories"]
+            paired_base_poses_reg = trace["base_trajectories"]
+            final_poses_cls = trace["current_cls"]
+            final_old_poses_cls = trace["current_cls"].detach()
+            final_ref_poses_cls = trace["reference_cls"].detach()
+            generation_outputs = {
+                "diffgrpo_current_log_probs": trace["current_log_probs"],
+                "diffgrpo_bc_log_probs": trace["bc_log_probs"],
+                "diffgrpo_reference_mean_kl": trace["reference_mean_kl"],
+                "diffgrpo_num_denoising_steps": trace["num_denoising_steps"],
+                "diffgrpo_group_size": trace["group_size"],
+                "stage32_current_selected_modes": trace[
+                    "current_selected_modes"
+                ],
+                "stage32_public_selected_modes": trace[
+                    "public_selected_modes"
+                ],
+                "stage32_current_mode_valid": trace["current_mode_valid"].reshape(bs, -1),
+                "stage32_public_mode_valid": trace["public_mode_valid"].reshape(bs, -1),
+                "stage32_pool_size": trace["stage32_pool_size"],
+                "stage32_selector_mode_disagreement": trace[
+                    "selector_mode_disagreement"
+                ],
+                "stage32_current_selector_switch_rate": trace[
+                    "current_selector_switch_rate"
+                ],
+                "stage32_public_selector_switch_rate": trace[
+                    "public_selector_switch_rate"
+                ],
+                "stage32_current_sampled_chain_count": trace[
+                    "current_sampled_chain_count"
+                ],
+                "stage32_public_sampled_chain_count": trace[
+                    "public_sampled_chain_count"
+                ],
+                "stage32_current_replayed_chain_count": trace[
+                    "current_replayed_chain_count"
+                ],
+                "stage32_public_replayed_chain_count": trace[
+                    "public_replayed_chain_count"
+                ],
+            }
+        elif self._grpo_training_mode in STAGE35_NCD_TRAINING_MODES:
+            trace = collect_nested_counterfactual_deployment_trace(
+                self, self._diffgrpo_group_size, ego_query, agents_query,
+                bev_feature, bev_spatial_shape, status_encoding, global_img,
+            )
+            final_poses_reg = trace["trajectories"]
+            paired_base_poses_reg = trace["base_trajectories"]
+            final_poses_cls = trace["current_cls"]
+            final_old_poses_cls = trace["current_cls"].detach()
+            final_ref_poses_cls = trace["reference_cls"].detach()
+            generation_outputs = {
+                "diffgrpo_current_log_probs": trace["current_log_probs"],
+                "diffgrpo_bc_log_probs": trace["bc_log_probs"],
+                "diffgrpo_reference_mean_kl": trace["reference_mean_kl"],
+                "diffgrpo_num_denoising_steps": trace["num_denoising_steps"],
+                "diffgrpo_group_size": trace["group_size"],
+                "stage35_current_selected_modes": trace["current_selected_modes"],
+                "stage35_public_selected_modes": trace["public_selected_modes"],
+                "stage35_active_modes": trace["active_modes"],
+                "stage35_active_valid": trace["active_valid"],
+                "stage35_hybrid_selected_modes": trace["hybrid_selected_modes"],
+                "stage35_donor_indices": trace["donor_indices"],
+                "stage35_scene_buckets": self._lookup_stage30_buckets(tokens_list, device),
+                "stage35_selector_mode_disagreement": trace["selector_mode_disagreement"],
+                "stage35_current_selector_switch_rate": trace["current_selector_switch_rate"],
+                "stage35_public_selector_switch_rate": trace["public_selector_switch_rate"],
+                "stage35_sampled_chain_count": trace["sampled_chain_count"],
+                "stage35_replayed_chain_count": trace["replayed_chain_count"],
+                "stage35_counterfactual_selector_count": trace["counterfactual_selector_count"],
+            }
+        elif self._grpo_training_mode in STAGE34_MODE_ALIGNED_TRAINING_MODES:
+            trace = collect_mode_coverage_diffgrpo_trace(
+                self, ego_query, agents_query, bev_feature, bev_spatial_shape,
+                status_encoding, global_img,
+            )
+            final_poses_reg = trace["trajectories"]
+            paired_base_poses_reg = trace["base_trajectories"]
+            final_poses_cls = trace["current_cls"]
+            final_old_poses_cls = trace["current_cls"].detach()
+            final_ref_poses_cls = trace["reference_cls"].detach()
+            generation_outputs = {
+                "diffgrpo_current_log_probs": trace["current_log_probs"],
+                "diffgrpo_bc_log_probs": trace["bc_log_probs"],
+                "diffgrpo_reference_mean_kl": trace["reference_mean_kl"],
+                "diffgrpo_num_denoising_steps": trace["num_denoising_steps"],
+                "diffgrpo_group_size": trace["group_size"],
+                "stage34_sampled_chain_count": trace["sampled_chain_count"],
+                "stage34_replayed_chain_count": trace["replayed_chain_count"],
+                "stage34_scene_buckets": self._lookup_stage30_buckets(tokens_list, device),
+            }
+            generation_outputs.update(build_stage34_trace_diagnostics(
+                self, trace, ego_query, agents_query, bev_feature,
+                bev_spatial_shape, status_encoding,
+            ))
+        elif self._grpo_training_mode in MODE_COVERAGE_TRAINING_MODES:
+            trace = collect_mode_coverage_diffgrpo_trace(
+                self, ego_query, agents_query, bev_feature, bev_spatial_shape,
+                status_encoding, global_img,
+            )
+            final_poses_reg = trace["trajectories"]
+            paired_base_poses_reg = trace["base_trajectories"]
+            final_poses_cls = trace["current_cls"]
+            final_old_poses_cls = trace["current_cls"].detach()
+            final_ref_poses_cls = trace["reference_cls"].detach()
+            generation_outputs = {
+                "diffgrpo_current_log_probs": trace["current_log_probs"],
+                "diffgrpo_bc_log_probs": trace["bc_log_probs"],
+                "diffgrpo_reference_mean_kl": trace["reference_mean_kl"],
+                "diffgrpo_num_denoising_steps": trace["num_denoising_steps"],
+                "diffgrpo_group_size": trace["group_size"],
+                "stage30_sampled_chain_count": trace["sampled_chain_count"],
+                "stage30_replayed_chain_count": trace["replayed_chain_count"],
+                "stage30_scene_buckets": self._lookup_stage30_buckets(
+                    tokens_list, device
+                ),
+            }
+        elif self._grpo_training_mode in SELECTED_SET_TRAINING_MODES:
+            trace = collect_selected_set_diffgrpo_trace(
+                self, self._diffgrpo_group_size, ego_query, agents_query,
+                bev_feature, bev_spatial_shape, status_encoding, global_img,
+            )
+            final_poses_reg = trace["trajectories"]
+            paired_base_poses_reg = trace["base_trajectories"]
+            final_poses_cls = trace["current_cls"]
+            final_old_poses_cls = trace["current_cls"].detach()
+            final_ref_poses_cls = trace["reference_cls"].detach()
+            generation_outputs = {
+                "diffgrpo_current_log_probs": trace["current_log_probs"],
+                "diffgrpo_bc_log_probs": trace["bc_log_probs"],
+                "diffgrpo_reference_mean_kl": trace["reference_mean_kl"],
+                "diffgrpo_num_denoising_steps": trace["num_denoising_steps"],
+                "diffgrpo_selected_set_modes": trace["selected_modes"],
+                "diffgrpo_group_size": trace["group_size"],
+                "stage23_selector_switch_rate": trace["selector_switch_rate"],
+                "stage23_sampled_chain_count": trace["sampled_chain_count"],
+                "stage23_replayed_chain_count": trace["replayed_chain_count"],
             }
         elif self._grpo_training_mode in {
             "generation", "generation_group", "generation_group_adaptive", "joint"
@@ -1635,23 +2775,92 @@ class TrajectoryHead(nn.Module):
         reward_tiebreak_epsilon = None
         component_scores = None
         num_modes = final_poses_cls.shape[-1]
+        score_poses_reg = final_poses_reg
+        score_num_modes = num_modes
+        if self._grpo_training_mode in {
+            "diffgrpo_paired_residual", "diffgrpo_selected_set",
+            "stage27_public_diffgrpo_selected_set",
+            "stage28_public_paired_uplift_multi",
+            "stage28_public_paired_uplift_explore",
+            "stage29_public_headroom_hybrid",
+            "stage29_public_headroom_conditional",
+            "stage30_public_mode_coverage",
+            "stage30_public_mode_coverage_constrained",
+            "stage31_public_deployed_pair",
+            "stage31_public_deployed_frontier",
+            "stage32_public_deployed_extended",
+            "stage32_selector_aware_frontier",
+            "stage33_cdc_grpo",
+            "stage34_mode_aligned_frontier_grpo",
+            "stage35_nested_counterfactual_deployment_grpo",
+            "stage36_reference_gated_tail_ncd_grpo",
+        }:
+            if paired_base_poses_reg is None:
+                raise RuntimeError("paired DiffGRPO trace produced no base trajectories")
+            score_poses_reg = torch.cat(
+                (final_poses_reg, paired_base_poses_reg), dim=1
+            )
+            score_num_modes = 2 * num_modes
         if tokens_list is not None:
             if self._lazy_metric_cache is not None:
                 reward_result = self._compute_rewards_from_lazy_cache(
-                    final_poses_reg, tokens_list, num_modes,
+                    score_poses_reg, tokens_list, score_num_modes,
                 )
             elif self.metric_cache_loader is not None:
                 reward_result = self._compute_rewards_from_disk(
-                    final_poses_reg, tokens_list, num_modes,
+                    score_poses_reg, tokens_list, score_num_modes,
                 )
             else:
                 reward_result = None
             if reward_result is not None:
-                rewards = reward_result["training_rewards"]
-                raw_rewards = reward_result["raw_rewards"]
-                reward_valid_mask = reward_result["valid_mask"]
-                reward_tiebreak_epsilon = reward_result["tiebreak_epsilon"]
-                component_scores = reward_result["component_scores"]
+                if self._grpo_training_mode in {
+                    "diffgrpo_paired_residual", "diffgrpo_selected_set",
+                    "stage27_public_diffgrpo_selected_set",
+                    "stage28_public_paired_uplift_multi",
+                    "stage28_public_paired_uplift_explore",
+                    "stage29_public_headroom_hybrid",
+                    "stage29_public_headroom_conditional",
+                    "stage30_public_mode_coverage",
+                    "stage30_public_mode_coverage_constrained",
+                    "stage31_public_deployed_pair",
+                    "stage31_public_deployed_frontier",
+                    "stage32_public_deployed_extended",
+                    "stage32_selector_aware_frontier",
+                    "stage33_cdc_grpo",
+                    "stage34_mode_aligned_frontier_grpo",
+                    "stage35_nested_counterfactual_deployment_grpo",
+                    "stage36_reference_gated_tail_ncd_grpo",
+                }:
+                    rewards = reward_result["training_rewards"][:, :num_modes]
+                    raw_rewards = reward_result["raw_rewards"][:, :num_modes]
+                    reward_valid_mask = reward_result["valid_mask"][:, :num_modes]
+                    # Tie-break epsilon is scene-level [B], not mode-level.
+                    # Stage22 optimizes raw PDMS, but retains this diagnostic.
+                    reward_tiebreak_epsilon = reward_result[
+                        "tiebreak_epsilon"
+                    ]
+                    component_scores = reward_result[
+                        "component_scores"
+                    ][:, :num_modes]
+                    generation_outputs.update(
+                        {
+                            "diffgrpo_base_rewards": reward_result[
+                                "raw_rewards"
+                            ][:, num_modes:],
+                            "diffgrpo_base_valid_mask": reward_result[
+                                "valid_mask"
+                            ][:, num_modes:],
+                            "diffgrpo_base_component_scores": reward_result[
+                                "component_scores"
+                            ][:, num_modes:],
+                        }
+                    )
+                else:
+                    rewards = reward_result["training_rewards"]
+                    raw_rewards = reward_result["raw_rewards"]
+                    reward_valid_mask = reward_result["valid_mask"]
+                    reward_tiebreak_epsilon = reward_result["tiebreak_epsilon"]
+                    component_scores = reward_result["component_scores"]
         if rewards is None or reward_valid_mask is None:
             raise RuntimeError(
                 "GRPO training requires PDM rewards and scene tokens for every batch"
@@ -1660,6 +2869,26 @@ class TrajectoryHead(nn.Module):
             raise RuntimeError(
                 f"No valid PDM reward in batch; tokens={list(tokens_list or [])}"
             )
+        if stage36_deferred_trace is not None:
+            generation_outputs.update(finalize_stage36_reward_dependent_replay(
+                self,
+                stage36_deferred_trace,
+                rewards=raw_rewards,
+                valid_mask=reward_valid_mask,
+                component_scores=component_scores,
+                base_rewards=generation_outputs["diffgrpo_base_rewards"],
+                base_valid_mask=generation_outputs["diffgrpo_base_valid_mask"],
+                base_component_scores=generation_outputs[
+                    "diffgrpo_base_component_scores"
+                ],
+                scene_buckets=generation_outputs["stage36_scene_buckets"],
+                ego_query=ego_query,
+                agents_query=agents_query,
+                bev_feature=bev_feature,
+                bev_spatial_shape=bev_spatial_shape,
+                status_encoding=status_encoding,
+                global_img=global_img,
+            ))
 
         reference_selected_reward = None
         reference_reward_valid_mask = None
@@ -1704,7 +2933,27 @@ class TrajectoryHead(nn.Module):
 
         if self._grpo_training_mode == "diffgrpo_full_chain":
             mode_idx = final_ref_poses_cls.argmax(dim=-1)
-        elif self._grpo_training_mode == "diffgrpo_selected_anchor":
+        elif self._grpo_training_mode in {
+            "diffgrpo_selected_anchor",
+            "diffgrpo_selected_anchor_base_preserve",
+            "diffgrpo_paired_residual",
+            "diffgrpo_selected_set",
+            "stage27_public_diffgrpo_selected_set",
+            "stage28_public_paired_uplift_multi",
+            "stage28_public_paired_uplift_explore",
+            "stage29_public_headroom_hybrid",
+            "stage29_public_headroom_conditional",
+            "stage30_public_mode_coverage",
+            "stage30_public_mode_coverage_constrained",
+            "stage31_public_deployed_pair",
+            "stage31_public_deployed_frontier",
+            "stage32_public_deployed_extended",
+            "stage32_selector_aware_frontier",
+            "stage33_cdc_grpo",
+            "stage34_mode_aligned_frontier_grpo",
+            "stage35_nested_counterfactual_deployment_grpo",
+            "stage36_reference_gated_tail_ncd_grpo",
+        }:
             mode_idx = torch.zeros(bs, dtype=torch.long, device=device)
         else:
             mode_idx = final_poses_cls.argmax(dim=-1)
@@ -1954,7 +3203,12 @@ class TrajectoryHead(nn.Module):
             else final_poses_cls
         )
         final_ref_poses_reg = None
-        if not trust_active and self.ref_policy is not None:
+        if (
+            not trust_active
+            and self.ref_policy is not None
+            and self._inference_selector_source
+            in {"reference", "value_top2", "paired_tail_risk"}
+        ):
             with torch.no_grad():
                 final_ref_poses_reg, final_ref_poses_cls = self._run_policy_rollout(
                     self.ref_policy, initial_sample, ego_query, agents_query,
@@ -1969,6 +3223,8 @@ class TrajectoryHead(nn.Module):
                 "reference inference selector requires a frozen reference policy"
             )
         value_diagnostics = {}
+        stage23_diagnostics = {}
+        stage24_diagnostics = {}
         paired_diagnostics = {}
         paired_selected_trajectory = None
         if self._inference_selector_source == "value_top2":
@@ -2016,6 +3272,175 @@ class TrajectoryHead(nn.Module):
                     "score_std": value_outputs["score_std"],
                 }
             )
+        elif self._inference_selector_source == "trajectory_oof":
+            if int(self._stage23_selector_training_updates.item()) <= 0:
+                raise RuntimeError(
+                    "trajectory_oof requires a trained Stage23 selector checkpoint"
+                )
+            if num_modes != 20:
+                raise RuntimeError("trajectory_oof requires all 20 generator modes")
+            stage23_outputs = self.stage23_selector(
+                final_poses_reg, final_poses_cls.detach(), bev_feature,
+                bev_spatial_shape, agents_query, ego_query, status_encoding,
+            )
+            mode_idx, stage23_diagnostics = select_stage23_trajectory(
+                final_poses_cls.detach(),
+                stage23_outputs["component_predictions"],
+                stage23_outputs["score_predictions"],
+                residual_margin=float(
+                    getattr(self._config, "stage23_selector_residual_margin", -1.0)
+                ),
+                safety_threshold=float(
+                    getattr(self._config, "stage23_selector_safety_threshold", 0.95)
+                ),
+                confidence_z=float(
+                    getattr(self._config, "stage23_selector_confidence_z", 1.96)
+                ),
+                safety_relative_tolerance=float(
+                    getattr(self._config, "stage23_selector_safety_tolerance", 0.0)
+                ),
+            )
+            inference_selector_logits = torch.full_like(
+                final_poses_cls, torch.finfo(final_poses_cls.dtype).min
+            )
+            inference_selector_logits.scatter_(
+                1, mode_idx.unsqueeze(-1),
+                torch.zeros_like(mode_idx, dtype=final_poses_cls.dtype).unsqueeze(-1),
+            )
+            stage23_diagnostics.update(stage23_outputs)
+        elif self._inference_selector_source == "trajectory_relative_harm_v3":
+            if (
+                int(self._stage24_selector_training_updates.item()) <= 0
+                or int(self._stage25_selector_training_updates.item()) <= 0
+            ):
+                raise RuntimeError(
+                    "trajectory_relative_harm_v3 requires trained Stage24/25 state"
+                )
+            if num_modes != 20:
+                raise RuntimeError(
+                    "trajectory_relative_harm_v3 requires all 20 modes"
+                )
+            stage24_outputs = self.stage24_selector(
+                final_poses_reg, final_poses_cls.detach(), bev_feature,
+                bev_spatial_shape, agents_query, ego_query, status_encoding,
+            )
+            stage25_outputs = self.stage25_selector(
+                stage24_outputs["embedding_predictions"]
+            )
+            collect_calibration = bool(
+                getattr(self._config, "stage25_collect_calibration", False)
+            )
+            if collect_calibration:
+                mode_idx = stage24_outputs["fallback_mode"]
+                stage24_diagnostics = {
+                    "calibration_collection": torch.ones(
+                        bs, dtype=torch.bool, device=device
+                    ),
+                    "fallback_mode": mode_idx,
+                    "switch": torch.zeros(bs, dtype=torch.bool, device=device),
+                }
+            else:
+                if not bool(self._stage24_calibration_loaded.item()):
+                    raise RuntimeError(
+                        "Stage25 deployment requires loaded calibration/OOD state"
+                    )
+                mode_idx, stage24_diagnostics = select_stage25_trajectory(
+                    final_poses_cls.detach(),
+                    stage25_outputs["harm_probabilities"],
+                    stage25_outputs["catastrophe_probabilities"],
+                    stage24_outputs["delta_predictions"],
+                    stage24_outputs["embedding_mean"],
+                    residual_margin=float(getattr(
+                        self._config, "stage24_selector_residual_margin", -1.0
+                    )),
+                    risk_threshold=float(getattr(
+                        self._config, "stage25_selector_risk_threshold", -1.0
+                    )),
+                    ood_mean=self._stage24_ood_mean,
+                    ood_variance=self._stage24_ood_variance,
+                    ood_threshold=float(getattr(
+                        self._config, "stage24_selector_ood_threshold", -1.0
+                    )),
+                    confidence_z=float(getattr(
+                        self._config, "stage24_selector_confidence_z", 1.96
+                    )),
+                )
+            inference_selector_logits = torch.full_like(
+                final_poses_cls, torch.finfo(final_poses_cls.dtype).min
+            )
+            inference_selector_logits.scatter_(
+                1, mode_idx.unsqueeze(-1),
+                torch.zeros_like(
+                    mode_idx, dtype=final_poses_cls.dtype
+                ).unsqueeze(-1),
+            )
+            stage24_diagnostics.update(stage24_outputs)
+            stage24_diagnostics.update(stage25_outputs)
+        elif self._inference_selector_source == "trajectory_safety_value_v2":
+            if int(self._stage24_selector_training_updates.item()) <= 0:
+                raise RuntimeError(
+                    "trajectory_safety_value_v2 requires a trained Stage24 selector"
+                )
+            if num_modes != 20:
+                raise RuntimeError(
+                    "trajectory_safety_value_v2 requires all 20 generator modes"
+                )
+            stage24_outputs = self.stage24_selector(
+                final_poses_reg, final_poses_cls.detach(), bev_feature,
+                bev_spatial_shape, agents_query, ego_query, status_encoding,
+            )
+            collect_calibration = bool(
+                getattr(self._config, "stage24_collect_calibration", False)
+            )
+            if collect_calibration:
+                mode_idx = stage24_outputs["fallback_mode"]
+                stage24_diagnostics = {
+                    "calibration_collection": torch.ones(
+                        bs, dtype=torch.bool, device=device
+                    ),
+                    "fallback_mode": mode_idx,
+                    "switch": torch.zeros(bs, dtype=torch.bool, device=device),
+                }
+            else:
+                if not bool(self._stage24_calibration_loaded.item()):
+                    raise RuntimeError(
+                        "Stage24 deployment requires loaded calibration/OOD state"
+                    )
+                mode_idx, stage24_diagnostics = select_stage24_trajectory(
+                    final_poses_cls.detach(),
+                    stage24_outputs["safety_probabilities"],
+                    stage24_outputs["any_unsafe_probabilities"],
+                    stage24_outputs["component_delta_predictions"],
+                    stage24_outputs["delta_predictions"],
+                    stage24_outputs["embedding_mean"],
+                    residual_margin=float(getattr(
+                        self._config, "stage24_selector_residual_margin", -1.0
+                    )),
+                    risk_threshold=float(getattr(
+                        self._config, "stage24_selector_risk_threshold", -1.0
+                    )),
+                    ood_mean=self._stage24_ood_mean,
+                    ood_variance=self._stage24_ood_variance,
+                    ood_threshold=float(getattr(
+                        self._config, "stage24_selector_ood_threshold", -1.0
+                    )),
+                    confidence_z=float(getattr(
+                        self._config, "stage24_selector_confidence_z", 1.96
+                    )),
+                    safety_tolerance=float(getattr(
+                        self._config, "stage24_selector_safety_tolerance", 0.001
+                    )),
+                )
+            inference_selector_logits = torch.full_like(
+                final_poses_cls, torch.finfo(final_poses_cls.dtype).min
+            )
+            inference_selector_logits.scatter_(
+                1, mode_idx.unsqueeze(-1),
+                torch.zeros_like(
+                    mode_idx, dtype=final_poses_cls.dtype
+                ).unsqueeze(-1),
+            )
+            stage24_diagnostics.update(stage24_outputs)
         elif self._inference_selector_source == "paired_tail_risk":
             if final_ref_poses_reg is None:
                 raise RuntimeError(
@@ -2061,7 +3486,14 @@ class TrajectoryHead(nn.Module):
         paired_base_rewards = None
         paired_base_valid = None
         paired_base_components = None
-        if tokens_list is not None:
+        if (
+            tokens_list is not None
+            and self._inference_selector_source
+            not in {
+                "trajectory_oof", "trajectory_safety_value_v2",
+                "trajectory_relative_harm_v3",
+            }
+        ):
             reward_trajectories = final_poses_reg
             reward_modes = num_modes
             if self._inference_selector_source == "paired_tail_risk":
@@ -2111,6 +3543,8 @@ class TrajectoryHead(nn.Module):
             "num_modes": num_modes,
             "grpo_training_rollout": False,
             **{f"value_selector_{key}": value for key, value in value_diagnostics.items()},
+            **{f"stage23_selector_{key}": value for key, value in stage23_diagnostics.items()},
+            **{f"stage24_selector_{key}": value for key, value in stage24_diagnostics.items()},
             **{f"paired_risk_{key}": value for key, value in paired_diagnostics.items()},
             **trust_diagnostics,
         }

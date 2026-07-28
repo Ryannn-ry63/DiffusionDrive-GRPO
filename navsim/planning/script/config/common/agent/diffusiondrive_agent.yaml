@@ -28,6 +28,49 @@ config:
   value_selector_calibration_margin: -1.0
   value_selector_safety_threshold: 0.9
   value_selector_confidence_z: 1.64
+  stage23_selector_num_members: 5
+  stage23_selector_num_modes: 20
+  stage23_selector_dim: 128
+  stage23_selector_checkpoint_path: ""
+  stage23_selector_calibration_path: ""
+  stage23_selector_train_manifest_path: ""
+  stage23_candidate_bank_paths: []
+  stage23_generator_train_manifest_path: ""
+  stage23_selector_pair_reward_gap: 0.01
+  stage23_selector_focal_gamma: 2.0
+  stage23_selector_unsafe_positive_weight: 50.0
+  stage23_selector_residual_margin: -1.0
+  stage23_selector_safety_threshold: 0.95
+  stage23_selector_confidence_z: 1.96
+  stage23_selector_safety_tolerance: 0.0
+  stage24_selector_num_members: 8
+  stage24_selector_num_modes: 20
+  stage24_selector_dim: 128
+  stage24_selector_checkpoint_path: ""
+  stage24_selector_calibration_path: ""
+  stage24_selector_train_manifest_path: ""
+  stage24_candidate_bank_paths: []
+  stage24_selector_steps_per_epoch: 1528
+  stage24_selector_subbag_fraction: 0.8
+  stage24_selector_pair_reward_gap: 0.005
+  stage24_selector_focal_gamma: 2.0
+  stage24_selector_hard_negative_count: 4
+  stage24_selector_residual_margin: -1.0
+  stage24_selector_risk_threshold: -1.0
+  stage24_selector_ood_threshold: -1.0
+  stage24_selector_confidence_z: 1.96
+  stage24_selector_safety_tolerance: 0.001
+  stage24_collect_calibration: false
+  stage24_generator_train_manifest_path: ""
+  stage25_selector_checkpoint_path: ""
+  stage25_selector_calibration_path: ""
+  stage25_selector_focal_gamma: 2.0
+  stage25_selector_hard_negative_count: 4
+  stage25_selector_hard_risk_margin: 0.9
+  stage25_selector_risk_threshold: -1.0
+  stage25_collect_calibration: false
+  stage28_training_selector_role: ""
+  stage28_exploration_authorization_path: ""
   paired_risk_checkpoint_path: ""
   paired_risk_train_manifest_path: ""
   paired_risk_validation_manifest_path: ""
@@ -66,6 +109,156 @@ config:
   diffgrpo_train_manifest_path: ""
   diffgrpo_selected_mode_manifest_path: ""
   diffgrpo_group_size: 8
+  diffgrpo_base_margin: 0.01
+  diffgrpo_base_scale: 0.10
+  diffgrpo_base_advantage_clip: 2.0
+  diffgrpo_safety_regression_tolerance: 0.000001
+  diffgrpo_bc_max_weight: 0.3
+  diffgrpo_paired_positive_margin: 0.01
+  diffgrpo_paired_negative_margin: 0.01
+  diffgrpo_paired_mature_negative_margin: 0.002
+  diffgrpo_paired_mature_reward_threshold: 0.75
+  diffgrpo_paired_mature_negative_multiplier: 2.0
+  diffgrpo_paired_regular_kl_weight: 0.1
+  diffgrpo_paired_mature_kl_weight: 0.5
+  diffgrpo_paired_bootstrap_advantage_weight: 0.25
+  stage29_headroom_low: 0.75
+  stage29_headroom_high: 0.90
+  stage29_delta_scale_floor: 0.002
+  stage29_rank_weight: 0.5
+  stage29_conditional_regularization: false
+  stage29_fixed_bc_weight: 0.1
+  stage29_fixed_kl_weight: 0.1
+  stage29_hard_bc_weight: 0.05
+  stage29_mature_bc_weight: 0.1
+  stage29_hard_kl_weight: 0.05
+  stage29_mature_kl_weight: 0.5
+  stage29_safety_kl_weight: 0.5
+  stage30_bucket_manifest_path: ""
+  stage30_plan_sha256: e9867ec48d4806ff97adb0284bae7550305cb1350e4ec66dbfd20d245de435ce
+  stage30_top_k: 5
+  stage30_delta_scale_floor: 0.002
+  stage30_coverage_top_weight: 0.5
+  stage30_boundary_top_weight: 0.25
+  stage30_boundary_positive_margin: 0.001
+  stage30_boundary_negative_multiplier: 2.0
+  stage30_mature_negative_floor: -0.0002
+  stage30_mature_positive_margin: 0.002
+  stage30_mature_negative_multiplier: 4.0
+  stage30_component_tolerance: 0.000001
+  stage30_optimizer_steps_per_epoch: 48
+  stage30_gradient_accumulation: 8
+  stage30_global_bucket_composition: [2, 30, 8, 24]
+  stage31_bucket_manifest_path: ""
+  stage31_plan_sha256: 3ff3d3bcd3120b9d73a017876f942458eb3fa16651517e4e30b27cf2fff7bb0d
+  stage31_headroom_low: 0.75
+  stage31_headroom_high: 0.90
+  stage31_delta_scale_floor: 0.002
+  stage31_rank_weight: 0.5
+  stage31_bc_weight: 0.1
+  stage31_kl_weight: 0.1
+  stage31_safety_kl_weight: 0.5
+  stage31_optimizer_steps_per_epoch: 48
+  stage31_gradient_accumulation: 8
+  stage31_global_bucket_composition: [2, 30, 8, 24]
+  stage32_bucket_manifest_path: ""
+  stage32_plan_sha256: 5c5f3b148c8d03fe3c714558314ebd895a8f143b94fd10fb9bdf8c4ad61cefcd
+  stage32_scf_objective_revision: mean_normalized_bc_kl_v2
+  stage32_frontier_pool_size: 4
+  stage32_frontier_risk_margin: 0.10
+  stage32_frontier_owner_margin: 0.001
+  stage32_frontier_weight: 0.5
+  stage32_frontier_mature_cap: 0.25
+  stage32_optimizer_steps_per_epoch: 48
+  stage32_gradient_accumulation: 8
+  stage32_global_bucket_composition: [2, 30, 8, 24]
+  stage33_bucket_manifest_path: ""
+  stage33_plan_sha256: 0ace8d8959360a15cfac8f45bc2c6e19898c09ad1a04aa7b5e5dcc2fb36283ff
+  stage33_selector_reranker_path: ""
+  stage33_selector_reranker_sha256: ""
+  stage33_cdc_objective_revision: cdc_deployment_credit_v1
+  stage33_deployment_weight: 0.5
+  stage33_headroom_weight: 0.5
+  stage33_headroom_margin: 0.001
+  stage33_advantage_clip: 2.0
+  stage33_optimizer_steps_per_epoch: 48
+  stage33_gradient_accumulation: 8
+  stage33_global_bucket_composition: [2, 30, 8, 24]
+  stage34_bucket_manifest_path: ""
+  stage34_plan_sha256: ad3e9dace53cd3196ef236c7d3630605e64aa46c908e5dd18c81b8600eaf155a
+  stage34_objective_revision: mode_aligned_frontier_v1
+  stage34_top_k: 5
+  stage34_headroom_k: 2
+  stage34_delta_scale_floor: 0.002
+  stage34_deployment_weight: 0.5
+  stage34_headroom_weight: 0.25
+  stage34_headroom_margin: 0.001
+  stage34_top5_negative_multiplier: 1.5
+  stage34_top1_negative_multiplier: 2.0
+  stage34_mature_positive_multiplier: 0.25
+  stage34_advantage_clip: 2.0
+  stage34_bc_weight: 0.1
+  stage34_kl_weight: 0.1
+  stage34_safety_kl_weight: 0.5
+  stage34_optimizer_steps_per_epoch: 48
+  stage34_gradient_accumulation: 8
+  stage34_global_bucket_composition: [2, 30, 8, 24]
+  stage35_bucket_manifest_path: ""
+  stage35_plan_sha256: 301e5fb37066c34f6a3e224be08fd1ca435cc9a8d961121869cf6dcd21d2fae7
+  stage35_objective_revision: nested_counterfactual_deployment_v1
+  stage35_active_pool_width: 4
+  stage35_selector_micro_batch_size: 16
+  stage35_frontier_risk_margin: 0.10
+  stage35_counterfactual_weight: 0.25
+  stage35_mature_positive_multiplier: 0.25
+  stage35_advantage_eps: 0.001
+  stage35_delta_scale_floor: 0.002
+  stage35_headroom_low: 0.75
+  stage35_headroom_high: 0.90
+  stage35_rank_weight: 0.5
+  stage35_advantage_clip: 2.0
+  stage35_bc_weight: 0.1
+  stage35_kl_weight: 0.1
+  stage35_safety_kl_weight: 0.5
+  stage35_optimizer_steps_per_epoch: 48
+  stage35_gradient_accumulation: 8
+  stage35_global_bucket_composition: [2, 30, 8, 24]
+  stage35_signal_nonzero_fraction_min: 0.10
+  stage35_signal_nonowner_scene_fraction_min: 0.25
+  stage35_diagnostic_only: false
+  stage36_bucket_manifest_path: ""
+  stage36_plan_sha256: 858e6688faa9dff6d9027254e6a0262c67e47582d51a5829cc12a9723a25e521
+  stage36_objective_revision: reference_gated_tail_ncd_v1
+  stage36_active_pool_width: 4
+  stage36_selector_micro_batch_size: 16
+  stage36_frontier_risk_margin: 0.10
+  stage36_frontier_width: 5
+  stage36_tail_elite_count: 2
+  stage36_retention_tolerance: 0.0001
+  stage36_tail_margin: 0.001
+  stage36_tail_scale: 0.002
+  stage36_tail_weight: 0.25
+  stage36_retention_weight: 0.25
+  stage36_counterfactual_weight: 0.25
+  stage36_mature_positive_multiplier: 0.25
+  stage36_advantage_eps: 0.001
+  stage36_delta_scale_floor: 0.002
+  stage36_headroom_low: 0.75
+  stage36_headroom_high: 0.90
+  stage36_rank_weight: 0.5
+  stage36_advantage_clip: 2.0
+  stage36_bc_weight: 0.1
+  stage36_kl_weight: 0.1
+  stage36_safety_kl_weight: 0.5
+  stage36_optimizer_steps_per_epoch: 48
+  stage36_gradient_accumulation: 8
+  stage36_global_bucket_composition: [2, 30, 8, 24]
+  stage36_signal_retention_fraction_min: 0.01
+  stage36_signal_tail_fraction_min: 0.005
+  stage36_diagnostic_only: false
+  diffgrpo_lora_rank: 8
+  diffgrpo_lora_alpha: 8.0
+  weight_decay: 0.0001
   generation_adaptive_kl_enabled: false
   generation_kl_initial_coefficient: 0.1
   generation_kl_min_coefficient: 0.1

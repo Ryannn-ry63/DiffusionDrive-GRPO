@@ -74,6 +74,7 @@ class AgentLightningModule(pl.LightningModule):
         if (
             training_mode not in {
                 "diffgrpo_full_chain", "diffgrpo_selected_anchor",
+                "diffgrpo_paired_residual",
                 "paired_tail_risk_selector",
             }
             and head is not None
@@ -200,6 +201,36 @@ class AgentLightningModule(pl.LightningModule):
                         + parameter.grad.detach().float().square().sum()
                     )
         value_selector_grad_norm = value_squared_norm.sqrt()
+        stage23_squared_norm = torch.zeros((), device=self.device)
+        stage23_selector = getattr(trajectory_head, "stage23_selector", None)
+        if stage23_selector is not None:
+            for parameter in stage23_selector.parameters():
+                if parameter.grad is not None:
+                    stage23_squared_norm = (
+                        stage23_squared_norm
+                        + parameter.grad.detach().float().square().sum()
+                    )
+        stage23_selector_grad_norm = stage23_squared_norm.sqrt()
+        stage24_squared_norm = torch.zeros((), device=self.device)
+        stage24_selector = getattr(trajectory_head, "stage24_selector", None)
+        if stage24_selector is not None:
+            for parameter in stage24_selector.parameters():
+                if parameter.grad is not None:
+                    stage24_squared_norm = (
+                        stage24_squared_norm
+                        + parameter.grad.detach().float().square().sum()
+                    )
+        stage24_selector_grad_norm = stage24_squared_norm.sqrt()
+        stage25_squared_norm = torch.zeros((), device=self.device)
+        stage25_selector = getattr(trajectory_head, "stage25_selector", None)
+        if stage25_selector is not None:
+            for parameter in stage25_selector.parameters():
+                if parameter.grad is not None:
+                    stage25_squared_norm = (
+                        stage25_squared_norm
+                        + parameter.grad.detach().float().square().sum()
+                    )
+        stage25_selector_grad_norm = stage25_squared_norm.sqrt()
         paired_squared_norm = torch.zeros((), device=self.device)
         paired_risk = getattr(trajectory_head, "paired_risk_head", None)
         if paired_risk is not None:
@@ -215,25 +246,110 @@ class AgentLightningModule(pl.LightningModule):
         )
         if training_mode in {
             "generation", "generation_group", "generation_group_adaptive",
-            "diffgrpo_full_chain", "diffgrpo_selected_anchor"
+            "diffgrpo_full_chain", "diffgrpo_selected_anchor",
+            "diffgrpo_selected_anchor_base_preserve",
+            "diffgrpo_paired_residual",
+            "diffgrpo_selected_set",
+            "stage27_public_diffgrpo_selected_set",
+            "stage28_public_paired_uplift_multi",
+            "stage28_public_paired_uplift_explore",
+            "stage29_public_headroom_hybrid",
+            "stage29_public_headroom_conditional",
+            "stage30_public_mode_coverage",
+            "stage30_public_mode_coverage_constrained",
+            "stage31_public_deployed_pair",
+            "stage31_public_deployed_frontier",
+            "stage32_public_deployed_extended",
+            "stage32_selector_aware_frontier",
+            "stage33_cdc_grpo",
+            "stage34_mode_aligned_frontier_grpo",
         } and (
             grad_norms["classification"] != 0 or perception_grad_norm != 0
         ):
             raise RuntimeError(
                 "Generation-only GRPO produced classification/perception gradients"
             )
+        if training_mode in {
+            "diffgrpo_selected_set",
+            "stage27_public_diffgrpo_selected_set",
+            "stage28_public_paired_uplift_multi",
+            "stage28_public_paired_uplift_explore",
+            "stage29_public_headroom_hybrid",
+            "stage29_public_headroom_conditional",
+            "stage30_public_mode_coverage",
+            "stage30_public_mode_coverage_constrained",
+            "stage31_public_deployed_pair",
+            "stage31_public_deployed_frontier",
+            "stage32_public_deployed_extended",
+            "stage32_selector_aware_frontier",
+            "stage33_cdc_grpo",
+            "stage34_mode_aligned_frontier_grpo",
+        } and (
+            total_grad_norm <= 0
+            or value_selector_grad_norm != 0
+            or stage23_selector_grad_norm != 0
+            or stage24_selector_grad_norm != 0
+            or stage25_selector_grad_norm != 0
+            or paired_risk_grad_norm != 0
+        ):
+            raise RuntimeError(
+                "Selected-set GRPO violated its frozen selector boundary or has "
+                "zero decoder gradient"
+            )
         if training_mode == "value_selector" and (
             total_grad_norm != 0
             or perception_grad_norm != 0
             or value_selector_grad_norm <= 0
+            or stage23_selector_grad_norm != 0
+            or stage24_selector_grad_norm != 0
+            or stage25_selector_grad_norm != 0
         ):
             raise RuntimeError(
                 "Value-selector training violated its frozen boundary or has zero gradient"
+            )
+        if training_mode == "stage23_selector" and (
+            total_grad_norm != 0
+            or perception_grad_norm != 0
+            or value_selector_grad_norm != 0
+            or stage23_selector_grad_norm <= 0
+            or stage24_selector_grad_norm != 0
+            or stage25_selector_grad_norm != 0
+            or paired_risk_grad_norm != 0
+        ):
+            raise RuntimeError(
+                "Stage23 selector violated its frozen boundary or has zero gradient"
+            )
+        if training_mode == "stage24_selector" and (
+            total_grad_norm != 0
+            or perception_grad_norm != 0
+            or value_selector_grad_norm != 0
+            or stage23_selector_grad_norm != 0
+            or stage24_selector_grad_norm <= 0
+            or stage25_selector_grad_norm != 0
+            or paired_risk_grad_norm != 0
+        ):
+            raise RuntimeError(
+                "Stage24 selector violated its frozen boundary or has zero gradient"
+            )
+        if training_mode == "stage25_relative_harm_selector" and (
+            total_grad_norm != 0
+            or perception_grad_norm != 0
+            or value_selector_grad_norm != 0
+            or stage23_selector_grad_norm != 0
+            or stage24_selector_grad_norm != 0
+            or stage25_selector_grad_norm <= 0
+            or paired_risk_grad_norm != 0
+        ):
+            raise RuntimeError(
+                "Stage25 selector violated its frozen boundary or has zero gradient"
             )
         if training_mode == "paired_tail_risk_selector" and (
             total_grad_norm != 0
             or perception_grad_norm != 0
             or value_selector_grad_norm != 0
+            or stage23_selector_grad_norm != 0
+            or stage24_selector_grad_norm != 0
+            or stage25_selector_grad_norm != 0
             or paired_risk_grad_norm <= 0
         ):
             raise RuntimeError(
@@ -241,7 +357,9 @@ class AgentLightningModule(pl.LightningModule):
             )
         if not all(torch.isfinite(value) for value in (
             *grad_norms.values(), total_grad_norm, perception_grad_norm,
-            value_selector_grad_norm, paired_risk_grad_norm,
+            value_selector_grad_norm, stage23_selector_grad_norm,
+            stage24_selector_grad_norm, paired_risk_grad_norm,
+            stage25_selector_grad_norm,
         )):
             raise FloatingPointError("Non-finite diff_decoder gradient norm")
         self.log(
@@ -254,6 +372,18 @@ class AgentLightningModule(pl.LightningModule):
         )
         self.log(
             "train/value_selector_grad_norm", value_selector_grad_norm,
+            on_step=True, on_epoch=True, prog_bar=True, sync_dist=True,
+        )
+        self.log(
+            "train/stage23_selector_grad_norm", stage23_selector_grad_norm,
+            on_step=True, on_epoch=True, prog_bar=False, sync_dist=True,
+        )
+        self.log(
+            "train/stage24_selector_grad_norm", stage24_selector_grad_norm,
+            on_step=True, on_epoch=True, prog_bar=True, sync_dist=True,
+        )
+        self.log(
+            "train/stage25_selector_grad_norm", stage25_selector_grad_norm,
             on_step=True, on_epoch=True, prog_bar=True, sync_dist=True,
         )
         self.log(

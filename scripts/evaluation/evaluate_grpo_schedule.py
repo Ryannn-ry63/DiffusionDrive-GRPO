@@ -51,6 +51,8 @@ TRUST_METRICS = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, default=BASE_CHECKPOINT)
+    # Stage15 preregistered interface retained as a strict subset:
+    # choices=("current", "reference", "value_top2", "paired_tail_risk")
     parser.add_argument(
         "--reference-checkpoint",
         type=Path,
@@ -71,6 +73,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-path", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--metric-cache-path", type=Path, default=DEFAULT_METRIC_CACHE)
     parser.add_argument("--limit", type=int, default=1024)
+    parser.add_argument(
+        "--token-offset", type=int, default=0,
+        help="Start index in a fixed tokens file; used for resumable shards",
+    )
     parser.add_argument(
         "--log-split",
         choices=("train", "val", "test"),
@@ -101,6 +107,9 @@ def parse_args() -> argparse.Namespace:
             "legacy_ppo",
             "diffgrpo_full_chain",
             "diffgrpo_selected_anchor",
+            "diffgrpo_selected_anchor_base_preserve",
+            "diffgrpo_paired_residual",
+            "diffgrpo_selected_set",
         ),
         default="legacy_ppo",
         help="Record and validate the generation algorithm associated with the schedule",
@@ -113,7 +122,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--selector-logits-source",
-        choices=("current", "reference", "value_top2", "paired_tail_risk"),
+        choices=(
+            "current", "reference", "value_top2", "paired_tail_risk",
+            "trajectory_oof", "trajectory_safety_value_v2",
+            "trajectory_relative_harm_v3",
+        ),
         default="current",
         help="Choose current candidates with current, frozen-reference, or Stage-15 logits",
     )
@@ -122,6 +135,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paired-risk-checkpoint", type=Path)
     parser.add_argument("--paired-risk-threshold", type=float, default=-1.0)
     parser.add_argument("--paired-risk-calibration-path", type=Path)
+    parser.add_argument("--stage23-selector-checkpoint", type=Path)
+    parser.add_argument("--stage23-selector-residual-margin", type=float, default=-1.0)
+    parser.add_argument("--stage23-selector-safety-threshold", type=float, default=0.95)
+    parser.add_argument("--stage24-selector-checkpoint", type=Path)
+    parser.add_argument("--stage24-selector-calibration", type=Path)
+    parser.add_argument("--stage24-selector-residual-margin", type=float, default=-1.0)
+    parser.add_argument("--stage24-selector-risk-threshold", type=float, default=-1.0)
+    parser.add_argument("--stage24-selector-ood-threshold", type=float, default=-1.0)
+    parser.add_argument(
+        "--stage24-collect-calibration", action="store_true",
+    )
+    parser.add_argument("--stage25-selector-checkpoint", type=Path)
+    parser.add_argument("--stage25-selector-calibration", type=Path)
+    parser.add_argument("--stage25-selector-risk-threshold", type=float, default=-1.0)
+    parser.add_argument(
+        "--stage25-collect-calibration", action="store_true",
+    )
+    parser.add_argument("--generator-domain", default="")
+    parser.add_argument(
+        "--store-candidate-trajectories", action="store_true",
+        help="Store all 20 trajectories for the preregistered Stage23 candidate bank",
+    )
     parser.add_argument(
         "--paired-risk-expected-generator-sha256",
         default="",
@@ -200,6 +235,19 @@ def load_ordered_tokens(path: Path) -> list[str]:
     return tokens
 
 
+def load_token_logs(path: Path) -> dict[str, str]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
+        return {}
+    result = {}
+    for record in payload["records"]:
+        token = str(record.get("token", ""))
+        log_name = str(record.get("log_name", record.get("log_id", "")))
+        if token and log_name:
+            result[token] = log_name
+    return result
+
+
 def paired_bootstrap_ci(
     differences: np.ndarray, samples: int, seed: int
 ) -> list[float]:
@@ -255,7 +303,63 @@ def main() -> None:
         raise ValueError(
             "--paired-risk-checkpoint is valid only with paired_tail_risk"
         )
+    if args.selector_logits_source == "trajectory_oof":
+        if (
+            args.stage23_selector_checkpoint is None
+            or not args.stage23_selector_checkpoint.is_file()
+        ):
+            raise ValueError("trajectory_oof requires --stage23-selector-checkpoint")
+        if args.stage23_selector_residual_margin < 0:
+            raise ValueError("trajectory_oof requires a calibrated non-negative margin")
+    elif args.stage23_selector_checkpoint is not None:
+        raise ValueError(
+            "--stage23-selector-checkpoint is valid only with trajectory_oof"
+        )
 
+    if args.selector_logits_source == "trajectory_safety_value_v2":
+        if (
+            args.stage24_selector_checkpoint is None
+            or not args.stage24_selector_checkpoint.is_file()
+        ):
+            raise ValueError(
+                "trajectory_safety_value_v2 requires --stage24-selector-checkpoint"
+            )
+        if not args.stage24_collect_calibration:
+            if (
+                args.stage24_selector_calibration is None
+                or not args.stage24_selector_calibration.is_file()
+            ):
+                raise ValueError("Stage24 deployment requires calibration")
+            if min(
+                args.stage24_selector_residual_margin,
+                args.stage24_selector_risk_threshold,
+                args.stage24_selector_ood_threshold,
+            ) < 0:
+                raise ValueError("Stage24 calibrated thresholds must be non-negative")
+    elif args.stage24_selector_checkpoint is not None:
+        raise ValueError("Stage24 checkpoint is valid only with its selector source")
+    if args.selector_logits_source == "trajectory_relative_harm_v3":
+        if (
+            args.stage25_selector_checkpoint is None
+            or not args.stage25_selector_checkpoint.is_file()
+        ):
+            raise ValueError(
+                "trajectory_relative_harm_v3 requires --stage25-selector-checkpoint"
+            )
+        if not args.stage25_collect_calibration:
+            if (
+                args.stage25_selector_calibration is None
+                or not args.stage25_selector_calibration.is_file()
+            ):
+                raise ValueError("Stage25 deployment requires calibration")
+            if min(
+                args.stage24_selector_residual_margin,
+                args.stage25_selector_risk_threshold,
+                args.stage24_selector_ood_threshold,
+            ) < 0:
+                raise ValueError("Stage25 calibrated thresholds must be non-negative")
+    elif args.stage25_selector_checkpoint is not None:
+        raise ValueError("Stage25 checkpoint is valid only with its selector source")
     config = replace(
         TransfuserConfig(),
         metric_cache_path=(
@@ -269,6 +373,19 @@ def main() -> None:
         inference_selector_source=args.selector_logits_source,
         value_selector_checkpoint_path=str(args.value_selector_checkpoint or ""),
         value_selector_calibration_margin=args.value_selector_calibration_margin,
+        stage23_selector_checkpoint_path=str(args.stage23_selector_checkpoint or ""),
+        stage23_selector_residual_margin=args.stage23_selector_residual_margin,
+        stage23_selector_safety_threshold=args.stage23_selector_safety_threshold,
+        stage24_selector_checkpoint_path=str(args.stage24_selector_checkpoint or ""),
+        stage24_selector_calibration_path=str(args.stage24_selector_calibration or ""),
+        stage24_selector_residual_margin=args.stage24_selector_residual_margin,
+        stage24_selector_risk_threshold=args.stage24_selector_risk_threshold,
+        stage24_selector_ood_threshold=args.stage24_selector_ood_threshold,
+        stage24_collect_calibration=bool(args.stage24_collect_calibration),
+        stage25_selector_checkpoint_path=str(args.stage25_selector_checkpoint or ""),
+        stage25_selector_calibration_path=str(args.stage25_selector_calibration or ""),
+        stage25_selector_risk_threshold=args.stage25_selector_risk_threshold,
+        stage25_collect_calibration=bool(args.stage25_collect_calibration),
         paired_risk_checkpoint_path=str(args.paired_risk_checkpoint or ""),
         paired_risk_threshold=args.paired_risk_threshold,
         paired_risk_calibration_path=str(args.paired_risk_calibration_path or ""),
@@ -308,7 +425,12 @@ def main() -> None:
         rewardable = set(MetricCacheLoader(args.metric_cache_path).tokens)
         available = set(dataset.tokens).intersection(rewardable)
     if args.tokens_file is not None:
-        requested_tokens = load_ordered_tokens(args.tokens_file)[: args.limit]
+        if args.token_offset < 0:
+            raise ValueError("token-offset must be non-negative")
+        ordered_tokens = load_ordered_tokens(args.tokens_file)
+        requested_tokens = ordered_tokens[
+            args.token_offset : args.token_offset + args.limit
+        ]
         missing_tokens = [token for token in requested_tokens if token not in available]
         if missing_tokens:
             raise RuntimeError(
@@ -323,6 +445,7 @@ def main() -> None:
             f"Requested {args.limit} tokens, found only {len(dataset.tokens)} "
             f"rewardable {args.log_split} tokens"
         )
+    token_logs = load_token_logs(args.tokens_file) if args.tokens_file is not None else {}
 
     loader = DataLoader(
         dataset,
@@ -376,15 +499,68 @@ def main() -> None:
                         flush=True,
                     )
                 continue
-            rewards = predictions["rewards"].float()
-            valid = predictions["reward_valid_mask"].bool()
+            trajectories = predictions["final_poses_reg"].float()
+            stage23_active = args.selector_logits_source == "trajectory_oof"
+            stage24_active = args.selector_logits_source == "trajectory_safety_value_v2"
+            stage25_active = args.selector_logits_source == "trajectory_relative_harm_v3"
+            if stage23_active or stage24_active or stage25_active:
+                # Deliberately outside the model inference graph: PDM supplies
+                # evaluation labels only and cannot influence mode selection.
+                head = agent._transfuser_model._trajectory_head
+                reward_result = head._compute_rewards_from_lazy_cache(
+                    trajectories, tokens, trajectories.shape[1]
+                )
+                rewards = reward_result["raw_rewards"].float()
+                valid = reward_result["valid_mask"].bool()
+                components = reward_result["component_scores"].float()
+            else:
+                rewards = predictions["rewards"].float()
+                valid = predictions["reward_valid_mask"].bool()
+                components = predictions["reward_component_scores"].float()
             current_logits = predictions["final_poses_cls"].float()
             reference_logits = predictions["final_ref_poses_cls"].float()
             logits = predictions["inference_selector_logits"].float()
-            trajectories = predictions["final_poses_reg"].float()
-            components = predictions["reward_component_scores"].float()
             value_active = args.selector_logits_source == "value_top2"
             paired_active = args.selector_logits_source == "paired_tail_risk"
+            stage23_batch = {}
+            stage24_batch = {}
+            if stage24_active or stage25_active:
+                for name in (
+                    "fallback_mode", "switch", "safety_probabilities",
+                    "any_unsafe_probabilities", "component_delta_predictions",
+                    "delta_predictions", "embedding_mean",
+                ):
+                    key = f"stage24_selector_{name}"
+                    if key not in predictions:
+                        raise RuntimeError(f"Missing Stage24 diagnostic: {key}")
+                    stage24_batch[name] = predictions[key]
+                if stage25_active:
+                    for name in (
+                        "harm_probabilities", "catastrophe_probabilities",
+                    ):
+                        key = f"stage24_selector_{name}"
+                        if key not in predictions:
+                            raise RuntimeError(
+                                f"Missing Stage25 diagnostic: {key}"
+                            )
+                        stage24_batch[name] = predictions[key]
+                for name in (
+                    "challenger_mode", "eligible", "risk_ucb", "delta_lcb",
+                    "safety_delta_lcb", "ood_distance", "ood_rejected",
+                ):
+                    key = f"stage24_selector_{name}"
+                    if key in predictions:
+                        stage24_batch[name] = predictions[key]
+            if stage23_active:
+                for name in (
+                    "fallback_mode", "challenger_mode", "switch", "eligible",
+                    "advantage_mean", "advantage_std", "advantage_lcb",
+                    "safety_lower", "component_predictions", "score_predictions",
+                ):
+                    key = f"stage23_selector_{name}"
+                    if key not in predictions:
+                        raise RuntimeError(f"Missing Stage23 diagnostic: {key}")
+                    stage23_batch[name] = predictions[key]
             value_batch = {}
             if value_active:
                 for name in (
@@ -610,9 +786,94 @@ def main() -> None:
                             ].detach().cpu().tolist(),
                         }
                     }
+                stage23_record = {}
+                if stage23_active:
+                    fallback_mode = int(stage23_batch["fallback_mode"][row].item())
+                    challenger_mode = int(stage23_batch["challenger_mode"][row].item())
+                    switched = bool(stage23_batch["switch"][row].item())
+                    stage23_record = {
+                        "stage23_selector": {
+                            "fallback_mode": fallback_mode,
+                            "challenger_mode": challenger_mode,
+                            "switched": switched,
+                            "true_selected_minus_fallback": float(
+                                rewards[row, selected_mode].item()
+                                - rewards[row, fallback_mode].item()
+                            ),
+                            "fallback_components": components[row, fallback_mode]
+                            .detach().cpu().tolist(),
+                            "selected_components": components[row, selected_mode]
+                            .detach().cpu().tolist(),
+                            "eligible": stage23_batch["eligible"][row]
+                            .detach().cpu().tolist(),
+                            "advantage_mean": stage23_batch["advantage_mean"][row]
+                            .detach().cpu().tolist(),
+                            "advantage_std": stage23_batch["advantage_std"][row]
+                            .detach().cpu().tolist(),
+                            "advantage_lcb": stage23_batch["advantage_lcb"][row]
+                            .detach().cpu().tolist(),
+                            "safety_lower": stage23_batch["safety_lower"][row]
+                            .detach().cpu().tolist(),
+                            "component_predictions": stage23_batch[
+                                "component_predictions"
+                            ][row].detach().cpu().tolist(),
+                            "score_predictions": stage23_batch["score_predictions"][
+                                row
+                            ].detach().cpu().tolist(),
+                        }
+                    }
+                stage24_record = {}
+                if stage24_active or stage25_active:
+                    fallback_mode = int(stage24_batch["fallback_mode"][row].item())
+                    switched = bool(stage24_batch["switch"][row].item())
+                    diagnostic = {
+                        "fallback_mode": fallback_mode,
+                        "selected_mode": selected_mode,
+                        "switched": switched,
+                        "true_selected_minus_fallback": float(
+                            rewards[row, selected_mode].item()
+                            - rewards[row, fallback_mode].item()
+                        ),
+                        "fallback_components": components[row, fallback_mode]
+                        .detach().cpu().tolist(),
+                        "selected_components": components[row, selected_mode]
+                        .detach().cpu().tolist(),
+                        "safety_probabilities": stage24_batch[
+                            "safety_probabilities"
+                        ][row].detach().cpu().tolist(),
+                        "any_unsafe_probabilities": stage24_batch[
+                            "any_unsafe_probabilities"
+                        ][row].detach().cpu().tolist(),
+                        "component_delta_predictions": stage24_batch[
+                            "component_delta_predictions"
+                        ][row].detach().cpu().tolist(),
+                        "delta_predictions": stage24_batch[
+                            "delta_predictions"
+                        ][row].detach().cpu().tolist(),
+                        "embedding_mean": stage24_batch[
+                            "embedding_mean"
+                        ][row].detach().cpu().tolist(),
+                    }
+                    if stage25_active:
+                        diagnostic["harm_probabilities"] = stage24_batch[
+                            "harm_probabilities"
+                        ][row].detach().cpu().tolist()
+                        diagnostic["catastrophe_probabilities"] = stage24_batch[
+                            "catastrophe_probabilities"
+                        ][row].detach().cpu().tolist()
+                    for name in (
+                        "challenger_mode", "eligible", "risk_ucb", "delta_lcb",
+                        "safety_delta_lcb", "ood_distance", "ood_rejected",
+                    ):
+                        if name in stage24_batch:
+                            diagnostic[name] = stage24_batch[name][
+                                row
+                            ].detach().cpu().tolist()
+                    stage24_record = {"stage24_selector": diagnostic}
                 records.append(
                     {
                         "token": token,
+                        **({"log_name": token_logs[token]} if token in token_logs else {}),
                         "selector_logits_source": args.selector_logits_source,
                         "selected_reward": selected_value,
                         "oracle_reward": oracle_value,
@@ -637,6 +898,10 @@ def main() -> None:
                             if bool(valid[row, mode]) else None
                             for mode in range(rewards.shape[1])
                         ],
+                        "candidate_components": components[row]
+                        .detach().cpu().tolist(),
+                        "candidate_reference_logits": reference_logits[row]
+                        .detach().cpu().tolist(),
                         "selector_probabilities": [
                             float(selector_probs[row, mode].item())
                             for mode in range(rewards.shape[1])
@@ -645,8 +910,17 @@ def main() -> None:
                         "diversity": diversity_value,
                         "reward_logit_spearman": correlation,
                         "selected_components": component_record,
+                        **(
+                            {
+                                "candidate_trajectories": trajectories[row]
+                                .detach().cpu().tolist()
+                            }
+                            if args.store_candidate_trajectories else {}
+                        ),
                         **value_record,
                         **paired_record,
+                        **stage23_record,
+                        **stage24_record,
                         **(
                             {
                                 "generation_trust": {
@@ -672,6 +946,7 @@ def main() -> None:
     summary = {
         "checkpoint": str(args.checkpoint),
         "checkpoint_sha256": agent._checkpoint_sha256,
+        "generator_domain": str(args.generator_domain),
         "reference_checkpoint": str(args.reference_checkpoint),
         "reference_checkpoint_sha256": agent._reference_checkpoint_sha256,
         "generation_policy_algorithm": args.generation_policy_algorithm,
@@ -680,11 +955,13 @@ def main() -> None:
         "metric_cache_path": str(args.metric_cache_path),
         "tokens_file": str(args.tokens_file),
         "requested_limit": int(args.limit),
+        "token_offset": int(args.token_offset),
         "num_tokens": len(records),
         "num_failures": 0,
         "completed": len(records) == min(int(args.limit), len(dataset)),
         "log_split": args.log_split,
         "selector_logits_source": args.selector_logits_source,
+        "stores_candidate_trajectories": bool(args.store_candidate_trajectories),
         "schedule": agent._transfuser_model._trajectory_head.get_roll_schedule(),
         "selected_reward": float(np.mean(selected_values)),
         "oracle_reward": float(np.mean(oracle_values)),
@@ -754,6 +1031,86 @@ def main() -> None:
                 ((~fallback_array) & (delta_array <= -0.5)).sum()
             ),
         }
+    if args.selector_logits_source == "trajectory_oof":
+        selector_records = [record["stage23_selector"] for record in records]
+        switch_array = np.asarray(
+            [record["switched"] for record in selector_records], dtype=bool
+        )
+        delta_array = np.asarray(
+            [record["true_selected_minus_fallback"] for record in selector_records],
+            dtype=np.float64,
+        )
+        switched_delta = delta_array[switch_array]
+        summary["stage23_selector"] = {
+            "checkpoint": str(args.stage23_selector_checkpoint),
+            "checkpoint_sha256": agent._stage23_selector_checkpoint_sha256,
+            "residual_margin": float(args.stage23_selector_residual_margin),
+            "safety_threshold": float(args.stage23_selector_safety_threshold),
+            "pdm_evaluation_outside_inference_graph": True,
+            "switch_count": int(switch_array.sum()),
+            "switch_rate": float(switch_array.mean()),
+            "selected_minus_fallback_mean": float(delta_array.mean()),
+            "harmful_switch_count": int((switched_delta < 0).sum()),
+            "catastrophic_switch_count": int((switched_delta <= -0.5).sum()),
+            "worst_switch_gain": (
+                float(switched_delta.min()) if switched_delta.size else 0.0
+            ),
+        }
+    if args.selector_logits_source in {
+        "trajectory_safety_value_v2", "trajectory_relative_harm_v3"
+    }:
+        selector_records = [record["stage24_selector"] for record in records]
+        switch_array = np.asarray(
+            [record["switched"] for record in selector_records], dtype=bool
+        )
+        delta_array = np.asarray(
+            [record["true_selected_minus_fallback"] for record in selector_records],
+            dtype=np.float64,
+        )
+        switched_delta = delta_array[switch_array]
+        is_stage25 = (
+            args.selector_logits_source == "trajectory_relative_harm_v3"
+        )
+        selector_summary = {
+            "checkpoint": str(
+                args.stage25_selector_checkpoint
+                if is_stage25 else args.stage24_selector_checkpoint
+            ),
+            "checkpoint_sha256": (
+                agent._stage25_selector_checkpoint_sha256
+                if is_stage25 else agent._stage24_selector_checkpoint_sha256
+            ),
+            "calibration_path": str(
+                (args.stage25_selector_calibration if is_stage25
+                 else args.stage24_selector_calibration) or ""
+            ),
+            "calibration_sha256": (
+                agent._stage25_calibration_sha256
+                if is_stage25 else agent._stage24_calibration_sha256
+            ),
+            "calibration_collection": bool(
+                args.stage25_collect_calibration
+                if is_stage25 else args.stage24_collect_calibration
+            ),
+            "residual_margin": float(args.stage24_selector_residual_margin),
+            "risk_threshold": float(
+                args.stage25_selector_risk_threshold
+                if is_stage25 else args.stage24_selector_risk_threshold
+            ),
+            "ood_threshold": float(args.stage24_selector_ood_threshold),
+            "pdm_evaluation_outside_inference_graph": True,
+            "switch_count": int(switch_array.sum()),
+            "switch_rate": float(switch_array.mean()),
+            "selected_minus_fallback_mean": float(delta_array.mean()),
+            "harmful_switch_count": int((switched_delta < 0).sum()),
+            "catastrophic_switch_count": int((switched_delta <= -0.5).sum()),
+            "worst_switch_gain": (
+                float(switched_delta.min()) if switched_delta.size else 0.0
+            ),
+        }
+        summary[
+            "stage25_selector" if is_stage25 else "stage24_selector"
+        ] = selector_summary
     if args.collect_trust_calibration:
         for key in (
             "selected_reward",

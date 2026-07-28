@@ -1,3 +1,29 @@
 *.pyc
 *.npy
 core*
+
+# Local caches and temporary files
+__pycache__/
+.pytest_cache/
+*.orig
+*.rej
+.stage*_probe
+
+# Generated experiment outputs
+artifacts/
+outputs/
+logs/
+lightning_logs/
+wandb/
+slurm-*.out
+slurm-*.err
+
+# Model weights and checkpoints
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+
+# Local secrets
+.env
+.env.*

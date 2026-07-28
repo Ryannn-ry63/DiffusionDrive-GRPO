@@ -2,6 +2,7 @@ from typing import Any, List, Dict, Optional, Union
 from pathlib import Path
 
 import copy
+import json
 import math
 import torch
 import torch.nn as nn
@@ -15,6 +16,25 @@ from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 from navsim.agents.diffusiondrive.diffusion_grpo import (
     AdaptiveKLController,
     file_sha256,
+)
+from navsim.agents.diffusiondrive.paired_residual_lora import (
+    attach_stage22_lora,
+)
+from navsim.agents.diffusiondrive.stage34_contract import (
+    STAGE34_LEGACY_STAGE30_KEYS,
+    STAGE34_OBJECTIVE_REVISION,
+    STAGE34_PLAN_SHA256,
+    STAGE34_ROUTE_EXPECTED,
+)
+from navsim.agents.diffusiondrive.stage35_contract import (
+    STAGE35_LEGACY_STAGE31_KEYS,
+    STAGE35_ALLOWED_INITIAL_SHA256,
+    STAGE35_ROUTE_EXPECTED,
+)
+from navsim.agents.diffusiondrive.stage36_contract import (
+    STAGE36_LEGACY_STAGE31_KEYS,
+    STAGE36_ALLOWED_INITIAL_SHA256,
+    STAGE36_ROUTE_EXPECTED,
 )
 
 from navsim.agents.diffusiondrive.transfuser_model_v2 import V2TransfuserModel as TransfuserModel
@@ -42,14 +62,81 @@ STAGE9_GRPO_MODES = {"selector_group", "generation_group"}
 STAGE10_GRPO_MODES = {"generation_group_adaptive"}
 STAGE16_GRPO_MODES = {"diffgrpo_full_chain"}
 STAGE19_GRPO_MODES = {"diffgrpo_selected_anchor"}
+STAGE21_GRPO_MODES = {"diffgrpo_selected_anchor_base_preserve"}
+STAGE22_GRPO_MODES = {"diffgrpo_paired_residual"}
+STAGE23_GRPO_MODES = {"diffgrpo_selected_set"}
+STAGE27_GRPO_MODES = {"stage27_public_diffgrpo_selected_set"}
+STAGE28_GRPO_MODES = {
+    "stage28_public_paired_uplift_multi",
+    "stage28_public_paired_uplift_explore",
+}
+STAGE29_GRPO_MODES = {
+    "stage29_public_headroom_hybrid",
+    "stage29_public_headroom_conditional",
+}
+STAGE30_GRPO_MODES = {
+    "stage30_public_mode_coverage",
+    "stage30_public_mode_coverage_constrained",
+}
+STAGE31_GRPO_MODES = {
+    "stage31_public_deployed_pair",
+    "stage31_public_deployed_frontier",
+}
+STAGE32_GRPO_MODES = {
+    "stage32_public_deployed_extended",
+    "stage32_selector_aware_frontier",
+}
+STAGE33_GRPO_MODES = {"stage33_cdc_grpo"}
+STAGE34_GRPO_MODES = {"stage34_mode_aligned_frontier_grpo"}
+STAGE35_GRPO_MODES = {"stage35_nested_counterfactual_deployment_grpo"}
+STAGE36_GRPO_MODES = {"stage36_reference_gated_tail_ncd_grpo"}
+STAGE32_PLAN_SHA256 = "5c5f3b148c8d03fe3c714558314ebd895a8f143b94fd10fb9bdf8c4ad61cefcd"
+STAGE32_SCF_OBJECTIVE_REVISION = "mean_normalized_bc_kl_v2"
+STAGE33_PLAN_SHA256 = "0ace8d8959360a15cfac8f45bc2c6e19898c09ad1a04aa7b5e5dcc2fb36283ff"
+STAGE33_CDC_OBJECTIVE_REVISION = "cdc_deployment_credit_v1"
+SELECTED_SET_GRPO_MODES = (
+    STAGE23_GRPO_MODES | STAGE27_GRPO_MODES | STAGE28_GRPO_MODES
+    | STAGE29_GRPO_MODES | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES
+    | STAGE33_GRPO_MODES
+)
 FORMAL_GRPO_MODES = (
     STAGE9_GRPO_MODES
     | STAGE10_GRPO_MODES
     | STAGE16_GRPO_MODES
     | STAGE19_GRPO_MODES
+    | STAGE21_GRPO_MODES
+    | STAGE22_GRPO_MODES
+    | STAGE23_GRPO_MODES
+    | STAGE27_GRPO_MODES
+    | STAGE28_GRPO_MODES
+    | STAGE29_GRPO_MODES
+    | STAGE30_GRPO_MODES
+    | STAGE31_GRPO_MODES
+    | STAGE32_GRPO_MODES
+    | STAGE33_GRPO_MODES
+    | STAGE34_GRPO_MODES
+    | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES
 )
 FORMAL_BASE_SHA256 = (
     "59a8de460cfd8b1266c5cdd393372273da5c2465fa6707da551c4ecb1fbd019d"
+)
+STAGE27_PUBLIC_BASE_SHA256 = (
+    "008ffc39cc6c57ff9007025217e601f408818afa036c0bae4e543907993a005b"
+)
+STAGE28_MULTI_SELECTOR_SHA256 = (
+    "023d7b6b77bb8fa2dc3e779849f3716688abf0796b019416494c80b29615b691"
+)
+STAGE28_MULTI_CALIBRATION_SHA256 = (
+    "fec2a10573e913e4452f8eea92e6334fcd5e6f1104e6244876770973a1f41990"
+)
+STAGE28_EXPLORE_SELECTOR_SHA256 = (
+    "9a7a202830f0dcd87c5aeac2f91a3b2dc3958584cc965ecf4b7048f56ceca91b"
+)
+STAGE28_EXPLORE_CALIBRATION_SHA256 = (
+    "ab1931fc96c00288c32b8d2fa484c2114dd5cd66ef1ccf05693d8fba8885660a"
+)
+STAGE28_PLAN_SHA256 = (
+    "217ef4b31cdc830e0e8fad7aa6d0f53d05c07fffcc381b00ad57f13912bc287b"
 )
 STAGE17_GENERATOR_SHA256 = (
     "3a7641d4ac2a9d644eda4cb945d1902d4ac4bebfdad09b156676dc0cbed94e23"
@@ -69,6 +156,59 @@ def validate_frozen_policy_state(policy: nn.Module, expected_state: Dict[str, to
             )
     if any(parameter.requires_grad for parameter in policy.parameters()):
         raise RuntimeError("Frozen reference policy has trainable parameters")
+
+
+def validate_stage28_exploration_authorization(
+    config: TransfuserConfig,
+    selector_sha256: str,
+    calibration_path: Path,
+) -> None:
+    """Authorize the failed S-public calibration for training exploration only."""
+    if str(getattr(config, "grpo_training_mode", "")) != (
+        "stage28_public_paired_uplift_explore"
+    ):
+        raise RuntimeError("Stage28 exploration authorization used outside explore mode")
+    authorization_path = Path(str(
+        getattr(config, "stage28_exploration_authorization_path", "")
+    ))
+    if not authorization_path.is_file():
+        raise FileNotFoundError("Stage28 exploration authorization is missing")
+    authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
+    calibration_sha256 = file_sha256(calibration_path)
+    expected = {
+        "schema_version": 1,
+        "stage": 28,
+        "purpose": "training_selector_exploration",
+        "training_only": True,
+        "deployment_forbidden": True,
+        "public_checkpoint_sha256": STAGE27_PUBLIC_BASE_SHA256,
+        "plan_sha256": STAGE28_PLAN_SHA256,
+        "selector_checkpoint_sha256": STAGE28_EXPLORE_SELECTOR_SHA256,
+        "calibration_sha256": STAGE28_EXPLORE_CALIBRATION_SHA256,
+        "calibration_passed": False,
+    }
+    for name, wanted in expected.items():
+        if authorization.get(name) != wanted:
+            raise RuntimeError(
+                f"Stage28 exploration authorization drifted for {name}"
+            )
+    plan_path = Path(str(authorization.get("plan", "")))
+    selector_path = Path(str(authorization.get("selector_checkpoint", "")))
+    authorized_calibration = Path(str(authorization.get("calibration", "")))
+    if not plan_path.is_file() or file_sha256(plan_path) != STAGE28_PLAN_SHA256:
+        raise RuntimeError("Stage28 exploration authorization plan SHA mismatch")
+    if (
+        not selector_path.is_file()
+        or file_sha256(selector_path) != selector_sha256
+        or selector_sha256 != STAGE28_EXPLORE_SELECTOR_SHA256
+    ):
+        raise RuntimeError("Stage28 exploration authorization selector SHA mismatch")
+    if (
+        not authorized_calibration.is_file()
+        or authorized_calibration.resolve() != calibration_path.resolve()
+        or calibration_sha256 != STAGE28_EXPLORE_CALIBRATION_SHA256
+    ):
+        raise RuntimeError("Stage28 exploration authorization calibration mismatch")
 
 
 def validate_formal_grpo_config(config: TransfuserConfig) -> None:
@@ -163,7 +303,509 @@ def validate_formal_grpo_config(config: TransfuserConfig) -> None:
             "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
             "diffusion_scheduler_num_inference_steps": 125,
         },
-    }[mode]
+        "diffgrpo_selected_anchor_base_preserve": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_selected_anchor_base_preserve",
+            "diffgrpo_bc_weight": 0.1,
+            "diffgrpo_bc_max_weight": 0.3,
+            "diffgrpo_base_margin": 0.01,
+            "diffgrpo_base_scale": 0.10,
+            "diffgrpo_base_advantage_clip": 2.0,
+            "diffgrpo_safety_regression_tolerance": 1e-6,
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "diffgrpo_group_size": 8,
+            "inference_selector_source": "reference",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+        },
+        "diffgrpo_paired_residual": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_paired_residual",
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "diffgrpo_group_size": 8,
+            "diffgrpo_base_scale": 0.10,
+            "diffgrpo_base_advantage_clip": 2.0,
+            "diffgrpo_safety_regression_tolerance": 1e-6,
+            "diffgrpo_paired_positive_margin": 0.01,
+            "diffgrpo_paired_negative_margin": 0.01,
+            "diffgrpo_paired_mature_negative_margin": 0.002,
+            "diffgrpo_paired_mature_reward_threshold": 0.75,
+            "diffgrpo_paired_mature_negative_multiplier": 2.0,
+            "diffgrpo_paired_regular_kl_weight": 0.1,
+            "diffgrpo_paired_mature_kl_weight": 0.5,
+            "diffgrpo_paired_bootstrap_advantage_weight": 0.25,
+            "diffgrpo_lora_rank": 8,
+            "diffgrpo_lora_alpha": 8.0,
+            "weight_decay": 0.0,
+            "inference_selector_source": "reference",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+        },
+        "diffgrpo_selected_set": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_selected_set",
+            "diffgrpo_bc_weight": 0.1,
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "diffgrpo_group_size": 8,
+            "diffgrpo_safety_regression_tolerance": 1e-6,
+            "diffgrpo_paired_regular_kl_weight": 0.1,
+            "diffgrpo_paired_mature_kl_weight": 0.5,
+            "inference_selector_source": "trajectory_oof",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+        },
+        "stage27_public_diffgrpo_selected_set": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_selected_set",
+            "diffgrpo_bc_weight": 0.1,
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "diffgrpo_group_size": 8,
+            "diffgrpo_safety_regression_tolerance": 1e-6,
+            "diffgrpo_paired_regular_kl_weight": 0.1,
+            "diffgrpo_paired_mature_kl_weight": 0.5,
+            "inference_selector_source": "trajectory_relative_harm_v3",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+        },
+        "stage28_public_paired_uplift_multi": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_selected_set",
+            "diffgrpo_bc_weight": 0.1,
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "diffgrpo_group_size": 8,
+            "diffgrpo_base_scale": 0.1,
+            "diffgrpo_base_advantage_clip": 2.0,
+            "diffgrpo_safety_regression_tolerance": 1e-6,
+            "diffgrpo_paired_positive_margin": 0.002,
+            "diffgrpo_paired_negative_margin": 0.002,
+            "diffgrpo_paired_mature_negative_margin": 0.0005,
+            "diffgrpo_paired_mature_reward_threshold": 0.75,
+            "diffgrpo_paired_regular_kl_weight": 0.1,
+            "diffgrpo_paired_mature_kl_weight": 0.5,
+            "diffgrpo_paired_bootstrap_advantage_weight": 0.0,
+            "stage28_training_selector_role": "multi",
+            "stage28_exploration_authorization_path": "",
+            "inference_selector_source": "trajectory_relative_harm_v3",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+        },
+        "stage28_public_paired_uplift_explore": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_selected_set",
+            "diffgrpo_bc_weight": 0.1,
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "diffgrpo_group_size": 8,
+            "diffgrpo_base_scale": 0.1,
+            "diffgrpo_base_advantage_clip": 2.0,
+            "diffgrpo_safety_regression_tolerance": 1e-6,
+            "diffgrpo_paired_positive_margin": 0.002,
+            "diffgrpo_paired_negative_margin": 0.002,
+            "diffgrpo_paired_mature_negative_margin": 0.0005,
+            "diffgrpo_paired_mature_reward_threshold": 0.75,
+            "diffgrpo_paired_regular_kl_weight": 0.1,
+            "diffgrpo_paired_mature_kl_weight": 0.5,
+            "diffgrpo_paired_bootstrap_advantage_weight": 0.0,
+            "stage28_training_selector_role": "explore",
+            "inference_selector_source": "trajectory_relative_harm_v3",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+        },
+        "stage29_public_headroom_hybrid": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_selected_set",
+            "diffgrpo_bc_weight": 0.1,
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "diffgrpo_group_size": 8,
+            "diffgrpo_base_advantage_clip": 2.0,
+            "diffgrpo_safety_regression_tolerance": 1e-6,
+            "stage29_headroom_low": 0.75,
+            "stage29_headroom_high": 0.90,
+            "stage29_delta_scale_floor": 0.002,
+            "stage29_rank_weight": 0.5,
+            "stage29_conditional_regularization": False,
+            "stage29_fixed_bc_weight": 0.1,
+            "stage29_fixed_kl_weight": 0.1,
+            "stage29_hard_bc_weight": 0.05,
+            "stage29_mature_bc_weight": 0.1,
+            "stage29_hard_kl_weight": 0.05,
+            "stage29_mature_kl_weight": 0.5,
+            "stage29_safety_kl_weight": 0.5,
+            "inference_selector_source": "trajectory_relative_harm_v3",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+        },
+        "stage29_public_headroom_conditional": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_selected_set",
+            "diffgrpo_bc_weight": 0.1,
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "diffgrpo_group_size": 8,
+            "diffgrpo_base_advantage_clip": 2.0,
+            "diffgrpo_safety_regression_tolerance": 1e-6,
+            "stage29_headroom_low": 0.75,
+            "stage29_headroom_high": 0.90,
+            "stage29_delta_scale_floor": 0.002,
+            "stage29_rank_weight": 0.5,
+            "stage29_conditional_regularization": True,
+            "stage29_fixed_bc_weight": 0.1,
+            "stage29_fixed_kl_weight": 0.1,
+            "stage29_hard_bc_weight": 0.05,
+            "stage29_mature_bc_weight": 0.1,
+            "stage29_hard_kl_weight": 0.05,
+            "stage29_mature_kl_weight": 0.5,
+            "stage29_safety_kl_weight": 0.5,
+            "inference_selector_source": "trajectory_relative_harm_v3",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+        },
+        "stage30_public_mode_coverage": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_mode_coverage",
+            "diffgrpo_bc_weight": 0.1,
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "diffgrpo_group_size": 20,
+            "diffgrpo_base_advantage_clip": 2.0,
+            "diffgrpo_safety_regression_tolerance": 1e-6,
+            "stage30_top_k": 5,
+            "stage30_delta_scale_floor": 0.002,
+            "stage30_coverage_top_weight": 0.5,
+            "stage30_boundary_top_weight": 0.25,
+            "stage30_boundary_positive_margin": 0.001,
+            "stage30_boundary_negative_multiplier": 2.0,
+            "stage30_mature_negative_floor": -0.0002,
+            "stage30_mature_positive_margin": 0.002,
+            "stage30_mature_negative_multiplier": 4.0,
+            "stage30_component_tolerance": 1e-6,
+            "stage30_plan_sha256": "e9867ec48d4806ff97adb0284bae7550305cb1350e4ec66dbfd20d245de435ce",
+            "stage30_optimizer_steps_per_epoch": 48,
+            "stage30_gradient_accumulation": 8,
+            "stage30_global_bucket_composition": (2, 30, 8, 24),
+            "inference_selector_source": "trajectory_relative_harm_v3",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+            "weight_decay": 0.0,
+        },
+        "stage30_public_mode_coverage_constrained": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_mode_coverage",
+            "diffgrpo_bc_weight": 0.1,
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "diffgrpo_group_size": 20,
+            "diffgrpo_base_advantage_clip": 2.0,
+            "diffgrpo_safety_regression_tolerance": 1e-6,
+            "stage30_top_k": 5,
+            "stage30_delta_scale_floor": 0.002,
+            "stage30_coverage_top_weight": 0.5,
+            "stage30_boundary_top_weight": 0.25,
+            "stage30_boundary_positive_margin": 0.001,
+            "stage30_boundary_negative_multiplier": 2.0,
+            "stage30_mature_negative_floor": -0.0002,
+            "stage30_mature_positive_margin": 0.002,
+            "stage30_mature_negative_multiplier": 4.0,
+            "stage30_component_tolerance": 1e-6,
+            "stage30_plan_sha256": "e9867ec48d4806ff97adb0284bae7550305cb1350e4ec66dbfd20d245de435ce",
+            "stage30_optimizer_steps_per_epoch": 48,
+            "stage30_gradient_accumulation": 8,
+            "stage30_global_bucket_composition": (2, 30, 8, 24),
+            "inference_selector_source": "trajectory_relative_harm_v3",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+            "weight_decay": 0.0,
+        },
+        "stage31_public_deployed_pair": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_deployed_selected_set",
+            "diffgrpo_bc_weight": 0.1,
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "diffgrpo_group_size": 8,
+            "diffgrpo_base_advantage_clip": 2.0,
+            "diffgrpo_safety_regression_tolerance": 1e-6,
+            "stage31_plan_sha256": "3ff3d3bcd3120b9d73a017876f942458eb3fa16651517e4e30b27cf2fff7bb0d",
+            "stage31_headroom_low": 0.75,
+            "stage31_headroom_high": 0.90,
+            "stage31_delta_scale_floor": 0.002,
+            "stage31_rank_weight": 0.5,
+            "stage31_bc_weight": 0.1,
+            "stage31_kl_weight": 0.1,
+            "stage31_safety_kl_weight": 0.5,
+            "stage31_optimizer_steps_per_epoch": 48,
+            "stage31_gradient_accumulation": 8,
+            "stage31_global_bucket_composition": (2, 30, 8, 24),
+            "inference_selector_source": "trajectory_relative_harm_v3",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+            "weight_decay": 0.0,
+        },
+        "stage31_public_deployed_frontier": {
+            "policy_loss_weight": 0.0,
+            "kl_loss_weight": 0.0,
+            "selector_generation_kl_weight": 0.0,
+            "generation_policy_loss_weight": 1.0,
+            "generation_kl_loss_weight": 0.0,
+            "generation_adaptive_kl_enabled": False,
+            "generation_policy_algorithm": "diffgrpo_deployed_selected_set",
+            "diffgrpo_bc_weight": 0.1,
+            "diffgrpo_step_discount": 0.6,
+            "diffgrpo_logprob_reduction": "mean",
+            "diffgrpo_group_size": 8,
+            "diffgrpo_base_advantage_clip": 2.0,
+            "diffgrpo_safety_regression_tolerance": 1e-6,
+            "stage31_plan_sha256": "3ff3d3bcd3120b9d73a017876f942458eb3fa16651517e4e30b27cf2fff7bb0d",
+            "stage31_headroom_low": 0.75,
+            "stage31_headroom_high": 0.90,
+            "stage31_delta_scale_floor": 0.002,
+            "stage31_rank_weight": 0.5,
+            "stage31_bc_weight": 0.1,
+            "stage31_kl_weight": 0.1,
+            "stage31_safety_kl_weight": 0.5,
+            "stage31_optimizer_steps_per_epoch": 48,
+            "stage31_gradient_accumulation": 8,
+            "stage31_global_bucket_composition": (2, 30, 8, 24),
+            "inference_selector_source": "trajectory_relative_harm_v3",
+            "diffusion_truncation_timestep": 32,
+            "diffusion_roll_timesteps": (32, 24, 16, 8, 0),
+            "diffusion_scheduler_num_inference_steps": 125,
+            "weight_decay": 0.0,
+        },
+    }[
+        "stage30_public_mode_coverage_constrained"
+        if mode in STAGE34_GRPO_MODES
+        else "stage31_public_deployed_frontier"
+        if mode in (STAGE32_GRPO_MODES | STAGE33_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES)
+        else mode
+    ]
+    if mode in STAGE34_GRPO_MODES:
+        for legacy_name in STAGE34_LEGACY_STAGE30_KEYS:
+            route_expected.pop(legacy_name)
+        route_expected.update(STAGE34_ROUTE_EXPECTED)
+    if mode in STAGE35_GRPO_MODES:
+        for legacy_name in STAGE35_LEGACY_STAGE31_KEYS:
+            route_expected.pop(legacy_name)
+        route_expected.update(STAGE35_ROUTE_EXPECTED)
+    if mode in STAGE36_GRPO_MODES:
+        for legacy_name in STAGE36_LEGACY_STAGE31_KEYS:
+            route_expected.pop(legacy_name)
+        route_expected.update(STAGE36_ROUTE_EXPECTED)
+    if mode in (SELECTED_SET_GRPO_MODES | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES):
+        selector_source = str(getattr(config, "inference_selector_source", ""))
+        allowed_selector_sources = (
+            {"trajectory_relative_harm_v3"}
+            if mode in (
+                STAGE27_GRPO_MODES | STAGE28_GRPO_MODES | STAGE29_GRPO_MODES
+                | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES | STAGE34_GRPO_MODES
+                | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES)
+            else {"trajectory_oof", "trajectory_relative_harm_v3"}
+        )
+        if selector_source not in allowed_selector_sources:
+            raise ValueError(
+                f"formal {mode} requires one of the frozen selector sources "
+                f"{sorted(allowed_selector_sources)}"
+            )
+        route_expected["inference_selector_source"] = selector_source
+        if selector_source == "trajectory_relative_harm_v3" and (
+            not str(getattr(config, "stage25_selector_checkpoint_path", ""))
+            or not str(getattr(config, "stage25_selector_calibration_path", ""))
+        ):
+            raise ValueError(
+                "formal Stage25 selected-set GRPO requires checkpoint and "
+                "calibration paths"
+            )
+        if mode == "stage28_public_paired_uplift_explore" and not str(
+            getattr(config, "stage28_exploration_authorization_path", "")
+        ):
+            raise ValueError(
+                "formal Stage28 explore mode requires its SHA-locked "
+                "training-only authorization"
+            )
+    if mode in STAGE30_GRPO_MODES:
+        if (
+            str(getattr(config, "inference_selector_source", ""))
+            != "trajectory_relative_harm_v3"
+            or not str(getattr(config, "stage25_selector_checkpoint_path", ""))
+            or not str(getattr(config, "stage25_selector_calibration_path", ""))
+        ):
+            raise ValueError(
+                "formal Stage30 requires the frozen S-multi selector paths"
+            )
+        if not str(getattr(config, "stage30_bucket_manifest_path", "")):
+            raise ValueError("formal Stage30 requires its bucket manifest")
+        if tuple(getattr(config, "stage30_global_bucket_composition", ())) != (
+            2, 30, 8, 24
+        ):
+            raise ValueError("formal Stage30 global bucket composition drifted")
+        if int(getattr(config, "stage30_gradient_accumulation", -1)) != 8:
+            raise ValueError("formal Stage30 requires accumulation=8")
+    if mode in STAGE31_GRPO_MODES:
+        if (
+            str(getattr(config, "inference_selector_source", ""))
+            != "trajectory_relative_harm_v3"
+            or not str(getattr(config, "stage25_selector_checkpoint_path", ""))
+            or not str(getattr(config, "stage25_selector_calibration_path", ""))
+        ):
+            raise ValueError(
+                "formal Stage31 requires the frozen S-multi selector paths"
+            )
+        if not str(getattr(config, "stage31_bucket_manifest_path", "")):
+            raise ValueError("formal Stage31 requires its bucket manifest")
+        if tuple(getattr(config, "stage31_global_bucket_composition", ())) != (
+            2, 30, 8, 24
+        ):
+            raise ValueError("formal Stage31 global bucket composition drifted")
+        if int(getattr(config, "stage31_gradient_accumulation", -1)) != 8:
+            raise ValueError("formal Stage31 requires accumulation=8")
+    if mode in STAGE32_GRPO_MODES:
+        if (
+            str(getattr(config, "inference_selector_source", ""))
+            != "trajectory_relative_harm_v3"
+            or not str(getattr(config, "stage25_selector_checkpoint_path", ""))
+            or not str(getattr(config, "stage25_selector_calibration_path", ""))
+        ):
+            raise ValueError("formal Stage32 requires the frozen S-multi selector paths")
+        if not str(getattr(config, "stage32_bucket_manifest_path", "")):
+            raise ValueError("formal Stage32 requires its bucket manifest")
+        if tuple(getattr(config, "stage32_global_bucket_composition", ())) != (
+            2, 30, 8, 24
+        ):
+            raise ValueError("formal Stage32 global bucket composition drifted")
+        if int(getattr(config, "stage32_gradient_accumulation", -1)) != 8:
+            raise ValueError("formal Stage32 requires accumulation=8")
+        if int(getattr(config, "stage32_frontier_pool_size", -1)) != 4:
+            raise ValueError("formal Stage32 requires frontier pool size=4")
+        for name, wanted in (
+            ("stage32_frontier_risk_margin", 0.10),
+            ("stage32_frontier_owner_margin", 0.001),
+            ("stage32_frontier_weight", 0.5),
+            ("stage32_frontier_mature_cap", 0.25),
+        ):
+            if not math.isclose(
+                float(getattr(config, name, -1.0)), wanted,
+                rel_tol=0.0, abs_tol=1e-12,
+            ):
+                raise ValueError(f"formal Stage32 requires {name}={wanted}")
+        if str(getattr(config, "stage32_plan_sha256", "")) != STAGE32_PLAN_SHA256:
+            raise ValueError("formal Stage32 plan SHA drifted")
+        if (
+            mode == "stage32_selector_aware_frontier"
+            and str(getattr(config, "stage32_scf_objective_revision", ""))
+            != STAGE32_SCF_OBJECTIVE_REVISION
+        ):
+            raise ValueError("formal Stage32 SCF objective revision drifted")
+    if mode in STAGE33_GRPO_MODES:
+        if str(getattr(config, "inference_selector_source", "")) != "trajectory_relative_harm_v3":
+            raise ValueError("formal Stage33 requires the frozen Stage25 selector")
+        if not str(getattr(config, "stage25_selector_checkpoint_path", "")):
+            raise ValueError("formal Stage33 requires the Stage25 selector checkpoint")
+        if not str(getattr(config, "stage25_selector_calibration_path", "")):
+            raise ValueError("formal Stage33 requires the Stage25 selector calibration")
+        if not str(getattr(config, "stage33_bucket_manifest_path", "")):
+            raise ValueError("formal Stage33 requires its bucket manifest")
+        if tuple(getattr(config, "stage33_global_bucket_composition", ())) != (2, 30, 8, 24):
+            raise ValueError("formal Stage33 global bucket composition drifted")
+        if int(getattr(config, "stage33_gradient_accumulation", -1)) != 8:
+            raise ValueError("formal Stage33 requires accumulation=8")
+        if int(getattr(config, "diffgrpo_group_size", -1)) != 8:
+            raise ValueError("formal Stage33 requires group_size=8")
+        if str(getattr(config, "stage33_plan_sha256", "")) != STAGE33_PLAN_SHA256:
+            raise ValueError("formal Stage33 plan SHA drifted")
+        if str(getattr(config, "stage33_cdc_objective_revision", "")) != STAGE33_CDC_OBJECTIVE_REVISION:
+            raise ValueError("formal Stage33 CDC objective revision drifted")
+        for name, wanted in (
+            ("stage33_deployment_weight", 0.5),
+            ("stage33_headroom_weight", 0.5),
+            ("stage33_headroom_margin", 0.001),
+            ("stage33_advantage_clip", 2.0),
+        ):
+            if not math.isclose(float(getattr(config, name, -1.0)), wanted, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(f"formal Stage33 requires {name}={wanted}")
+    if mode in STAGE34_GRPO_MODES and not str(
+        getattr(config, "stage34_bucket_manifest_path", "")
+    ):
+        raise ValueError("formal Stage34 requires its bucket manifest")
+    if mode in STAGE35_GRPO_MODES and not str(
+        getattr(config, "stage35_bucket_manifest_path", "")
+    ):
+        raise ValueError("formal Stage35 requires its bucket manifest")
+    if mode in STAGE36_GRPO_MODES and not str(
+        getattr(config, "stage36_bucket_manifest_path", "")
+    ):
+        raise ValueError("formal Stage36 requires its bucket manifest")
     for name, wanted in {**expected, **route_expected}.items():
         actual = getattr(config, name, None)
         if isinstance(wanted, tuple) and actual is not None:
@@ -186,6 +828,17 @@ def validate_formal_grpo_config(config: TransfuserConfig) -> None:
         for wanted in (0.1, 1.0)
     ):
         raise ValueError("formal Stage-10 route requires layer-0 LR multiplier 0.1 or 1.0")
+    if mode in (
+        STAGE21_GRPO_MODES | STAGE23_GRPO_MODES | STAGE27_GRPO_MODES
+        | STAGE28_GRPO_MODES | STAGE29_GRPO_MODES | STAGE30_GRPO_MODES
+        | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES | STAGE33_GRPO_MODES
+        | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES
+    ) and not math.isclose(
+        layer0_lr_mult, 0.1, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError(
+            "formal Stage21/23/27/28/29/30/31 requires layer-0 LR multiplier 0.1"
+        )
 
 
 def build_stage10_decoder_param_groups(
@@ -250,17 +903,47 @@ class TransfuserAgent(AbstractAgent):
             else file_sha256(reference_file)
         )
         validate_formal_grpo_config(config)
-        if str(getattr(config, "grpo_training_mode", "")) in FORMAL_GRPO_MODES:
-            if self._reference_checkpoint_sha256 != FORMAL_BASE_SHA256:
+        formal_mode = str(getattr(config, "grpo_training_mode", ""))
+        if formal_mode in FORMAL_GRPO_MODES:
+            expected_base_sha = (
+                STAGE27_PUBLIC_BASE_SHA256
+                if formal_mode in (
+                    STAGE27_GRPO_MODES | STAGE28_GRPO_MODES
+                    | STAGE29_GRPO_MODES | STAGE30_GRPO_MODES
+                    | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES | STAGE33_GRPO_MODES
+                    | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES)
+                else FORMAL_BASE_SHA256
+            )
+            if self._reference_checkpoint_sha256 != expected_base_sha:
                 raise RuntimeError(
-                    "Formal GRPO reference checkpoint is not the registered base"
+                    "Formal GRPO reference checkpoint is not the registered "
+                    f"base for mode={formal_mode}"
                 )
-            if self._checkpoint_sha256 != self._reference_checkpoint_sha256:
+            if formal_mode in STAGE35_GRPO_MODES:
+                if self._checkpoint_sha256 not in STAGE35_ALLOWED_INITIAL_SHA256:
+                    raise RuntimeError(
+                        "Stage35 current policy is not a frozen DPEL192 initializer"
+                    )
+            elif formal_mode in STAGE36_GRPO_MODES:
+                if self._checkpoint_sha256 not in STAGE36_ALLOWED_INITIAL_SHA256:
+                    raise RuntimeError(
+                        "Stage36 current policy is not a frozen DPEL192 initializer"
+                    )
+            elif self._checkpoint_sha256 != self._reference_checkpoint_sha256:
                 raise RuntimeError(
                     "Formal GRPO current policy must initialize from frozen base"
                 )
-            if not math.isclose(float(lr), 1e-6, rel_tol=0.0, abs_tol=1e-12):
-                raise ValueError("Formal GRPO decoder learning rate must be 1e-6")
+            expected_lr = (
+                3e-5
+                if formal_mode in STAGE22_GRPO_MODES
+                else 1e-6
+            )
+            if not math.isclose(
+                float(lr), expected_lr, rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise ValueError(
+                    f"Formal GRPO learning rate must be {expected_lr}"
+                )
         stage17_training = (
             str(getattr(config, "grpo_training_mode", ""))
             == "paired_tail_risk_selector"
@@ -290,7 +973,11 @@ class TransfuserAgent(AbstractAgent):
                 or int(getattr(config, "diffusion_truncation_timestep", -1)) != 32
                 or int(getattr(config, "diffusion_scheduler_num_inference_steps", -1)) != 125
                 or str(getattr(config, "generation_policy_algorithm", ""))
-                not in {"diffgrpo_full_chain", "diffgrpo_selected_anchor"}
+                not in {
+                    "diffgrpo_full_chain",
+                    "diffgrpo_selected_anchor",
+                    "diffgrpo_selected_anchor_base_preserve",
+                }
             ):
                 raise ValueError("Stage-17 requires the locked full-chain schedule")
             if stage17_training and not math.isclose(
@@ -310,6 +997,227 @@ class TransfuserAgent(AbstractAgent):
         )
         if value_selector_checkpoint:
             self.load_value_selector_checkpoint(value_selector_checkpoint)
+        self._stage23_selector_checkpoint_sha256 = None
+        stage23_selector_checkpoint = str(
+            getattr(config, "stage23_selector_checkpoint_path", "")
+        )
+        if stage23_selector_checkpoint:
+            self.load_stage23_selector_checkpoint(stage23_selector_checkpoint)
+        elif str(getattr(config, "inference_selector_source", "")) == "trajectory_oof":
+            raise ValueError("trajectory_oof inference requires a Stage23 selector checkpoint")
+        if (
+            str(getattr(config, "grpo_training_mode", "")) in STAGE23_GRPO_MODES
+            and str(getattr(config, "inference_selector_source", ""))
+            == "trajectory_oof"
+        ):
+            calibration_path = Path(
+                str(getattr(config, "stage23_selector_calibration_path", ""))
+            )
+            if not calibration_path.is_file():
+                raise FileNotFoundError(
+                    "Stage23 generator requires frozen selector calibration"
+                )
+            calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+            if (
+                not calibration.get("passed")
+                or calibration.get("selector_checkpoint_sha256")
+                != self._stage23_selector_checkpoint_sha256
+            ):
+                raise RuntimeError("Stage23 selector calibration/checkpoint SHA mismatch")
+            expected_margin = float(calibration["residual_margin"])
+            expected_threshold = float(calibration["selected"]["threshold"])
+            if not math.isclose(
+                float(config.stage23_selector_residual_margin), expected_margin,
+                rel_tol=0.0, abs_tol=1e-12,
+            ) or not math.isclose(
+                float(config.stage23_selector_safety_threshold), expected_threshold,
+                rel_tol=0.0, abs_tol=1e-12,
+            ):
+                raise RuntimeError("Stage23 runtime selector calibration values drifted")
+        self._stage24_selector_checkpoint_sha256 = None
+        self._stage24_calibration_sha256 = None
+        stage24_selector_checkpoint = str(
+            getattr(config, "stage24_selector_checkpoint_path", "")
+        )
+        stage24_active = (
+            str(getattr(config, "inference_selector_source", ""))
+            == "trajectory_safety_value_v2"
+        )
+        if stage24_selector_checkpoint:
+            self.load_stage24_selector_checkpoint(stage24_selector_checkpoint)
+        elif stage24_active:
+            raise ValueError(
+                "trajectory_safety_value_v2 requires a Stage24 selector checkpoint"
+            )
+        if stage24_active and not bool(
+            getattr(config, "stage24_collect_calibration", False)
+        ):
+            calibration_path = Path(
+                str(getattr(config, "stage24_selector_calibration_path", ""))
+            )
+            if not calibration_path.is_file():
+                raise FileNotFoundError(
+                    "Stage24 deployment requires frozen selector calibration"
+                )
+            calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+            if (
+                not calibration.get("passed")
+                or calibration.get("selector_checkpoint_sha256")
+                != self._stage24_selector_checkpoint_sha256
+            ):
+                raise RuntimeError(
+                    "Stage24 selector calibration/checkpoint SHA mismatch"
+                )
+            expected = {
+                "stage24_selector_residual_margin": float(
+                    calibration["residual_margin"]
+                ),
+                "stage24_selector_risk_threshold": float(
+                    calibration["risk_threshold"]
+                ),
+                "stage24_selector_ood_threshold": float(
+                    calibration["ood_threshold"]
+                ),
+            }
+            for name, wanted in expected.items():
+                if not math.isclose(
+                    float(getattr(config, name)), wanted,
+                    rel_tol=0.0, abs_tol=1e-12,
+                ):
+                    raise RuntimeError(
+                        f"Stage24 runtime calibration drifted for {name}"
+                    )
+            ood = calibration.get("ood", {})
+            mean = torch.as_tensor(ood.get("mean", ()), dtype=torch.float32)
+            variance = torch.as_tensor(
+                ood.get("variance", ()), dtype=torch.float32
+            )
+            head = self._transfuser_model._trajectory_head
+            if (
+                mean.shape != head._stage24_ood_mean.shape
+                or variance.shape != head._stage24_ood_variance.shape
+                or not torch.isfinite(mean).all()
+                or not torch.isfinite(variance).all()
+                or not (variance > 0).all()
+            ):
+                raise RuntimeError("Stage24 calibration has invalid OOD statistics")
+            head._stage24_ood_mean.copy_(mean)
+            head._stage24_ood_variance.copy_(variance)
+            head._stage24_calibration_loaded.fill_(True)
+            self._stage24_calibration_sha256 = file_sha256(calibration_path)
+        self._stage25_selector_checkpoint_sha256 = None
+        self._stage25_calibration_sha256 = None
+        stage25_active = (
+            str(getattr(config, "inference_selector_source", ""))
+            == "trajectory_relative_harm_v3"
+        )
+        stage25_selector_checkpoint = str(
+            getattr(config, "stage25_selector_checkpoint_path", "")
+        )
+        if stage25_selector_checkpoint:
+            self.load_stage25_selector_checkpoint(stage25_selector_checkpoint)
+        elif stage25_active:
+            raise ValueError(
+                "trajectory_relative_harm_v3 requires a Stage25 checkpoint"
+            )
+        if stage25_active and not bool(
+            getattr(config, "stage25_collect_calibration", False)
+        ):
+            calibration_path = Path(str(
+                getattr(config, "stage25_selector_calibration_path", "")
+            ))
+            if not calibration_path.is_file():
+                raise FileNotFoundError(
+                    "Stage25 deployment requires frozen selector calibration"
+                )
+            calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+            if (
+                calibration.get("selector_checkpoint_sha256")
+                != self._stage25_selector_checkpoint_sha256
+            ):
+                raise RuntimeError(
+                    "Stage25 selector calibration/checkpoint SHA mismatch"
+                )
+            if not calibration.get("passed"):
+                validate_stage28_exploration_authorization(
+                    config,
+                    str(self._stage25_selector_checkpoint_sha256),
+                    calibration_path,
+                )
+            stage28_role = str(
+                getattr(config, "stage28_training_selector_role", "")
+            )
+            if formal_mode in STAGE28_GRPO_MODES:
+                expected_selector_sha, expected_calibration_sha = (
+                    (
+                        STAGE28_EXPLORE_SELECTOR_SHA256,
+                        STAGE28_EXPLORE_CALIBRATION_SHA256,
+                    )
+                    if stage28_role == "explore"
+                    else (
+                        STAGE28_MULTI_SELECTOR_SHA256,
+                        STAGE28_MULTI_CALIBRATION_SHA256,
+                    )
+                )
+                if (
+                    self._stage25_selector_checkpoint_sha256
+                    != expected_selector_sha
+                    or file_sha256(calibration_path) != expected_calibration_sha
+                ):
+                    raise RuntimeError(
+                        "Stage28 training selector/calibration SHA drifted"
+                    )
+            if formal_mode in (
+                STAGE29_GRPO_MODES | STAGE30_GRPO_MODES | STAGE31_GRPO_MODES
+                | STAGE32_GRPO_MODES | STAGE33_GRPO_MODES | STAGE34_GRPO_MODES
+                | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES
+            ):
+                if (
+                    self._stage25_selector_checkpoint_sha256
+                    != STAGE28_MULTI_SELECTOR_SHA256
+                    or file_sha256(calibration_path)
+                    != STAGE28_MULTI_CALIBRATION_SHA256
+                    or not calibration.get("passed")
+                ):
+                    raise RuntimeError(
+                        "Stage29/30/31 requires the frozen passing S-multi selector "
+                        "and calibration"
+                    )
+            expected = {
+                "stage24_selector_residual_margin": calibration[
+                    "residual_margin"
+                ],
+                "stage24_selector_ood_threshold": calibration["ood_threshold"],
+                "stage25_selector_risk_threshold": calibration[
+                    "risk_threshold"
+                ],
+            }
+            for name, wanted in expected.items():
+                if not math.isclose(
+                    float(getattr(config, name)), float(wanted),
+                    rel_tol=0.0, abs_tol=1e-12,
+                ):
+                    raise RuntimeError(
+                        f"Stage25 runtime calibration drifted for {name}"
+                    )
+            ood = calibration.get("ood", {})
+            mean = torch.as_tensor(ood.get("mean", ()), dtype=torch.float32)
+            variance = torch.as_tensor(
+                ood.get("variance", ()), dtype=torch.float32
+            )
+            head = self._transfuser_model._trajectory_head
+            if (
+                mean.shape != head._stage24_ood_mean.shape
+                or variance.shape != head._stage24_ood_variance.shape
+                or not torch.isfinite(mean).all()
+                or not torch.isfinite(variance).all()
+                or not (variance > 0).all()
+            ):
+                raise RuntimeError("Stage25 calibration has invalid OOD state")
+            head._stage24_ood_mean.copy_(mean)
+            head._stage24_ood_variance.copy_(variance)
+            head._stage24_calibration_loaded.fill_(True)
+            self._stage25_calibration_sha256 = file_sha256(calibration_path)
         self._paired_risk_checkpoint_sha256 = None
         paired_risk_checkpoint = str(
             getattr(config, "paired_risk_checkpoint_path", "")
@@ -348,19 +1256,39 @@ class TransfuserAgent(AbstractAgent):
             )
         elif training_mode == "value_selector":
             trajectory_head.value_selector.requires_grad_(True)
+        elif training_mode == "stage23_selector":
+            trajectory_head.stage23_selector.requires_grad_(True)
+        elif training_mode == "stage24_selector":
+            trajectory_head.stage24_selector.requires_grad_(True)
+        elif training_mode == "stage25_relative_harm_selector":
+            trajectory_head.stage25_selector.requires_grad_(True)
         elif training_mode == "paired_tail_risk_selector":
             trajectory_head.paired_risk_head.requires_grad_(True)
         elif training_mode in {
             "generation", "generation_group", "generation_group_adaptive",
-            "diffgrpo_full_chain", "diffgrpo_selected_anchor", "joint"
-        }:
+            "diffgrpo_full_chain", "diffgrpo_selected_anchor",
+            "diffgrpo_selected_anchor_base_preserve", "joint",
+            "diffgrpo_selected_set",
+            "stage27_public_diffgrpo_selected_set",
+        } | STAGE28_GRPO_MODES | STAGE29_GRPO_MODES | STAGE30_GRPO_MODES \
+                | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES | STAGE33_GRPO_MODES \
+                | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES:
             trajectory_head.diff_decoder.requires_grad_(True)
             if training_mode in {
                 "generation", "generation_group", "generation_group_adaptive",
-                "diffgrpo_full_chain", "diffgrpo_selected_anchor"
-            }:
+                "diffgrpo_full_chain", "diffgrpo_selected_anchor",
+                "diffgrpo_selected_anchor_base_preserve",
+                "diffgrpo_selected_set",
+                "stage27_public_diffgrpo_selected_set",
+            } | STAGE28_GRPO_MODES | STAGE29_GRPO_MODES | STAGE30_GRPO_MODES \
+            | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES | STAGE33_GRPO_MODES \
+            | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES:
                 for layer in trajectory_head.diff_decoder.layers:
                     layer.task_decoder.plan_cls_branch.requires_grad_(False)
+        elif training_mode in STAGE22_GRPO_MODES:
+            # The plain base decoder remains frozen until adapters are attached
+            # after the frozen reference snapshot has been constructed.
+            pass
         else:
             raise ValueError(
                 "grpo_training_mode must be one of "
@@ -368,15 +1296,29 @@ class TransfuserAgent(AbstractAgent):
                 "'generation', 'joint', 'selector_group', "
                 "'generation_group', 'generation_group_adaptive', "
                 "'diffgrpo_full_chain', 'diffgrpo_selected_anchor', "
-                "'value_selector', 'paired_tail_risk_selector'}; "
+                "'diffgrpo_selected_anchor_base_preserve', "
+                "'diffgrpo_paired_residual', "
+                "'diffgrpo_selected_set', "
+                "'stage27_public_diffgrpo_selected_set', "
+                "'stage28_public_paired_uplift_multi', "
+                "'stage28_public_paired_uplift_explore', "
+                "'stage29_public_headroom_hybrid', "
+                "'stage29_public_headroom_conditional', "
+                "'stage30_public_mode_coverage', "
+                "'stage30_public_mode_coverage_constrained', "
+                "'stage31_public_deployed_pair', "
+                "'stage31_public_deployed_frontier', "
+                "'stage32_public_deployed_extended', "
+                "'stage32_selector_aware_frontier', "
+                "'stage33_cdc_grpo', "
+                "'stage34_mode_aligned_frontier_grpo', "
+                "'stage35_nested_counterfactual_deployment_grpo', "
+                "'stage36_reference_gated_tail_ncd_grpo', "
+                "'value_selector', 'stage23_selector', 'stage24_selector', "
+                "'stage25_relative_harm_selector', "
+                "'paired_tail_risk_selector'}; "
                 f"got {training_mode!r}"
             )
-        trainable_params = sum(
-            parameter.numel()
-            for parameter in self._transfuser_model.parameters()
-            if parameter.requires_grad
-        )
-        print(f"✓ GRPO train mode={training_mode}; trainable parameters={trainable_params:,}")
 
         ref_policy = copy.deepcopy(self._transfuser_model._trajectory_head.diff_decoder)
         reference_checkpoint = torch.load(self._reference_checkpoint_path, map_location="cpu")
@@ -411,9 +1353,33 @@ class TransfuserAgent(AbstractAgent):
         # 3. 设置到TrajectoryHead中
         self._transfuser_model._trajectory_head.set_ref_policy(ref_policy)
         self._transfuser_model._trajectory_head.set_old_policy(old_policy)
+        self._stage22_trainable_names = ()
+        if training_mode in STAGE22_GRPO_MODES:
+            self._stage22_trainable_names = attach_stage22_lora(
+                self._transfuser_model._trajectory_head.diff_decoder,
+                rank=int(getattr(config, "diffgrpo_lora_rank", 8)),
+                alpha=float(getattr(config, "diffgrpo_lora_alpha", 8.0)),
+            )
         self._transfuser_model._trajectory_head.validate_generation_trust_runtime(
             self._reference_checkpoint_path
         )
+
+        trainable_params = sum(
+            parameter.numel()
+            for parameter in self._transfuser_model.parameters()
+            if parameter.requires_grad
+        )
+        if training_mode in (SELECTED_SET_GRPO_MODES | STAGE30_GRPO_MODES | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES):
+            trainable_tensors = [
+                name for name, parameter in self._transfuser_model.named_parameters()
+                if parameter.requires_grad
+            ]
+            if len(trainable_tensors) != 64:
+                raise RuntimeError(
+                    "selected-set/mode-coverage GRPO requires exactly 64 trainable tensors; "
+                    f"got {len(trainable_tensors)}"
+                )
+        print(f"✓ GRPO train mode={training_mode}; trainable parameters={trainable_params:,}")
 
         print(
             "✓ Reference policy loaded from "
@@ -459,6 +1425,15 @@ class TransfuserAgent(AbstractAgent):
         optional_missing_prefixes = (
             "_transfuser_model._trajectory_head.value_selector.",
             "_transfuser_model._trajectory_head._value_selector_training_updates",
+            "_transfuser_model._trajectory_head.stage23_selector.",
+            "_transfuser_model._trajectory_head._stage23_selector_training_updates",
+            "_transfuser_model._trajectory_head.stage24_selector.",
+            "_transfuser_model._trajectory_head._stage24_selector_training_updates",
+            "_transfuser_model._trajectory_head._stage24_ood_",
+            "_transfuser_model._trajectory_head._stage24_calibration_loaded",
+            "_transfuser_model._trajectory_head._stage24_embedding_",
+            "_transfuser_model._trajectory_head.stage25_selector.",
+            "_transfuser_model._trajectory_head._stage25_selector_training_updates",
             "_transfuser_model._trajectory_head.paired_risk_head.",
             "_transfuser_model._trajectory_head._paired_risk_training_updates",
         )
@@ -504,6 +1479,128 @@ class TransfuserAgent(AbstractAgent):
         self._value_selector_checkpoint_sha256 = file_sha256(path)
         print(f"✓ Loaded Stage-15 value selector: {path}")
 
+    def load_stage23_selector_checkpoint(self, checkpoint_path: str) -> None:
+        """Load only the deployable Stage23 five-member selector."""
+        path = Path(checkpoint_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Stage23 selector checkpoint is missing: {path}")
+        checkpoint = torch.load(path, map_location="cpu")
+        if "state_dict" not in checkpoint:
+            raise KeyError(f"Stage23 selector checkpoint has no state_dict: {path}")
+        normalized = {
+            (key[len("agent."):] if key.startswith("agent.") else key): value
+            for key, value in checkpoint["state_dict"].items()
+        }
+        prefix = "_transfuser_model._trajectory_head.stage23_selector."
+        selector_state = {
+            key[len(prefix):]: value
+            for key, value in normalized.items()
+            if key.startswith(prefix)
+        }
+        if not selector_state:
+            raise RuntimeError(f"Checkpoint contains no Stage23 selector: {path}")
+        head = self._transfuser_model._trajectory_head
+        head.stage23_selector.load_state_dict(selector_state, strict=True)
+        update_key = (
+            "_transfuser_model._trajectory_head._stage23_selector_training_updates"
+        )
+        if update_key not in normalized or int(normalized[update_key].item()) <= 0:
+            raise RuntimeError("Stage23 selector checkpoint has no training provenance")
+        head._stage23_selector_training_updates.copy_(normalized[update_key])
+        self._stage23_selector_checkpoint_sha256 = file_sha256(path)
+        print(f"✓ Loaded Stage23 trajectory selector: {path}")
+
+    def load_stage24_selector_checkpoint(self, checkpoint_path: str) -> None:
+        """Load only the deployable Stage24 eight-member selector."""
+        path = Path(checkpoint_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Stage24 selector checkpoint is missing: {path}")
+        checkpoint = torch.load(path, map_location="cpu")
+        if "state_dict" not in checkpoint:
+            raise KeyError(f"Stage24 selector checkpoint has no state_dict: {path}")
+        normalized = {
+            (key[len("agent."):] if key.startswith("agent.") else key): value
+            for key, value in checkpoint["state_dict"].items()
+        }
+        prefix = "_transfuser_model._trajectory_head.stage24_selector."
+        selector_state = {
+            key[len(prefix):]: value
+            for key, value in normalized.items()
+            if key.startswith(prefix)
+        }
+        if not selector_state:
+            raise RuntimeError(f"Checkpoint contains no Stage24 selector: {path}")
+        head = self._transfuser_model._trajectory_head
+        head.stage24_selector.load_state_dict(selector_state, strict=True)
+        update_key = (
+            "_transfuser_model._trajectory_head._stage24_selector_training_updates"
+        )
+        if update_key not in normalized or int(normalized[update_key].item()) <= 0:
+            raise RuntimeError("Stage24 selector checkpoint has no training provenance")
+        head._stage24_selector_training_updates.copy_(normalized[update_key])
+        moment_names = (
+            "_stage24_embedding_count",
+            "_stage24_embedding_sum",
+            "_stage24_embedding_sum_sq",
+        )
+        for name in moment_names:
+            key = f"_transfuser_model._trajectory_head.{name}"
+            if key not in normalized:
+                raise RuntimeError(
+                    f"Stage24 selector checkpoint lacks OOD moment: {name}"
+                )
+            getattr(head, name).copy_(normalized[key])
+        if int(head._stage24_embedding_count.item()) <= 0:
+            raise RuntimeError("Stage24 selector checkpoint has empty OOD moments")
+        self._stage24_selector_checkpoint_sha256 = file_sha256(path)
+        print(f"✓ Loaded Stage24 safety/value selector: {path}")
+
+    def load_stage25_selector_checkpoint(self, checkpoint_path: str) -> None:
+        """Load frozen Stage24 value state plus the Stage25 harm heads."""
+        path = Path(checkpoint_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Stage25 checkpoint is missing: {path}")
+        checkpoint = torch.load(path, map_location="cpu")
+        if "state_dict" not in checkpoint:
+            raise KeyError(f"Stage25 checkpoint has no state_dict: {path}")
+        normalized = {
+            (key[len("agent."):] if key.startswith("agent.") else key): value
+            for key, value in checkpoint["state_dict"].items()
+        }
+        head = self._transfuser_model._trajectory_head
+        for module_name in ("stage24_selector", "stage25_selector"):
+            prefix = f"_transfuser_model._trajectory_head.{module_name}."
+            module_state = {
+                key[len(prefix):]: value
+                for key, value in normalized.items()
+                if key.startswith(prefix)
+            }
+            if not module_state:
+                raise RuntimeError(
+                    f"Stage25 checkpoint lacks {module_name}: {path}"
+                )
+            getattr(head, module_name).load_state_dict(
+                module_state, strict=True
+            )
+        for name in (
+            "_stage24_selector_training_updates",
+            "_stage25_selector_training_updates",
+            "_stage24_embedding_count",
+            "_stage24_embedding_sum",
+            "_stage24_embedding_sum_sq",
+        ):
+            key = f"_transfuser_model._trajectory_head.{name}"
+            if key not in normalized:
+                raise RuntimeError(f"Stage25 checkpoint lacks {name}")
+            getattr(head, name).copy_(normalized[key])
+        if (
+            int(head._stage24_selector_training_updates.item()) <= 0
+            or int(head._stage25_selector_training_updates.item()) <= 0
+            or int(head._stage24_embedding_count.item()) <= 0
+        ):
+            raise RuntimeError("Stage25 checkpoint has invalid training provenance")
+        self._stage25_selector_checkpoint_sha256 = file_sha256(path)
+        print(f"✓ Loaded Stage25 relative-harm selector: {path}")
     def load_paired_risk_checkpoint(self, checkpoint_path: str) -> None:
         """Load only the Stage-17 adapter and its update provenance."""
         path = Path(checkpoint_path)
@@ -582,6 +1679,8 @@ class TransfuserAgent(AbstractAgent):
             module.eval()
         model._trajectory_head.diff_decoder.eval()
         model._trajectory_head.value_selector.eval()
+        model._trajectory_head.stage23_selector.eval()
+        model._trajectory_head.stage24_selector.eval()
         model._trajectory_head.paired_risk_head.eval()
         if (
             self.training
@@ -589,6 +1688,18 @@ class TransfuserAgent(AbstractAgent):
             == "value_selector"
         ):
             model._trajectory_head.value_selector.train()
+        if (
+            self.training
+            and str(getattr(self._config, "grpo_training_mode", ""))
+            == "stage23_selector"
+        ):
+            model._trajectory_head.stage23_selector.train()
+        if (
+            self.training
+            and str(getattr(self._config, "grpo_training_mode", ""))
+            == "stage24_selector"
+        ):
+            model._trajectory_head.stage24_selector.train()
         if (
             self.training
             and str(getattr(self._config, "grpo_training_mode", ""))
@@ -606,6 +1717,15 @@ class TransfuserAgent(AbstractAgent):
 
     def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None, tokens_list=None) -> Dict[str, torch.Tensor]:
         """Inherited, see superclass."""
+        if (
+            str(getattr(self._config, "grpo_training_mode", ""))
+            == "stage28_public_paired_uplift_explore"
+            and not self.training
+        ):
+            raise RuntimeError(
+                "Stage28 S-public exploration mode is training-only and "
+                "cannot run inference/deployment"
+            )
         self._enforce_frozen_eval_mode()
         if tokens_list is None and not self.training and self._evaluation_token is not None:
             tokens_list = (self._evaluation_token,)
@@ -634,6 +1754,35 @@ class TransfuserAgent(AbstractAgent):
 
     def get_optimizers(self) -> Union[Optimizer, Dict[str, Union[Optimizer, LRScheduler]]]:
         """Inherited, see superclass."""
+        if str(getattr(self._config, "grpo_training_mode", "")) in (
+            SELECTED_SET_GRPO_MODES | STAGE30_GRPO_MODES | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES
+        ):
+            groups = build_stage10_decoder_param_groups(
+                self._transfuser_model.named_parameters(), 0.1
+            )
+            groups[0]["lr"] = float(self._lr)
+            groups[1]["lr"] = float(self._lr) * 0.1
+            optimizer = torch.optim.AdamW(
+                groups, lr=float(self._lr), weight_decay=float(self._config.weight_decay)
+            )
+            actual_lrs = sorted(group["lr"] for group in optimizer.param_groups)
+            if actual_lrs != [1e-7, 1e-6]:
+                raise RuntimeError(
+                    f"selected-set GRPO optimizer LR drift: {actual_lrs}"
+                )
+            return optimizer
+        if str(getattr(self._config, "grpo_training_mode", "")) in STAGE22_GRPO_MODES:
+            parameters = [
+                parameter for parameter in self._transfuser_model.parameters()
+                if parameter.requires_grad
+            ]
+            if len(parameters) != 4:
+                raise RuntimeError(
+                    f"Stage22 optimizer expected four LoRA tensors, got {len(parameters)}"
+                )
+            return torch.optim.AdamW(
+                parameters, lr=self._lr, weight_decay=0.0
+            )
         return self.get_coslr_optimizers()
 
     def get_step_lr_optimizers(self):
@@ -663,7 +1812,12 @@ class TransfuserAgent(AbstractAgent):
             paramwise_cfg = optimizer_cfg.pop('paramwise_cfg', None)
 
         stage10_param_groups = None
-        if str(getattr(self._config, "grpo_training_mode", "")) in STAGE10_GRPO_MODES:
+        if str(getattr(self._config, "grpo_training_mode", "")) in (
+            STAGE10_GRPO_MODES | STAGE21_GRPO_MODES | STAGE23_GRPO_MODES
+            | STAGE27_GRPO_MODES | STAGE28_GRPO_MODES | STAGE29_GRPO_MODES
+            | STAGE30_GRPO_MODES | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES
+            | STAGE33_GRPO_MODES | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES
+        ):
             stage10_param_groups = build_stage10_decoder_param_groups(
                 self._transfuser_model.named_parameters(),
                 self._config.grpo_decoder_layer0_lr_mult,
@@ -720,7 +1874,10 @@ class TransfuserAgent(AbstractAgent):
         )
         if (
             training_mode in FORMAL_GRPO_MODES
-            or training_mode in {"value_selector", "paired_tail_risk_selector"}
+            or training_mode in {
+                "value_selector", "stage23_selector", "stage24_selector",
+                "paired_tail_risk_selector"
+            }
             or checkpoint_save_top_k == -1
         ):
             # Stage 9 has no on-policy validation rollout: PDMS selection is

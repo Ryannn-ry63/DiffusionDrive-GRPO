@@ -16,7 +16,11 @@ from navsim.planning.training.dataset import CacheOnlyDataset, Dataset
 from navsim.planning.training.agent_lightning_module import AgentLightningModule
 from navsim.planning.training.grpo_sampler import (
     BalancedPriorityBatchSampler,
+    Stage30GlobalBucketBatchSampler,
     load_manifest_tokens,
+)
+from navsim.agents.diffusiondrive.stage30_mode_coverage import (
+    load_stage30_bucket_manifest,
 )
 
 from pytorch_lightning.loggers import TensorBoardLogger  #
@@ -200,6 +204,114 @@ def main(cfg: DictConfig) -> None:
             "value_selector_train_manifest_path is valid only in value_selector mode"
         )
 
+    stage23_manifest_path = str(
+        getattr(agent_config, "stage23_selector_train_manifest_path", "")
+    )
+    if str(getattr(agent_config, "grpo_training_mode", "")) == "stage23_selector":
+        if not stage23_manifest_path:
+            raise ValueError(
+                "stage23_selector training requires stage23_selector_train_manifest_path"
+            )
+        stage23_token_list = load_manifest_tokens(Path(stage23_manifest_path))
+        stage23_tokens = set(stage23_token_list)
+        missing_tokens = sorted(stage23_tokens - set(train_data.tokens))
+        if missing_tokens:
+            raise RuntimeError(
+                f"Stage23 manifest has {len(missing_tokens)} unavailable tokens; "
+                f"first={missing_tokens[0]}"
+            )
+        train_data.tokens = [
+            token for token in train_data.tokens if token in stage23_tokens
+        ]
+        if len(train_data.tokens) != len(stage23_token_list):
+            raise RuntimeError("Stage23 manifest filtering changed token count")
+        logger.info(
+            "Stage23 whole-log selector manifest: %d tokens from %s",
+            len(train_data.tokens), stage23_manifest_path,
+        )
+    elif stage23_manifest_path:
+        raise ValueError(
+            "stage23_selector_train_manifest_path is valid only in stage23_selector mode"
+        )
+
+    stage24_manifest_path = str(
+        getattr(agent_config, "stage24_selector_train_manifest_path", "")
+    )
+    stage24_bank_modes = {
+        "stage24_selector", "stage25_relative_harm_selector"
+    }
+    if str(getattr(agent_config, "grpo_training_mode", "")) in stage24_bank_modes:
+        if not stage24_manifest_path:
+            raise ValueError(
+                "Stage24/25 selector training requires "
+                "stage24_selector_train_manifest_path"
+            )
+        stage24_token_list = load_manifest_tokens(Path(stage24_manifest_path))
+        stage24_tokens = set(stage24_token_list)
+        missing_tokens = sorted(stage24_tokens - set(train_data.tokens))
+        if missing_tokens:
+            raise RuntimeError(
+                f"Stage24 manifest has {len(missing_tokens)} unavailable tokens; "
+                f"first={missing_tokens[0]}"
+            )
+        train_data.tokens = [
+            token for token in train_data.tokens if token in stage24_tokens
+        ]
+        if len(train_data.tokens) != len(stage24_token_list):
+            raise RuntimeError("Stage24 manifest filtering changed token count")
+        logger.info(
+            "Stage24 whole-log selector manifest: %d tokens from %s",
+            len(train_data.tokens), stage24_manifest_path,
+        )
+    elif stage24_manifest_path:
+        raise ValueError(
+            "stage24_selector_train_manifest_path is valid only in "
+            "Stage24/25 selector mode"
+        )
+
+    stage23_generator_manifest = str(
+        getattr(agent_config, "stage23_generator_train_manifest_path", "")
+    )
+    if str(getattr(agent_config, "grpo_training_mode", "")) in {
+        "diffgrpo_selected_set",
+        "stage27_public_diffgrpo_selected_set",
+        "stage28_public_paired_uplift_multi",
+        "stage28_public_paired_uplift_explore",
+        "stage29_public_headroom_hybrid",
+        "stage29_public_headroom_conditional",
+        "stage30_public_mode_coverage",
+        "stage30_public_mode_coverage_constrained",
+        "stage31_public_deployed_pair",
+        "stage31_public_deployed_frontier",
+        "stage32_public_deployed_extended",
+        "stage32_selector_aware_frontier",
+        # Stage33 uses the same frozen fold token manifest to prevent
+        # cross-fold leakage; the field is retained for backwards-compatible
+        # Hydra wiring with the existing Stage23/31/32 data path.
+        "stage33_cdc_grpo",
+        "stage34_mode_aligned_frontier_grpo",
+        "stage35_nested_counterfactual_deployment_grpo",
+        "stage36_reference_gated_tail_ncd_grpo",
+    }:
+        if not stage23_generator_manifest:
+            raise ValueError("Stage23 generator requires its folds0-3 manifest")
+        generator_tokens = load_manifest_tokens(Path(stage23_generator_manifest))
+        generator_token_set = set(generator_tokens)
+        missing_tokens = sorted(generator_token_set - set(train_data.tokens))
+        if missing_tokens:
+            raise RuntimeError(
+                f"Stage23 generator manifest has unavailable token: {missing_tokens[0]}"
+            )
+        train_data.tokens = [
+            token for token in train_data.tokens if token in generator_token_set
+        ]
+        if len(train_data.tokens) != len(generator_tokens):
+            raise RuntimeError("Stage23 generator manifest token count drifted")
+    elif stage23_generator_manifest:
+        raise ValueError(
+            "stage23_generator_train_manifest_path is Stage23-generator-only"
+        )
+
     diffgrpo_manifest_path = str(
         getattr(agent_config, "diffgrpo_train_manifest_path", "")
     )
@@ -230,10 +342,13 @@ def main(cfg: DictConfig) -> None:
     selected_anchor_manifest_path = str(
         getattr(agent_config, "diffgrpo_selected_mode_manifest_path", "")
     )
-    selected_anchor_training = (
-        str(getattr(agent_config, "grpo_training_mode", ""))
-        == "diffgrpo_selected_anchor"
-    )
+    selected_anchor_training = str(
+        getattr(agent_config, "grpo_training_mode", "")
+    ) in {
+        "diffgrpo_selected_anchor",
+        "diffgrpo_selected_anchor_base_preserve",
+        "diffgrpo_paired_residual",
+    }
     if selected_anchor_training:
         if not selected_anchor_manifest_path:
             raise ValueError(
@@ -247,21 +362,21 @@ def main(cfg: DictConfig) -> None:
         missing_tokens = sorted(selected_token_set - available_tokens)
         if missing_tokens:
             raise RuntimeError(
-                f"Stage19 manifest has {len(missing_tokens)} unavailable tokens; "
+                f"Selected-anchor manifest has {len(missing_tokens)} unavailable tokens; "
                 f"first={missing_tokens[0]}"
             )
         train_data.tokens = [
             token for token in train_data.tokens if token in selected_token_set
         ]
         if len(train_data.tokens) != len(selected_tokens):
-            raise RuntimeError("Stage19 manifest filtering changed token count")
+            raise RuntimeError("Selected-anchor manifest filtering changed token count")
         logger.info(
-            "Stage19 selected-anchor manifest: %d training tokens from %s",
+            "Selected-anchor manifest: %d training tokens from %s",
             len(train_data.tokens), selected_anchor_manifest_path,
         )
     elif selected_anchor_manifest_path:
         raise ValueError(
-            "diffgrpo_selected_mode_manifest_path is valid only in Stage19 mode"
+            "diffgrpo_selected_mode_manifest_path is valid only in selected-anchor modes"
         )
 
     paired_risk_manifest_path = str(
@@ -293,13 +408,116 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("paired-risk training requires paired_risk_train_manifest_path")
 
     logger.info("Building Datasets")
+    training_mode = str(getattr(agent_config, "grpo_training_mode", ""))
+    stage30_mode = training_mode in {
+        "stage30_public_mode_coverage",
+        "stage30_public_mode_coverage_constrained",
+    }
+    stage31_mode = training_mode in {
+        "stage31_public_deployed_pair",
+        "stage31_public_deployed_frontier",
+    }
+    stage32_mode = training_mode in {
+        "stage32_public_deployed_extended",
+        "stage32_selector_aware_frontier",
+    }
+    stage33_mode = training_mode == "stage33_cdc_grpo"
+    stage34_mode = training_mode == "stage34_mode_aligned_frontier_grpo"
+    stage35_mode = training_mode == "stage35_nested_counterfactual_deployment_grpo"
+    stage36_mode = training_mode == "stage36_reference_gated_tail_ncd_grpo"
     priority_manifest_path = str(
         getattr(agent_config, "grpo_priority_manifest_path", "")
     )
     priority_fraction = float(
         getattr(agent_config, "grpo_priority_sample_fraction", 0.0)
     )
-    if priority_manifest_path:
+    if stage30_mode or stage31_mode or stage32_mode or stage33_mode or stage34_mode or stage35_mode or stage36_mode:
+        stage_name = (
+            "Stage36" if stage36_mode else (
+                "Stage35" if stage35_mode else ("Stage34" if stage34_mode else ("Stage33" if stage33_mode else (
+                "Stage32" if stage32_mode else ("Stage31" if stage31_mode else "Stage30")
+            )))
+            )
+        )
+        config_prefix = (
+            "stage36" if stage36_mode else (
+                "stage35" if stage35_mode else ("stage34" if stage34_mode else ("stage33" if stage33_mode else (
+                "stage32" if stage32_mode else ("stage31" if stage31_mode else "stage30")
+            )))
+            )
+        )
+        if priority_manifest_path or priority_fraction != 0.0:
+            raise ValueError(
+                f"{stage_name} bucket sampler cannot mix priority sampling"
+            )
+        bucket_manifest_path = str(
+            getattr(
+                agent_config, f"{config_prefix}_bucket_manifest_path", ""
+            )
+        )
+        token_buckets = load_stage30_bucket_manifest(
+            bucket_manifest_path, require_full=True
+        )
+        accumulation = int(
+            getattr(agent_config, f"{config_prefix}_gradient_accumulation", 8)
+        )
+        trainer_accumulation = int(
+            cfg.trainer.params.get("accumulate_grad_batches", 1)
+        )
+        if trainer_accumulation != accumulation:
+            raise ValueError(
+                f"{stage_name} trainer accumulate_grad_batches must equal 8"
+            )
+        if bool(cfg.trainer.params.get("use_distributed_sampler", True)):
+            raise ValueError(
+                f"{stage_name} requires "
+                "trainer.params.use_distributed_sampler=false"
+            )
+        train_loader_params = dict(cfg.dataloader.params)
+        configured_batch = int(train_loader_params.pop("batch_size"))
+        if configured_batch != 1:
+            raise ValueError(
+                f"{stage_name} DataLoader batch_size override must be 1"
+            )
+        configured_devices = int(cfg.trainer.params.get("devices", 1))
+        if configured_devices != 8:
+            raise ValueError(
+                f"formal {stage_name} requires exactly eight DDP devices"
+            )
+        batch_sampler = Stage30GlobalBucketBatchSampler(
+            train_data.tokens,
+            token_buckets,
+            optimizer_steps_per_epoch=int(getattr(
+                agent_config,
+                f"{config_prefix}_optimizer_steps_per_epoch",
+                48,
+            )),
+            composition=tuple(getattr(
+                agent_config,
+                f"{config_prefix}_global_bucket_composition",
+                (2, 30, 8, 24),
+            )),
+            accumulation_steps=accumulation,
+            world_size=configured_devices,
+            seed=int(cfg.seed),
+        )
+        train_dataloader = DataLoader(
+            train_data,
+            collate_fn=custom_collate_fn,
+            batch_sampler=batch_sampler,
+            **train_loader_params,
+        )
+        logger.info(
+            "%s global bucket sampler: rank=%d/%d composition=%s "
+            "optimizer_steps=%d microbatches=%d",
+            stage_name,
+            batch_sampler.rank,
+            batch_sampler.world_size,
+            batch_sampler.composition,
+            batch_sampler.optimizer_steps_per_epoch,
+            len(batch_sampler),
+        )
+    elif priority_manifest_path:
         if not 0.0 < priority_fraction < 1.0:
             raise ValueError(
                 "grpo_priority_sample_fraction must be between 0 and 1 "
