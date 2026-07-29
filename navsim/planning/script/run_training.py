@@ -234,11 +234,21 @@ def main(cfg: DictConfig) -> None:
             "stage23_selector_train_manifest_path is valid only in stage23_selector mode"
         )
 
-    stage24_manifest_path = str(
-        getattr(agent_config, "stage24_selector_train_manifest_path", "")
-    )
+    training_mode_name = str(getattr(
+        agent_config, "grpo_training_mode", ""
+    ))
+    stage24_manifest_path = str(getattr(
+        agent_config,
+        (
+            "stage37_jfi_train_manifest_path"
+            if training_mode_name == "stage37_jfi_selector"
+            else "stage24_selector_train_manifest_path"
+        ),
+        "",
+    ))
     stage24_bank_modes = {
-        "stage24_selector", "stage25_relative_harm_selector"
+        "stage24_selector", "stage25_relative_harm_selector",
+        "stage37_jfi_selector",
     }
     if str(getattr(agent_config, "grpo_training_mode", "")) in stage24_bank_modes:
         if not stage24_manifest_path:
@@ -292,6 +302,11 @@ def main(cfg: DictConfig) -> None:
         "stage34_mode_aligned_frontier_grpo",
         "stage35_nested_counterfactual_deployment_grpo",
         "stage36_reference_gated_tail_ncd_grpo",
+        "stage37_bistate_projected_deployment_grpo",
+        "stage38_elite_set_counterfactual_repair_grpo",
+        "stage39_challenger_bc",
+        "stage39_challenger_standard_grpo",
+        "stage39_challenger_set_grpo",
     }:
         if not stage23_generator_manifest:
             raise ValueError("Stage23 generator requires its folds0-3 manifest")
@@ -425,27 +440,44 @@ def main(cfg: DictConfig) -> None:
     stage34_mode = training_mode == "stage34_mode_aligned_frontier_grpo"
     stage35_mode = training_mode == "stage35_nested_counterfactual_deployment_grpo"
     stage36_mode = training_mode == "stage36_reference_gated_tail_ncd_grpo"
+    stage37_mode = training_mode == "stage37_bistate_projected_deployment_grpo"
+    stage38_mode = training_mode == "stage38_elite_set_counterfactual_repair_grpo"
+    stage39_mode = training_mode in {
+        "stage39_challenger_bc",
+        "stage39_challenger_standard_grpo",
+        "stage39_challenger_set_grpo",
+    }
     priority_manifest_path = str(
         getattr(agent_config, "grpo_priority_manifest_path", "")
     )
     priority_fraction = float(
         getattr(agent_config, "grpo_priority_sample_fraction", 0.0)
     )
-    if stage30_mode or stage31_mode or stage32_mode or stage33_mode or stage34_mode or stage35_mode or stage36_mode:
+    if (
+        stage30_mode or stage31_mode or stage32_mode or stage33_mode
+        or stage34_mode or stage35_mode or stage36_mode or stage37_mode
+        or stage38_mode or stage39_mode
+    ):
         stage_name = (
-            "Stage36" if stage36_mode else (
+            "Stage37" if stage37_mode else ("Stage36" if stage36_mode else (
                 "Stage35" if stage35_mode else ("Stage34" if stage34_mode else ("Stage33" if stage33_mode else (
                 "Stage32" if stage32_mode else ("Stage31" if stage31_mode else "Stage30")
             )))
-            )
+            ))
         )
         config_prefix = (
-            "stage36" if stage36_mode else (
+            "stage37" if stage37_mode else ("stage36" if stage36_mode else (
                 "stage35" if stage35_mode else ("stage34" if stage34_mode else ("stage33" if stage33_mode else (
                 "stage32" if stage32_mode else ("stage31" if stage31_mode else "stage30")
             )))
-            )
+            ))
         )
+        if stage38_mode:
+            stage_name = "Stage38"
+            config_prefix = "stage38"
+        if stage39_mode:
+            stage_name = "Stage39"
+            config_prefix = "stage39"
         if priority_manifest_path or priority_fraction != 0.0:
             raise ValueError(
                 f"{stage_name} bucket sampler cannot mix priority sampling"

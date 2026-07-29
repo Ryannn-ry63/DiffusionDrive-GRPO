@@ -31,6 +31,18 @@ from navsim.agents.diffusiondrive.stage35_loss_bridge import (
 from navsim.agents.diffusiondrive.stage36_loss_bridge import (
     compute_stage36_transfuser_loss,
 )
+from navsim.agents.diffusiondrive.stage37_loss_bridge import (
+    compute_stage37_transfuser_loss,
+)
+from navsim.agents.diffusiondrive.stage38_loss_bridge import (
+    compute_stage38_transfuser_loss,
+)
+from navsim.agents.diffusiondrive.stage39_loss_bridge import (
+    compute_stage39_transfuser_loss,
+)
+from navsim.agents.diffusiondrive.stage37_joint_feasible_selector import (
+    compute_stage37_jfi_loss,
+)
 
 
 def compute_group_relative_advantages(
@@ -3100,6 +3112,25 @@ def transfuser_loss(
     """Pure GRPO objective for selection, generation, or their joint policy."""
     current_logits = predictions["final_poses_cls"]
     training_mode = getattr(config, "grpo_training_mode", "classification_shared")
+    if training_mode == "stage37_jfi_selector":
+        if not predictions.get("grpo_training_rollout", True):
+            zero = current_logits.sum() * 0.0
+            return {"loss": zero, "stage37_jfi_selector_loss": zero.detach()}
+        result = compute_stage37_jfi_loss(
+            predictions,
+            focal_gamma=float(getattr(
+                config, "stage37_jfi_focal_gamma", 2.0
+            )),
+            positive_weight=float(getattr(
+                config, "stage37_jfi_positive_weight", 1.0
+            )),
+            joint_weight=4.0,
+            quantile_weight=1.0,
+            rank_weight=1.0,
+            rank_margin=0.005,
+        )
+        result["stage37_jfi_selector_loss"] = result["loss"].detach()
+        return result
     if training_mode == "stage25_relative_harm_selector":
         if not predictions.get("grpo_training_rollout", True):
             zero = current_logits.sum() * 0.0
@@ -3210,6 +3241,16 @@ def transfuser_loss(
             "kl_loss": zero.detach(),
         }
 
+    if training_mode in {
+        "stage39_challenger_bc",
+        "stage39_challenger_standard_grpo",
+        "stage39_challenger_set_grpo",
+    }:
+        return compute_stage39_transfuser_loss(predictions, config)
+    if training_mode == "stage38_elite_set_counterfactual_repair_grpo":
+        return compute_stage38_transfuser_loss(predictions, config)
+    if training_mode == "stage37_bistate_projected_deployment_grpo":
+        return compute_stage37_transfuser_loss(predictions, config)
     if training_mode == "stage36_reference_gated_tail_ncd_grpo":
         return compute_stage36_transfuser_loss(predictions, config)
     if training_mode == "stage35_nested_counterfactual_deployment_grpo":

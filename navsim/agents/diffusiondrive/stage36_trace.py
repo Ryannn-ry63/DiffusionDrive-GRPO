@@ -54,6 +54,7 @@ def collect_stage36_sampling_trace(
     bev_spatial_shape,
     status_encoding: torch.Tensor,
     global_img: torch.Tensor | None,
+    selector_micro_batch_size: int | None = None,
 ) -> Dict[str, object]:
     """Sample paired banks and freeze selector-counterfactual decisions.
 
@@ -189,7 +190,9 @@ def collect_stage36_sampling_trace(
             status_encoding,
             selector_micro_batch_size=int(getattr(
                 head._config, "stage36_selector_micro_batch_size", 16
-            )),
+            )) if selector_micro_batch_size is None else int(
+                selector_micro_batch_size
+            ),
         )
     return {
         "current_states": current_states,
@@ -591,4 +594,3 @@ def finalize_stage36_reward_dependent_replay(
             float(steps)
         ),
     }
-

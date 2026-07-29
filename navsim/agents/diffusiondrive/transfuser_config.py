@@ -370,6 +370,90 @@ class TransfuserConfig:
     stage36_signal_retention_fraction_min: float = 0.01
     stage36_signal_tail_fraction_min: float = 0.005
     stage36_diagnostic_only: bool = False
+    # Stage37 bi-state projected deployment GRPO and JFI selector.
+    stage37_bucket_manifest_path: str = ""
+    stage37_plan_sha256: str = (
+        "4dc469dd0be4d2579796ff70ae7a09ed9fd8e4c92449cd057e42463d268bb5d8"
+    )
+    stage37_objective_revision: str = "bistate_projected_deployment_v1"
+    stage37_active_pool_width: int = 4
+    stage37_selector_micro_batch_size: int = 16
+    stage37_frontier_width: int = 5
+    stage37_tail_elite_count: int = 2
+    stage37_frontier_regression_tolerance: float = 1e-4
+    stage37_tail_margin: float = 0.001
+    stage37_advantage_scale: float = 0.002
+    stage37_advantage_clip: float = 2.0
+    stage37_counterfactual_weight: float = 0.25
+    stage37_tail_weight: float = 0.25
+    stage37_frontier_weight: float = 0.25
+    stage37_projection_recovery_coefficient: float = 0.25
+    stage37_projection_epsilon: float = 1e-12
+    stage37_bc_weight: float = 0.1
+    stage37_kl_weight: float = 0.1
+    stage37_safety_kl_weight: float = 0.5
+    stage37_optimizer_steps_per_epoch: int = 48
+    stage37_gradient_accumulation: int = 8
+    stage37_global_bucket_composition: tuple = (2, 30, 8, 24)
+    stage37_diagnostic_only: bool = False
+    stage37_jfi_num_members: int = 8
+    stage37_jfi_checkpoint_path: str = ""
+    stage37_jfi_calibration_path: str = ""
+    stage37_jfi_train_manifest_path: str = ""
+    stage37_jfi_candidate_bank_paths: Tuple[str, ...] = ()
+    stage37_jfi_focal_gamma: float = 2.0
+    stage37_jfi_positive_weight: float = 1.0
+    stage37_jfi_joint_threshold: float = -1.0
+    stage37_jfi_q10_floor: float = -1.0
+    stage37_jfi_max_candidates: int = 4
+    stage37_jfi_collect_calibration: bool = False
+    # Stage38 elite-set counterfactual repair GRPO (frozen 2026-07-28).
+    stage38_bucket_manifest_path: str = ""
+    stage38_plan_sha256: str = (
+        "8cd826b6ab8a4376c6e4a4fdffc97e96fe00fba00a25a1029d5fa5bcf4a8b027"
+    )
+    stage38_objective_revision: str = "elite_set_counterfactual_repair_v1"
+    stage38_selector_micro_batch_size: int = 16
+    stage38_elite_width: int = 5
+    stage38_positive_challenger_width: int = 2
+    stage38_active_pool_width: int = 8
+    stage38_positive_margin: float = 0.001
+    stage38_negative_tolerance: float = 0.0001
+    stage38_advantage_scale: float = 0.002
+    stage38_advantage_clip: float = 2.0
+    stage38_mature_positive_multiplier: float = 0.25
+    stage38_bc_weight: float = 0.1
+    stage38_kl_weight: float = 0.1
+    stage38_safety_kl_weight: float = 0.5
+    stage38_step_discount: float = 0.6
+    stage38_optimizer_steps_per_epoch: int = 48
+    stage38_gradient_accumulation: int = 8
+    stage38_global_bucket_composition: tuple = (2, 30, 8, 24)
+    stage38_diagnostic_only: bool = False
+    # Stage39 non-destructive challenger GRPO (frozen 2026-07-29).
+    stage39_bucket_manifest_path: str = ""
+    stage39_plan_sha256: str = (
+        "7e1e6142412778524714a0b919f971edf1d2bf14138b0efcf21fc9dd7c4d6f1b"
+    )
+    stage39_objective_revision: str = (
+        "non_destructive_challenger_set_grpo_v1"
+    )
+    stage39_public_candidate_count: int = 20
+    stage39_challenger_candidate_count: int = 20
+    stage39_group_size: int = 8
+    stage39_elite_width: int = 5
+    stage39_positive_margin: float = 0.001
+    stage39_advantage_scale: float = 0.02
+    stage39_advantage_clip: float = 2.0
+    stage39_std_floor: float = 0.0001
+    stage39_kl_weight: float = 0.1
+    stage39_step_discount: float = 0.6
+    stage39_optimizer_steps_per_epoch: int = 48
+    stage39_gradient_accumulation: int = 8
+    stage39_global_bucket_composition: tuple = (2, 30, 8, 24)
+    stage39_candidate_source: str = "public20"
+    stage39_challenger_noise_offset: int = 390001
+    stage39_diagnostic_only: bool = False
     diffgrpo_lora_rank: int = 8
     diffgrpo_lora_alpha: float = 8.0
     generation_adaptive_kl_enabled: bool = False

@@ -6,6 +6,9 @@ from torch import Tensor
 from typing import Dict, Tuple
 
 from navsim.agents.abstract_agent import AbstractAgent
+from navsim.agents.diffusiondrive.stage37_bistate_projected import (
+    project_reward_gradient,
+)
 
 
 class AgentLightningModule(pl.LightningModule):
@@ -22,6 +25,163 @@ class AgentLightningModule(pl.LightningModule):
         self._latest_generation_kl = None
         self._adaptive_kl_stop_pending = False
         self._adaptive_kl_stop_checkpoint_saved = False
+        self._stage37_preservation_gradients = None
+        self._stage37_frontier_delta_sum = None
+        self._stage37_microbatch_count = 0
+
+    def _stage37_trainable_parameters(self):
+        model = getattr(self.agent, "_transfuser_model", None)
+        head = getattr(model, "_trajectory_head", None)
+        decoder = getattr(head, "diff_decoder", None)
+        if decoder is None:
+            raise RuntimeError("Stage37 cannot find the diffusion decoder")
+        named = [
+            (name, parameter)
+            for name, parameter in decoder.named_parameters()
+            if parameter.requires_grad
+        ]
+        if len(named) != 64:
+            raise RuntimeError(
+                "Stage37 requires exactly 64 trainable decoder tensors; "
+                f"got {len(named)}"
+            )
+        if any("plan_cls_branch" in name for name, _ in named):
+            raise RuntimeError("Stage37 classification tensors must remain frozen")
+        return named
+
+    def _capture_stage37_preservation_gradient(
+        self, loss_dict: Dict[str, Tensor]
+    ) -> None:
+        preservation = loss_dict.get("stage37_preservation_loss")
+        reward = loss_dict.get("stage37_reward_loss")
+        frontier_delta = loss_dict.get("stage37_public_frontier_delta_mean")
+        if preservation is None or reward is None or frontier_delta is None:
+            raise RuntimeError("Stage37 split loss/provenance is incomplete")
+        if loss_dict.get("loss") is not reward:
+            raise RuntimeError("Stage37 automatic backward must use reward loss only")
+        named = self._stage37_trainable_parameters()
+        parameters = [parameter for _, parameter in named]
+        gradients = torch.autograd.grad(
+            preservation,
+            parameters,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )
+        detached = [
+            (
+                torch.zeros_like(parameter)
+                if gradient is None
+                else gradient.detach().to(parameter)
+            )
+            for parameter, gradient in zip(parameters, gradients)
+        ]
+        if not all(torch.isfinite(value).all() for value in detached):
+            raise FloatingPointError(
+                "Stage37 preservation gradient is non-finite"
+            )
+        if self._stage37_preservation_gradients is None:
+            self._stage37_preservation_gradients = [
+                value.clone() for value in detached
+            ]
+            self._stage37_frontier_delta_sum = (
+                frontier_delta.detach().float().clone()
+            )
+        else:
+            if len(self._stage37_preservation_gradients) != len(detached):
+                raise RuntimeError("Stage37 gradient accumulator shape drifted")
+            for accumulator, value in zip(
+                self._stage37_preservation_gradients, detached
+            ):
+                accumulator.add_(value)
+            self._stage37_frontier_delta_sum.add_(
+                frontier_delta.detach().float()
+            )
+        self._stage37_microbatch_count += 1
+
+    def _apply_stage37_gradient_projection(self) -> None:
+        named = self._stage37_trainable_parameters()
+        if (
+            self._stage37_preservation_gradients is None
+            or self._stage37_frontier_delta_sum is None
+            or self._stage37_microbatch_count <= 0
+        ):
+            raise RuntimeError("Stage37 optimizer step lacks captured constraints")
+        expected = int(getattr(
+            getattr(self.agent, "_config", None),
+            "stage37_gradient_accumulation",
+            8,
+        ))
+        if self._stage37_microbatch_count != expected:
+            raise RuntimeError(
+                "Stage37 optimizer boundary has "
+                f"{self._stage37_microbatch_count} microbatches, expected {expected}"
+            )
+        count = float(self._stage37_microbatch_count)
+        preserve = [
+            value.div(count) for value in self._stage37_preservation_gradients
+        ]
+        frontier_delta = self._stage37_frontier_delta_sum.div(count)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            world = float(torch.distributed.get_world_size())
+            for value in preserve:
+                torch.distributed.all_reduce(
+                    value, op=torch.distributed.ReduceOp.SUM
+                )
+                value.div_(world)
+            torch.distributed.all_reduce(
+                frontier_delta, op=torch.distributed.ReduceOp.SUM
+            )
+            frontier_delta.div_(world)
+        reward = []
+        for name, parameter in named:
+            if parameter.grad is None:
+                raise RuntimeError(
+                    f"Stage37 reward gradient missing for {name}"
+                )
+            reward.append(parameter.grad.detach().clone())
+        projected, diagnostics = project_reward_gradient(
+            reward,
+            preserve,
+            frontier_delta=frontier_delta,
+            regression_tolerance=float(getattr(
+                self.agent._config,
+                "stage37_frontier_regression_tolerance",
+                1e-4,
+            )),
+            recovery_coefficient=float(getattr(
+                self.agent._config,
+                "stage37_projection_recovery_coefficient",
+                0.25,
+            )),
+            epsilon=float(getattr(
+                self.agent._config, "stage37_projection_epsilon", 1e-12
+            )),
+        )
+        for (_, parameter), gradient in zip(named, projected):
+            parameter.grad.copy_(gradient)
+        for name, value in diagnostics.items():
+            self.log(
+                f"train/stage37_projection_{name}",
+                value,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=name in {
+                    "conflict", "recovery_active", "frontier_delta"
+                },
+                sync_dist=False,
+            )
+        self.log(
+            "train/stage37_projection_microbatch_count",
+            frontier_delta.new_tensor(float(self._stage37_microbatch_count)),
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            sync_dist=False,
+        )
+        self._stage37_preservation_gradients = None
+        self._stage37_frontier_delta_sum = None
+        self._stage37_microbatch_count = 0
 
     def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str) -> Tensor:
         """
@@ -38,6 +198,12 @@ class AgentLightningModule(pl.LightningModule):
         loss_dict = self.agent.compute_loss(features, targets, prediction)
         if logging_prefix == "train":
             self._latest_generation_kl = loss_dict.get("generation_kl_loss")
+            if str(getattr(
+                getattr(self.agent, "_config", None),
+                "grpo_training_mode",
+                "",
+            )) == "stage37_bistate_projected_deployment_grpo":
+                self._capture_stage37_preservation_gradient(loss_dict)
         for k, v in loss_dict.items():
             if v is not None:
                 self.log(f"{logging_prefix}/{k}", v, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=len(batch[0]))
@@ -93,9 +259,23 @@ class AgentLightningModule(pl.LightningModule):
 
     def on_before_optimizer_step(self, optimizer) -> None:
         """Log the trainable planning decoder gradient norm for GRPO diagnostics."""
+        training_mode = str(getattr(
+            getattr(self.agent, "_config", None), "grpo_training_mode", ""
+        ))
+        if training_mode == "stage37_bistate_projected_deployment_grpo":
+            self._apply_stage37_gradient_projection()
         model = getattr(self.agent, "_transfuser_model", None)
         trajectory_head = getattr(model, "_trajectory_head", None)
-        decoder = getattr(trajectory_head, "diff_decoder", None)
+        stage39_modes = {
+            "stage39_challenger_bc",
+            "stage39_challenger_standard_grpo",
+            "stage39_challenger_set_grpo",
+        }
+        decoder = (
+            getattr(trajectory_head, "stage39_challenger_decoder", None)
+            if training_mode in stage39_modes
+            else getattr(trajectory_head, "diff_decoder", None)
+        )
         if decoder is None:
             return
         squared_norms = {
@@ -231,6 +411,18 @@ class AgentLightningModule(pl.LightningModule):
                         + parameter.grad.detach().float().square().sum()
                     )
         stage25_selector_grad_norm = stage25_squared_norm.sqrt()
+        stage37_jfi_squared_norm = torch.zeros((), device=self.device)
+        stage37_jfi_selector = getattr(
+            trajectory_head, "stage37_jfi_selector", None
+        )
+        if stage37_jfi_selector is not None:
+            for parameter in stage37_jfi_selector.parameters():
+                if parameter.grad is not None:
+                    stage37_jfi_squared_norm = (
+                        stage37_jfi_squared_norm
+                        + parameter.grad.detach().float().square().sum()
+                    )
+        stage37_jfi_grad_norm = stage37_jfi_squared_norm.sqrt()
         paired_squared_norm = torch.zeros((), device=self.device)
         paired_risk = getattr(trajectory_head, "paired_risk_head", None)
         if paired_risk is not None:
@@ -263,6 +455,13 @@ class AgentLightningModule(pl.LightningModule):
             "stage32_selector_aware_frontier",
             "stage33_cdc_grpo",
             "stage34_mode_aligned_frontier_grpo",
+            "stage35_nested_counterfactual_deployment_grpo",
+            "stage36_reference_gated_tail_ncd_grpo",
+            "stage37_bistate_projected_deployment_grpo",
+            "stage38_elite_set_counterfactual_repair_grpo",
+            "stage39_challenger_bc",
+            "stage39_challenger_standard_grpo",
+            "stage39_challenger_set_grpo",
         } and (
             grad_norms["classification"] != 0 or perception_grad_norm != 0
         ):
@@ -284,12 +483,20 @@ class AgentLightningModule(pl.LightningModule):
             "stage32_selector_aware_frontier",
             "stage33_cdc_grpo",
             "stage34_mode_aligned_frontier_grpo",
+            "stage35_nested_counterfactual_deployment_grpo",
+            "stage36_reference_gated_tail_ncd_grpo",
+            "stage37_bistate_projected_deployment_grpo",
+            "stage38_elite_set_counterfactual_repair_grpo",
+            "stage39_challenger_bc",
+            "stage39_challenger_standard_grpo",
+            "stage39_challenger_set_grpo",
         } and (
             total_grad_norm <= 0
             or value_selector_grad_norm != 0
             or stage23_selector_grad_norm != 0
             or stage24_selector_grad_norm != 0
             or stage25_selector_grad_norm != 0
+            or stage37_jfi_grad_norm != 0
             or paired_risk_grad_norm != 0
         ):
             raise RuntimeError(
@@ -338,10 +545,24 @@ class AgentLightningModule(pl.LightningModule):
             or stage23_selector_grad_norm != 0
             or stage24_selector_grad_norm != 0
             or stage25_selector_grad_norm <= 0
+            or stage37_jfi_grad_norm != 0
             or paired_risk_grad_norm != 0
         ):
             raise RuntimeError(
                 "Stage25 selector violated its frozen boundary or has zero gradient"
+            )
+        if training_mode == "stage37_jfi_selector" and (
+            total_grad_norm != 0
+            or perception_grad_norm != 0
+            or value_selector_grad_norm != 0
+            or stage23_selector_grad_norm != 0
+            or stage24_selector_grad_norm != 0
+            or stage25_selector_grad_norm != 0
+            or stage37_jfi_grad_norm <= 0
+            or paired_risk_grad_norm != 0
+        ):
+            raise RuntimeError(
+                "Stage37 JFI violated its frozen encoder boundary or has zero gradient"
             )
         if training_mode == "paired_tail_risk_selector" and (
             total_grad_norm != 0
@@ -359,7 +580,7 @@ class AgentLightningModule(pl.LightningModule):
             *grad_norms.values(), total_grad_norm, perception_grad_norm,
             value_selector_grad_norm, stage23_selector_grad_norm,
             stage24_selector_grad_norm, paired_risk_grad_norm,
-            stage25_selector_grad_norm,
+            stage25_selector_grad_norm, stage37_jfi_grad_norm,
         )):
             raise FloatingPointError("Non-finite diff_decoder gradient norm")
         self.log(
@@ -384,6 +605,10 @@ class AgentLightningModule(pl.LightningModule):
         )
         self.log(
             "train/stage25_selector_grad_norm", stage25_selector_grad_norm,
+            on_step=True, on_epoch=True, prog_bar=True, sync_dist=True,
+        )
+        self.log(
+            "train/stage37_jfi_grad_norm", stage37_jfi_grad_norm,
             on_step=True, on_epoch=True, prog_bar=True, sync_dist=True,
         )
         self.log(

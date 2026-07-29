@@ -90,6 +90,25 @@ from navsim.agents.diffusiondrive.stage36_trace import (
     collect_stage36_sampling_trace,
     finalize_stage36_reward_dependent_replay,
 )
+from navsim.agents.diffusiondrive.stage37_trace import (
+    collect_stage37_sampling_trace,
+    finalize_stage37_reward_dependent_replay,
+)
+from navsim.agents.diffusiondrive.stage38_trace import (
+    collect_stage38_sampling_trace,
+    finalize_stage38_reward_dependent_replay,
+)
+from navsim.agents.diffusiondrive.stage39_contract import (
+    STAGE39_TRAINING_MODES,
+)
+from navsim.agents.diffusiondrive.stage39_trace import (
+    collect_stage39_sampling_trace,
+    finalize_stage39_replay,
+)
+from navsim.agents.diffusiondrive.stage37_joint_feasible_selector import (
+    Stage37JointFeasibleSelector,
+    select_stage37_jfi_trajectory,
+)
 
 from navsim.common.dataclasses import Trajectory
 from navsim.common.dataloader import MetricCacheLoader
@@ -145,10 +164,26 @@ STAGE35_NCD_TRAINING_MODES = {
 STAGE36_RGT_NCD_TRAINING_MODES = {
     "stage36_reference_gated_tail_ncd_grpo",
 }
+STAGE37_BPD_TRAINING_MODES = {
+    "stage37_bistate_projected_deployment_grpo",
+}
+STAGE38_ESCR_TRAINING_MODES = {
+    "stage38_elite_set_counterfactual_repair_grpo",
+}
+STAGE39_CHALLENGER_TRAINING_MODES = set(STAGE39_TRAINING_MODES)
 
 def resolve_mode_coverage_bucket_manifest(config, training_mode: str):
     """Resolve the frozen bucket manifest owned by the active training stage."""
-    if training_mode in STAGE36_RGT_NCD_TRAINING_MODES:
+    if training_mode in STAGE39_CHALLENGER_TRAINING_MODES:
+        stage = "Stage39"
+        path = str(getattr(config, "stage39_bucket_manifest_path", ""))
+    elif training_mode in STAGE38_ESCR_TRAINING_MODES:
+        stage = "Stage38"
+        path = str(getattr(config, "stage38_bucket_manifest_path", ""))
+    elif training_mode in STAGE37_BPD_TRAINING_MODES:
+        stage = "Stage37"
+        path = str(getattr(config, "stage37_bucket_manifest_path", ""))
+    elif training_mode in STAGE36_RGT_NCD_TRAINING_MODES:
         stage = "Stage36"
         path = str(getattr(config, "stage36_bucket_manifest_path", ""))
     elif training_mode in STAGE35_NCD_TRAINING_MODES:
@@ -748,6 +783,14 @@ class TrajectoryHead(nn.Module):
                 getattr(config, "grpo_decoder_gradient_scope", "last_layer")
             ),
         )
+        stage39_active = (
+            str(getattr(config, "grpo_training_mode", "")) in STAGE39_TRAINING_MODES
+            or str(getattr(config, "generation_policy_algorithm", ""))
+            == "diffgrpo_non_destructive_challenger"
+        )
+        self.stage39_challenger_decoder = (
+            copy.deepcopy(self.diff_decoder) if stage39_active else None
+        )
         self.value_selector = TrajectoryValueSelector(
             config, num_heads=int(getattr(config, "value_selector_num_heads", 3))
         )
@@ -783,6 +826,10 @@ class TrajectoryHead(nn.Module):
         self.stage25_selector = Stage25RelativeHarmSelector(config)
         self.register_buffer(
             "_stage25_selector_training_updates", torch.tensor(0, dtype=torch.long)
+        )
+        self.stage37_jfi_selector = Stage37JointFeasibleSelector(config)
+        self.register_buffer(
+            "_stage37_jfi_training_updates", torch.tensor(0, dtype=torch.long)
         )
         # Optional adapters must not perturb legacy decoder/training RNG streams.
         with torch.random.fork_rng(devices=[]):
@@ -833,6 +880,9 @@ class TrajectoryHead(nn.Module):
             "diffgrpo_deployed_selected_set", "diffgrpo_mode_aligned_frontier",
             "diffgrpo_nested_counterfactual_deployment",
             "diffgrpo_reference_gated_tail_ncd",
+            "diffgrpo_bistate_projected_deployment",
+            "diffgrpo_elite_set_counterfactual_repair",
+            "diffgrpo_non_destructive_challenger",
         }:
             raise ValueError(
                 "generation_policy_algorithm must be legacy_ppo, "
@@ -842,6 +892,8 @@ class TrajectoryHead(nn.Module):
                 "diffgrpo_deployed_selected_set/diffgrpo_mode_aligned_frontier"
                 "/diffgrpo_nested_counterfactual_deployment"
                 "/diffgrpo_reference_gated_tail_ncd"
+                "/diffgrpo_bistate_projected_deployment"
+                "/diffgrpo_elite_set_counterfactual_repair"
             )
         self._diffgrpo_bc_weight = float(getattr(config, "diffgrpo_bc_weight", 0.1))
         self._diffgrpo_step_discount = float(
@@ -907,12 +959,14 @@ class TrajectoryHead(nn.Module):
             "anchor_hierarchical",
             "anchor_rloo",
             "collision_truncated_intra_anchor",
+            "escr_set_marginal",
         }:
             raise ValueError(
                 "generation_advantage_mode must be one of "
                 "{'group_zscore', 'reference_centered', "
                 "'within_anchor', 'hierarchical', 'anchor_hierarchical', "
-                "'anchor_rloo', 'collision_truncated_intra_anchor'}; "
+                "'anchor_rloo', 'collision_truncated_intra_anchor', "
+                "'escr_set_marginal'}; "
                 f"got {self._generation_advantage_mode!r}"
             )
         self._grpo_rollouts_per_mode = int(
@@ -985,16 +1039,31 @@ class TrajectoryHead(nn.Module):
         self._stage24_bank_combinations = ()
         self._stage24_positive_weights = ((1.0, 1.0, 1.0), 1.0)
         self._stage25_positive_weights = (1.0, 1.0, 1.0, 1.0)
-        stage24_manifest = str(
-            getattr(config, "stage24_selector_train_manifest_path", "")
-        )
+        stage24_manifest = str(getattr(
+            config,
+            (
+                "stage37_jfi_train_manifest_path"
+                if self._grpo_training_mode == "stage37_jfi_selector"
+                else "stage24_selector_train_manifest_path"
+            ),
+            "",
+        ))
         if self._grpo_training_mode in {
-            "stage24_selector", "stage25_relative_harm_selector"
+            "stage24_selector", "stage25_relative_harm_selector",
+            "stage37_jfi_selector",
         }:
             if not stage24_manifest:
-                raise ValueError("stage24_selector requires its train manifest")
+                raise ValueError("Stage24/JFI selector requires its train manifest")
             self._stage24_token_logs = load_stage24_token_log_map(stage24_manifest)
-            bank_paths = tuple(getattr(config, "stage24_candidate_bank_paths", ()))
+            bank_paths = tuple(getattr(
+                config,
+                (
+                    "stage37_jfi_candidate_bank_paths"
+                    if self._grpo_training_mode == "stage37_jfi_selector"
+                    else "stage24_candidate_bank_paths"
+                ),
+                (),
+            ))
             (
                 self._stage24_candidate_bank,
                 self._stage24_bank_combinations,
@@ -1039,6 +1108,8 @@ class TrajectoryHead(nn.Module):
         if self._grpo_training_mode in (
             MODE_COVERAGE_TRAINING_MODES | STAGE34_MODE_ALIGNED_TRAINING_MODES
             | STAGE35_NCD_TRAINING_MODES | STAGE36_RGT_NCD_TRAINING_MODES
+            | STAGE37_BPD_TRAINING_MODES | STAGE38_ESCR_TRAINING_MODES
+            | STAGE39_CHALLENGER_TRAINING_MODES
         ):
             bucket_stage, bucket_manifest = resolve_mode_coverage_bucket_manifest(
                 config, self._grpo_training_mode
@@ -1323,6 +1394,85 @@ class TrajectoryHead(nn.Module):
                 raise ValueError("Stage36 public frontier width must be five")
             if int(getattr(config, "stage36_tail_elite_count", -1)) != 2:
                 raise ValueError("Stage36 same-anchor elite count must be two")
+        if self._grpo_training_mode in STAGE37_BPD_TRAINING_MODES:
+            if self._generation_policy_algorithm != "diffgrpo_bistate_projected_deployment":
+                raise ValueError("Stage37 requires its bi-state projected algorithm")
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError("Stage37 schedule must be [32,24,16,8,0]")
+            if self._truncation_timestep != 32 or self._scheduler_num_inference_steps != 125:
+                raise ValueError("Stage37 requires truncation=32 and scheduler steps=125")
+            if self._diffgrpo_group_size != 8 or self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage37 requires G=8")
+            if self._generation_advantage_mode != "group_zscore":
+                raise ValueError("Stage37 requires the locked nested-deployment route")
+            if self._inference_selector_source != "trajectory_relative_harm_v3":
+                raise ValueError("Stage37 generator training requires frozen Stage25")
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage37 does not permit inference trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage37 requires mean log probabilities")
+            if int(getattr(config, "stage37_active_pool_width", -1)) != 4:
+                raise ValueError("Stage37 active pool width must be four")
+            if int(getattr(config, "stage37_frontier_width", -1)) != 5:
+                raise ValueError("Stage37 public frontier width must be five")
+            if int(getattr(config, "stage37_tail_elite_count", -1)) != 2:
+                raise ValueError("Stage37 same-anchor elite count must be two")
+        if self._grpo_training_mode in STAGE39_CHALLENGER_TRAINING_MODES:
+            if self._generation_policy_algorithm != "diffgrpo_non_destructive_challenger":
+                raise ValueError("Stage39 requires the non-destructive challenger algorithm")
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError("Stage39 schedule must be [32,24,16,8,0]")
+            if self._truncation_timestep != 32 or self._scheduler_num_inference_steps != 125:
+                raise ValueError("Stage39 requires truncation=32 and scheduler steps=125")
+            if self._diffgrpo_group_size != 8 or self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage39 requires G=8 and one rollout per mode")
+            if self._generation_advantage_mode != "stage39_branch_objective":
+                raise ValueError("Stage39 requires stage39_branch_objective advantages")
+            if self._inference_selector_source != "trajectory_relative_harm_v3":
+                raise ValueError("Stage39 training requires the frozen Stage25 selector")
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage39 does not permit trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage39 requires mean log probabilities")
+            if int(getattr(self._config, "stage39_public_candidate_count", -1)) != 20:
+                raise ValueError("Stage39 public candidate count must be 20")
+            if int(getattr(self._config, "stage39_challenger_candidate_count", -1)) != 20:
+                raise ValueError("Stage39 challenger candidate count must be 20")
+            if abs(float(getattr(self._config, "stage39_positive_margin", -1.0)) - 0.001) > 1e-12:
+                raise ValueError("Stage39 positive margin must be 0.001")
+            if abs(float(getattr(self._config, "stage39_kl_weight", -1.0)) - 0.1) > 1e-12:
+                raise ValueError("Stage39 KL weight must be 0.1")
+        if self._grpo_training_mode in STAGE38_ESCR_TRAINING_MODES:
+            if self._generation_policy_algorithm != "diffgrpo_elite_set_counterfactual_repair":
+                raise ValueError("Stage38 requires the ESCR generation algorithm")
+            if self._roll_timesteps != (32, 24, 16, 8, 0):
+                raise ValueError("Stage38 schedule must be [32,24,16,8,0]")
+            if self._truncation_timestep != 32 or self._scheduler_num_inference_steps != 125:
+                raise ValueError("Stage38 requires truncation=32 and scheduler steps=125")
+            if self._diffgrpo_group_size != 8 or self._grpo_rollouts_per_mode != 1:
+                raise ValueError("Stage38 requires G=8 and one rollout per mode")
+            if self._generation_advantage_mode != "escr_set_marginal":
+                raise ValueError("Stage38 requires escr_set_marginal advantages")
+            if self._inference_selector_source != "trajectory_relative_harm_v3":
+                raise ValueError("Stage38 requires the frozen Stage25 selector")
+            if self._generation_trust_projection_mode != "none":
+                raise ValueError("Stage38 does not permit trust projection")
+            if self._diffgrpo_logprob_reduction != "mean":
+                raise ValueError("Stage38 requires mean log probabilities")
+            if int(getattr(config, "stage38_elite_width", -1)) != 5:
+                raise ValueError("Stage38 public elite width must be five")
+            if int(getattr(config, "stage38_positive_challenger_width", -1)) != 2:
+                raise ValueError("Stage38 positive challenger width must be two")
+            if int(getattr(config, "stage38_active_pool_width", -1)) != 8:
+                raise ValueError("Stage38 active pool width must be eight")
+            if abs(float(getattr(config, "stage38_bc_weight", -1.0)) - 0.1) > 1e-12:
+                raise ValueError("Stage38 BC weight must be 0.1")
+            if abs(float(getattr(config, "stage38_kl_weight", -1.0)) - 0.1) > 1e-12:
+                raise ValueError("Stage38 active KL weight must be 0.1")
+            if abs(float(getattr(config, "stage38_safety_kl_weight", -1.0)) - 0.5) > 1e-12:
+                raise ValueError("Stage38 safety KL weight must be 0.5")
+            if abs(float(getattr(config, "stage38_step_discount", -1.0)) - 0.6) > 1e-12:
+                raise ValueError("Stage38 diffusion step discount must be 0.6")
         if self._grpo_training_mode in MODE_COVERAGE_TRAINING_MODES:
             if self._generation_policy_algorithm != "diffgrpo_mode_coverage":
                 raise ValueError("Stage30 requires diffgrpo_mode_coverage")
@@ -2014,10 +2164,14 @@ class TrajectoryHead(nn.Module):
             }
 
         if self._grpo_training_mode in {
-            "stage24_selector", "stage25_relative_harm_selector"
+            "stage24_selector", "stage25_relative_harm_selector",
+            "stage37_jfi_selector",
         }:
             stage25_training = (
                 self._grpo_training_mode == "stage25_relative_harm_selector"
+            )
+            stage37_jfi_training = (
+                self._grpo_training_mode == "stage37_jfi_selector"
             )
             if tokens_list is None:
                 raise RuntimeError("Stage24 selector training requires scene tokens")
@@ -2031,9 +2185,10 @@ class TrajectoryHead(nn.Module):
                 getattr(self._config, "stage24_selector_steps_per_epoch", 0)
             )
             training_updates = (
-                self._stage25_selector_training_updates
-                if stage25_training
-                else self._stage24_selector_training_updates
+                self._stage37_jfi_training_updates
+                if stage37_jfi_training
+                else self._stage25_selector_training_updates
+                if stage25_training else self._stage24_selector_training_updates
             )
             epoch_index = int(training_updates.item()) // steps_per_epoch
             combination_index = epoch_index % len(self._stage24_bank_combinations)
@@ -2086,6 +2241,11 @@ class TrajectoryHead(nn.Module):
                     selector_outputs["embedding_predictions"].detach()
                 )
                 self._stage25_selector_training_updates.add_(1)
+            elif stage37_jfi_training:
+                stage37_jfi_outputs = self.stage37_jfi_selector(
+                    selector_outputs["embedding_predictions"].detach()
+                )
+                self._stage37_jfi_training_updates.add_(1)
             else:
                 embedding_rows = selector_outputs[
                     "embedding_mean"
@@ -2159,6 +2319,15 @@ class TrajectoryHead(nn.Module):
                         self._stage25_positive_weights,
                         device=device, dtype=torch.float32,
                     ),
+                })
+            if stage37_jfi_training:
+                result.update({
+                    "stage37_jfi_joint_logits": stage37_jfi_outputs[
+                        "joint_logits"
+                    ],
+                    "stage37_jfi_delta_quantiles": stage37_jfi_outputs[
+                        "delta_quantiles"
+                    ],
                 })
             return result
         if self._grpo_training_mode == "stage23_selector":
@@ -2322,7 +2491,10 @@ class TrajectoryHead(nn.Module):
 
         generation_outputs = {}
         paired_base_poses_reg = None
+        stage39_deferred_trace = None
         stage36_deferred_trace = None
+        stage37_deferred_trace = None
+        stage38_deferred_trace = None
         if self._grpo_training_mode == "diffgrpo_full_chain":
             trace = collect_full_chain_diffgrpo_trace(
                 self,
@@ -2437,6 +2609,98 @@ class TrajectoryHead(nn.Module):
                 "diffgrpo_scene_weights": self._lookup_paired_residual_weights(
                     tokens_list, device
                 ),
+            }
+        elif self._grpo_training_mode in STAGE39_TRAINING_MODES:
+            trace = collect_stage39_sampling_trace(
+                self, self._diffgrpo_group_size, ego_query, agents_query,
+                bev_feature, bev_spatial_shape, status_encoding, global_img,
+            )
+            stage39_deferred_trace = trace
+            final_poses_reg = self.denorm_odo(trace["challenger_final"])
+            paired_base_poses_reg = self.denorm_odo(trace["public_final"])
+            final_poses_cls = trace["challenger_cls"]
+            final_old_poses_cls = final_poses_cls.detach()
+            final_ref_poses_cls = trace["public_cls"].detach()
+            generation_outputs = {
+                "diffgrpo_group_size": trace["group_size"],
+                "stage39_sampled_chain_count": trace["sampled_chain_count"],
+                "stage39_independent_initial_noise": trace[
+                    "independent_initial_noise"
+                ],
+                "stage39_initial_noise_abs_cosine": trace[
+                    "initial_noise_abs_cosine"
+                ],
+            }
+        elif self._grpo_training_mode in STAGE38_ESCR_TRAINING_MODES:
+            trace = collect_stage38_sampling_trace(
+                self, self._diffgrpo_group_size, ego_query, agents_query,
+                bev_feature, bev_spatial_shape, status_encoding, global_img,
+            )
+            stage38_deferred_trace = trace
+            final_poses_reg = self.denorm_odo(trace["current_final"])
+            paired_base_poses_reg = self.denorm_odo(trace["public_final"])
+            final_poses_cls = trace["current_cls"]
+            final_old_poses_cls = trace["current_cls"].detach()
+            final_ref_poses_cls = trace["reference_cls"].detach()
+            generation_outputs = {
+                "diffgrpo_group_size": trace["group_size"],
+                "stage38_current_selected_modes": trace[
+                    "current_selected_modes"
+                ],
+                "stage38_scene_buckets": self._lookup_stage30_buckets(
+                    tokens_list, device
+                ),
+                "stage38_selector_mode_disagreement": trace[
+                    "selector_mode_disagreement"
+                ],
+                "stage38_current_selector_switch_rate": trace[
+                    "current_selector_switch_rate"
+                ],
+                "stage38_public_selector_switch_rate": trace[
+                    "public_selector_switch_rate"
+                ],
+                "stage38_sampled_chain_count": trace[
+                    "sampled_chain_count"
+                ],
+                "stage38_counterfactual_selector_count": trace[
+                    "counterfactual_selector_count"
+                ],
+            }
+        elif self._grpo_training_mode in STAGE37_BPD_TRAINING_MODES:
+            trace = collect_stage37_sampling_trace(
+                self, self._diffgrpo_group_size, ego_query, agents_query,
+                bev_feature, bev_spatial_shape, status_encoding, global_img,
+            )
+            stage37_deferred_trace = trace
+            final_poses_reg = self.denorm_odo(trace["current_final"])
+            paired_base_poses_reg = self.denorm_odo(trace["public_final"])
+            final_poses_cls = trace["current_cls"]
+            final_old_poses_cls = trace["current_cls"].detach()
+            final_ref_poses_cls = trace["reference_cls"].detach()
+            generation_outputs = {
+                "diffgrpo_group_size": trace["group_size"],
+                "stage37_current_selected_modes": trace["current_selected_modes"],
+                "stage37_public_selected_modes": trace["public_selected_modes"],
+                "stage37_active_modes": trace["active_modes"],
+                "stage37_active_valid": trace["active_valid"],
+                "stage37_hybrid_selected_modes": trace["hybrid_selected_modes"],
+                "stage37_donor_indices": trace["donor_indices"],
+                "stage37_scene_buckets": self._lookup_stage30_buckets(
+                    tokens_list, device
+                ),
+                "stage37_selector_mode_disagreement": trace[
+                    "selector_mode_disagreement"
+                ],
+                "stage37_current_selector_switch_rate": trace[
+                    "current_selector_switch_rate"
+                ],
+                "stage37_public_selector_switch_rate": trace[
+                    "public_selector_switch_rate"
+                ],
+                "stage37_sampled_chain_count": trace["sampled_chain_count"],
+                "stage37_counterfactual_selector_count": trace[
+                    "counterfactual_selector_count"
+                ],
             }
         elif self._grpo_training_mode in STAGE36_RGT_NCD_TRAINING_MODES:
             trace = collect_stage36_sampling_trace(
@@ -2794,6 +3058,11 @@ class TrajectoryHead(nn.Module):
             "stage34_mode_aligned_frontier_grpo",
             "stage35_nested_counterfactual_deployment_grpo",
             "stage36_reference_gated_tail_ncd_grpo",
+            "stage37_bistate_projected_deployment_grpo",
+            "stage38_elite_set_counterfactual_repair_grpo",
+            "stage39_challenger_bc",
+            "stage39_challenger_standard_grpo",
+            "stage39_challenger_set_grpo",
         }:
             if paired_base_poses_reg is None:
                 raise RuntimeError("paired DiffGRPO trace produced no base trajectories")
@@ -2830,6 +3099,11 @@ class TrajectoryHead(nn.Module):
                     "stage34_mode_aligned_frontier_grpo",
                     "stage35_nested_counterfactual_deployment_grpo",
                     "stage36_reference_gated_tail_ncd_grpo",
+                    "stage39_challenger_bc",
+                    "stage39_challenger_standard_grpo",
+                    "stage39_challenger_set_grpo",
+                    "stage37_bistate_projected_deployment_grpo",
+                    "stage38_elite_set_counterfactual_repair_grpo",
                 }:
                     rewards = reward_result["training_rewards"][:, :num_modes]
                     raw_rewards = reward_result["raw_rewards"][:, :num_modes]
@@ -2889,7 +3163,58 @@ class TrajectoryHead(nn.Module):
                 status_encoding=status_encoding,
                 global_img=global_img,
             ))
+        if stage37_deferred_trace is not None:
+            generation_outputs.update(finalize_stage37_reward_dependent_replay(
+                self,
+                stage37_deferred_trace,
+                rewards=raw_rewards,
+                valid_mask=reward_valid_mask,
+                component_scores=component_scores,
+                base_rewards=generation_outputs["diffgrpo_base_rewards"],
+                base_valid_mask=generation_outputs["diffgrpo_base_valid_mask"],
+                base_component_scores=generation_outputs[
+                    "diffgrpo_base_component_scores"
+                ],
+                scene_buckets=generation_outputs["stage37_scene_buckets"],
+                ego_query=ego_query,
+                agents_query=agents_query,
+                bev_feature=bev_feature,
+                bev_spatial_shape=bev_spatial_shape,
+                status_encoding=status_encoding,
+                global_img=global_img,
+            ))
+        if stage38_deferred_trace is not None:
+            generation_outputs.update(finalize_stage38_reward_dependent_replay(
+                self,
+                stage38_deferred_trace,
+                rewards=raw_rewards,
+                valid_mask=reward_valid_mask,
+                component_scores=component_scores,
+                base_rewards=generation_outputs["diffgrpo_base_rewards"],
+                base_valid_mask=generation_outputs["diffgrpo_base_valid_mask"],
+                base_component_scores=generation_outputs[
+                    "diffgrpo_base_component_scores"
+                ],
+                scene_buckets=generation_outputs["stage38_scene_buckets"],
+                ego_query=ego_query,
+                agents_query=agents_query,
+                bev_feature=bev_feature,
+                bev_spatial_shape=bev_spatial_shape,
+                status_encoding=status_encoding,
+                global_img=global_img,
+            ))
 
+        if stage39_deferred_trace is not None:
+            generation_outputs.update(finalize_stage39_replay(
+                self,
+                stage39_deferred_trace,
+                ego_query=ego_query,
+                agents_query=agents_query,
+                bev_feature=bev_feature,
+                bev_spatial_shape=bev_spatial_shape,
+                status_encoding=status_encoding,
+                global_img=global_img,
+            ))
         reference_selected_reward = None
         reference_reward_valid_mask = None
         reference_anchor_rewards = None
@@ -2950,9 +3275,14 @@ class TrajectoryHead(nn.Module):
             "stage32_public_deployed_extended",
             "stage32_selector_aware_frontier",
             "stage33_cdc_grpo",
+            "stage39_challenger_bc",
+            "stage39_challenger_standard_grpo",
+            "stage39_challenger_set_grpo",
             "stage34_mode_aligned_frontier_grpo",
             "stage35_nested_counterfactual_deployment_grpo",
             "stage36_reference_gated_tail_ncd_grpo",
+            "stage37_bistate_projected_deployment_grpo",
+            "stage38_elite_set_counterfactual_repair_grpo",
         }:
             mode_idx = torch.zeros(bs, dtype=torch.long, device=device)
         else:
@@ -3109,7 +3439,162 @@ class TrajectoryHead(nn.Module):
             )
         return torch.stack(samples, dim=0)
 
+    @torch.no_grad()
+    def _forward_test_stage39_candidates(
+        self,
+        ego_query,
+        agents_query,
+        bev_feature,
+        bev_spatial_shape,
+        status_encoding,
+        global_img,
+        tokens_list=None,
+    ) -> Dict[str, torch.Tensor]:
+        """Evaluate Stage39's extra candidate bank without changing public20.
+
+        ``public20`` remains on the legacy path bit-for-bit.  The two explicit
+        alternatives are deliberately isolated: ``public40_extra`` adds a
+        second deterministic noise bank to the frozen public decoder, while
+        ``challenger_union`` replaces that second bank with the independently
+        trained challenger decoder.  Both use the ordinary current-logit
+        selector so the generator and selector effects remain separable.
+        """
+        source = str(getattr(self._config, "stage39_candidate_source", "public20"))
+        if source not in {"public40_extra", "challenger_union"}:
+            raise ValueError(f"unsupported Stage39 candidate source: {source!r}")
+        if self.stage39_challenger_decoder is None:
+            raise RuntimeError("Stage39 candidate evaluation requires challenger decoder")
+        if self._inference_selector_source != "current":
+            raise RuntimeError(
+                "Stage39 candidate-bank evaluation currently requires selector source=current; "
+                "Stage40 will add the learned hierarchical selector"
+            )
+
+        bs = ego_query.shape[0]
+        device = ego_query.device
+        self.diffusion_scheduler.set_timesteps(
+            self._scheduler_num_inference_steps, device
+        )
+        plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs, 1, 1, 1)
+        normalized_anchor = self.norm_odo(plan_anchor)
+        if self._evaluation_noise_namespace >= 0:
+            namespace = self._evaluation_noise_namespace
+        else:
+            namespace = None
+        public_noise = self._sample_evaluation_noise(
+            normalized_anchor, tokens_list, namespace
+        )
+        trunc_timesteps = torch.full(
+            (bs,), self._truncation_timestep, device=device, dtype=torch.long
+        )
+        public_initial = self.diffusion_scheduler.add_noise(
+            original_samples=normalized_anchor,
+            noise=public_noise,
+            timesteps=trunc_timesteps,
+        )
+        public_reg, public_cls = self._run_policy_rollout(
+            self.diff_decoder, public_initial, ego_query, agents_query,
+            bev_feature, bev_spatial_shape, status_encoding, global_img,
+        )
+        offset = int(getattr(self._config, "stage39_challenger_noise_offset", 390001))
+        extra_namespace = offset if namespace is None else namespace + offset
+        extra_noise = self._sample_evaluation_noise(
+            normalized_anchor, tokens_list, extra_namespace
+        )
+        extra_initial = self.diffusion_scheduler.add_noise(
+            original_samples=normalized_anchor,
+            noise=extra_noise,
+            timesteps=trunc_timesteps,
+        )
+        second_policy = (
+            self.diff_decoder if source == "public40_extra"
+            else self.stage39_challenger_decoder
+        )
+        second_reg, second_cls = self._run_policy_rollout(
+            second_policy, extra_initial, ego_query, agents_query,
+            bev_feature, bev_spatial_shape, status_encoding, global_img,
+        )
+        final_poses_reg = torch.cat((public_reg, second_reg), dim=1)
+        final_poses_cls = torch.cat((public_cls, second_cls), dim=1)
+        num_modes = final_poses_cls.shape[1]
+        mode_idx = final_poses_cls.argmax(dim=-1)
+        batch_idx = torch.arange(bs, device=device)
+        best_reg = final_poses_reg[batch_idx, mode_idx]
+
+        rewards = reward_valid_mask = reward_component_scores = None
+        if tokens_list is not None:
+            # Keep the public20 branch bitwise invariant when it is embedded
+            # in the 40-candidate bank. PDMScorer normalizes progress by the
+            # maximum raw progress over the complete proposal set; adding the
+            # extra20 therefore changes public20 rewards even when its
+            # trajectories are identical. Score both equally sized banks
+            # independently, then concatenate their per-candidate results.
+            def score_bank(bank_reg):
+                if self._lazy_metric_cache is not None:
+                    return self._compute_rewards_from_lazy_cache(
+                        bank_reg, tokens_list, bank_reg.shape[1]
+                    )
+                if self.metric_cache_loader is not None:
+                    return self._compute_rewards_from_disk(
+                        bank_reg, tokens_list, bank_reg.shape[1]
+                    )
+                return None
+
+            public_result = score_bank(public_reg)
+            extra_result = score_bank(second_reg)
+            if public_result is not None and extra_result is not None:
+                rewards = torch.cat(
+                    (public_result["raw_rewards"], extra_result["raw_rewards"]),
+                    dim=1,
+                )
+                reward_valid_mask = torch.cat(
+                    (public_result["valid_mask"], extra_result["valid_mask"]),
+                    dim=1,
+                )
+                reward_component_scores = torch.cat(
+                    (
+                        public_result["component_scores"],
+                        extra_result["component_scores"],
+                    ),
+                    dim=1,
+                )
+
+        origin_mask = torch.zeros((bs, num_modes), dtype=torch.bool, device=device)
+        origin_mask[:, public_reg.shape[1]:] = True
+        return {
+            "trajectory": best_reg,
+            "final_poses_reg": final_poses_reg,
+            "final_poses_cls": final_poses_cls,
+            "final_ref_poses_cls": final_poses_cls,
+            "final_old_poses_cls": final_poses_cls,
+            "inference_selector_logits": final_poses_cls,
+            "inference_selector_source": self._inference_selector_source,
+            "mode_idx": mode_idx,
+            "current_mode_idx": mode_idx,
+            "reference_mode_idx": mode_idx,
+            "rewards": rewards,
+            "reward_valid_mask": reward_valid_mask,
+            "reward_component_scores": reward_component_scores,
+            "paired_base_poses_reg": None,
+            "paired_base_rewards": None,
+            "paired_base_valid": None,
+            "paired_base_components": None,
+            "num_modes": num_modes,
+            "grpo_training_rollout": False,
+            "stage39_origin_mask": origin_mask,
+            "stage39_candidate_source": source,
+        }
+
     def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img,tokens_list=None) -> Dict[str, torch.Tensor]:
+        if (
+            self._generation_policy_algorithm == "diffgrpo_non_destructive_challenger"
+            and str(getattr(self._config, "stage39_candidate_source", "public20"))
+            != "public20"
+        ):
+            return self._forward_test_stage39_candidates(
+                ego_query, agents_query, bev_feature, bev_spatial_shape,
+                status_encoding, global_img, tokens_list,
+            )
         bs = ego_query.shape[0]
         device = ego_query.device
         self.diffusion_scheduler.set_timesteps(
@@ -3376,6 +3861,73 @@ class TrajectoryHead(nn.Module):
             )
             stage24_diagnostics.update(stage24_outputs)
             stage24_diagnostics.update(stage25_outputs)
+        elif self._inference_selector_source == "joint_feasible_improvement_v1":
+            if (
+                int(self._stage24_selector_training_updates.item()) <= 0
+                or int(self._stage37_jfi_training_updates.item()) <= 0
+            ):
+                raise RuntimeError(
+                    "joint_feasible_improvement_v1 requires trained Stage24/JFI state"
+                )
+            if num_modes != 20:
+                raise RuntimeError("Stage37 JFI requires all 20 modes")
+            stage24_outputs = self.stage24_selector(
+                final_poses_reg, final_poses_cls.detach(), bev_feature,
+                bev_spatial_shape, agents_query, ego_query, status_encoding,
+            )
+            jfi_outputs = self.stage37_jfi_selector(
+                stage24_outputs["embedding_predictions"]
+            )
+            if bool(getattr(
+                self._config, "stage37_jfi_collect_calibration", False
+            )):
+                mode_idx = stage24_outputs["fallback_mode"]
+                stage24_diagnostics = {
+                    "calibration_collection": torch.ones(
+                        bs, dtype=torch.bool, device=device
+                    ),
+                    "fallback_mode": mode_idx,
+                    "switch": torch.zeros(
+                        bs, dtype=torch.bool, device=device
+                    ),
+                }
+            else:
+                if not bool(self._stage24_calibration_loaded.item()):
+                    raise RuntimeError("Stage37 JFI requires calibrated OOD state")
+                mode_idx, stage24_diagnostics = select_stage37_jfi_trajectory(
+                    reference_logits=final_poses_cls.detach(),
+                    joint_probabilities=jfi_outputs["joint_probabilities"],
+                    delta_quantiles=jfi_outputs["delta_quantiles"],
+                    embedding_mean=stage24_outputs["embedding_mean"],
+                    joint_threshold=float(getattr(
+                        self._config, "stage37_jfi_joint_threshold", -1.0
+                    )),
+                    q10_floor=float(getattr(
+                        self._config, "stage37_jfi_q10_floor", -1.0
+                    )),
+                    ood_mean=self._stage24_ood_mean,
+                    ood_variance=self._stage24_ood_variance,
+                    ood_threshold=float(getattr(
+                        self._config, "stage24_selector_ood_threshold", -1.0
+                    )),
+                    confidence_z=float(getattr(
+                        self._config, "stage24_selector_confidence_z", 1.96
+                    )),
+                    max_candidates=int(getattr(
+                        self._config, "stage37_jfi_max_candidates", 4
+                    )),
+                )
+            inference_selector_logits = torch.full_like(
+                final_poses_cls, torch.finfo(final_poses_cls.dtype).min
+            )
+            inference_selector_logits.scatter_(
+                1, mode_idx.unsqueeze(-1),
+                torch.zeros_like(
+                    mode_idx, dtype=final_poses_cls.dtype
+                ).unsqueeze(-1),
+            )
+            stage24_diagnostics.update(stage24_outputs)
+            stage24_diagnostics.update(jfi_outputs)
         elif self._inference_selector_source == "trajectory_safety_value_v2":
             if int(self._stage24_selector_training_updates.item()) <= 0:
                 raise RuntimeError(
@@ -3491,7 +4043,7 @@ class TrajectoryHead(nn.Module):
             and self._inference_selector_source
             not in {
                 "trajectory_oof", "trajectory_safety_value_v2",
-                "trajectory_relative_harm_v3",
+                "trajectory_relative_harm_v3", "joint_feasible_improvement_v1",
             }
         ):
             reward_trajectories = final_poses_reg

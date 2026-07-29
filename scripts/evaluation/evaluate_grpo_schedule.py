@@ -110,9 +110,18 @@ def parse_args() -> argparse.Namespace:
             "diffgrpo_selected_anchor_base_preserve",
             "diffgrpo_paired_residual",
             "diffgrpo_selected_set",
+            "diffgrpo_bistate_projected_deployment",
+            "diffgrpo_elite_set_counterfactual_repair",
+            "diffgrpo_non_destructive_challenger",
         ),
         default="legacy_ppo",
         help="Record and validate the generation algorithm associated with the schedule",
+    )
+    parser.add_argument(
+        "--stage39-candidate-source",
+        choices=("public20", "public40_extra", "challenger_union"),
+        default="public20",
+        help="Stage39 evaluation bank; public20 keeps the exact legacy path",
     )
     parser.add_argument(
         "--evaluation-noise-namespace",
@@ -126,6 +135,7 @@ def parse_args() -> argparse.Namespace:
             "current", "reference", "value_top2", "paired_tail_risk",
             "trajectory_oof", "trajectory_safety_value_v2",
             "trajectory_relative_harm_v3",
+            "joint_feasible_improvement_v1",
         ),
         default="current",
         help="Choose current candidates with current, frozen-reference, or Stage-15 logits",
@@ -151,6 +161,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage25-selector-risk-threshold", type=float, default=-1.0)
     parser.add_argument(
         "--stage25-collect-calibration", action="store_true",
+    )
+    parser.add_argument("--stage37-jfi-checkpoint", type=Path)
+    parser.add_argument("--stage37-jfi-calibration", type=Path)
+    parser.add_argument("--stage37-jfi-joint-threshold", type=float, default=-1.0)
+    parser.add_argument("--stage37-jfi-q10-floor", type=float, default=-1.0)
+    parser.add_argument("--stage37-jfi-max-candidates", type=int, default=4)
+    parser.add_argument(
+        "--stage37-jfi-collect-calibration", action="store_true",
     )
     parser.add_argument("--generator-domain", default="")
     parser.add_argument(
@@ -360,6 +378,45 @@ def main() -> None:
                 raise ValueError("Stage25 calibrated thresholds must be non-negative")
     elif args.stage25_selector_checkpoint is not None:
         raise ValueError("Stage25 checkpoint is valid only with its selector source")
+    if args.selector_logits_source == "joint_feasible_improvement_v1":
+        if (
+            args.stage37_jfi_checkpoint is None
+            or not args.stage37_jfi_checkpoint.is_file()
+        ):
+            raise ValueError(
+                "joint_feasible_improvement_v1 requires "
+                "--stage37-jfi-checkpoint"
+            )
+        if args.stage37_jfi_max_candidates != 4:
+            raise ValueError("Stage37 JFI requires exactly four pooled candidates")
+        if not args.stage37_jfi_collect_calibration:
+            if (
+                args.stage37_jfi_calibration is None
+                or not args.stage37_jfi_calibration.is_file()
+            ):
+                raise ValueError("Stage37 JFI deployment requires calibration")
+            if (
+                not 0.0 <= args.stage37_jfi_joint_threshold <= 1.0
+                or args.stage24_selector_ood_threshold < 0.0
+            ):
+                raise ValueError("Stage37 JFI calibrated thresholds are invalid")
+    elif args.stage37_jfi_checkpoint is not None:
+        raise ValueError("JFI checkpoint is valid only with its selector source")
+    if (
+        args.generation_policy_algorithm == "diffgrpo_non_destructive_challenger"
+        and args.stage39_candidate_source != "public20"
+        and args.selector_logits_source != "current"
+    ):
+        raise ValueError(
+            "Stage39 extra candidate banks currently require --selector-logits-source current"
+        )
+    if (
+        args.generation_policy_algorithm != "diffgrpo_non_destructive_challenger"
+        and args.stage39_candidate_source != "public20"
+    ):
+        raise ValueError(
+            "--stage39-candidate-source is valid only with the Stage39 algorithm"
+        )
     config = replace(
         TransfuserConfig(),
         metric_cache_path=(
@@ -369,6 +426,8 @@ def main() -> None:
         diffusion_roll_timesteps=tuple(args.roll_timesteps),
         diffusion_scheduler_num_inference_steps=args.scheduler_num_inference_steps,
         generation_policy_algorithm=args.generation_policy_algorithm,
+        stage39_candidate_source=args.stage39_candidate_source,
+        stage39_challenger_noise_offset=390001,
         evaluation_noise_namespace=args.evaluation_noise_namespace,
         inference_selector_source=args.selector_logits_source,
         value_selector_checkpoint_path=str(args.value_selector_checkpoint or ""),
@@ -386,6 +445,14 @@ def main() -> None:
         stage25_selector_calibration_path=str(args.stage25_selector_calibration or ""),
         stage25_selector_risk_threshold=args.stage25_selector_risk_threshold,
         stage25_collect_calibration=bool(args.stage25_collect_calibration),
+        stage37_jfi_checkpoint_path=str(args.stage37_jfi_checkpoint or ""),
+        stage37_jfi_calibration_path=str(args.stage37_jfi_calibration or ""),
+        stage37_jfi_joint_threshold=args.stage37_jfi_joint_threshold,
+        stage37_jfi_q10_floor=args.stage37_jfi_q10_floor,
+        stage37_jfi_max_candidates=args.stage37_jfi_max_candidates,
+        stage37_jfi_collect_calibration=bool(
+            args.stage37_jfi_collect_calibration
+        ),
         paired_risk_checkpoint_path=str(args.paired_risk_checkpoint or ""),
         paired_risk_threshold=args.paired_risk_threshold,
         paired_risk_calibration_path=str(args.paired_risk_calibration_path or ""),
@@ -503,7 +570,10 @@ def main() -> None:
             stage23_active = args.selector_logits_source == "trajectory_oof"
             stage24_active = args.selector_logits_source == "trajectory_safety_value_v2"
             stage25_active = args.selector_logits_source == "trajectory_relative_harm_v3"
-            if stage23_active or stage24_active or stage25_active:
+            stage37_jfi_active = (
+                args.selector_logits_source == "joint_feasible_improvement_v1"
+            )
+            if stage23_active or stage24_active or stage25_active or stage37_jfi_active:
                 # Deliberately outside the model inference graph: PDM supplies
                 # evaluation labels only and cannot influence mode selection.
                 head = agent._transfuser_model._trajectory_head
@@ -524,7 +594,7 @@ def main() -> None:
             paired_active = args.selector_logits_source == "paired_tail_risk"
             stage23_batch = {}
             stage24_batch = {}
-            if stage24_active or stage25_active:
+            if stage24_active or stage25_active or stage37_jfi_active:
                 for name in (
                     "fallback_mode", "switch", "safety_probabilities",
                     "any_unsafe_probabilities", "component_delta_predictions",
@@ -544,9 +614,21 @@ def main() -> None:
                                 f"Missing Stage25 diagnostic: {key}"
                             )
                         stage24_batch[name] = predictions[key]
+                if stage37_jfi_active:
+                    for name in (
+                        "joint_probabilities", "delta_quantiles",
+                    ):
+                        key = f"stage24_selector_{name}"
+                        if key not in predictions:
+                            raise RuntimeError(
+                                f"Missing Stage37 JFI diagnostic: {key}"
+                            )
+                        stage24_batch[name] = predictions[key]
                 for name in (
                     "challenger_mode", "eligible", "risk_ucb", "delta_lcb",
                     "safety_delta_lcb", "ood_distance", "ood_rejected",
+                    "joint_mean", "joint_std", "joint_lcb", "q10",
+                    "candidate_pool_size", "calibration_collection",
                 ):
                     key = f"stage24_selector_{name}"
                     if key in predictions:
@@ -823,7 +905,7 @@ def main() -> None:
                         }
                     }
                 stage24_record = {}
-                if stage24_active or stage25_active:
+                if stage24_active or stage25_active or stage37_jfi_active:
                     fallback_mode = int(stage24_batch["fallback_mode"][row].item())
                     switched = bool(stage24_batch["switch"][row].item())
                     diagnostic = {
@@ -861,15 +943,29 @@ def main() -> None:
                         diagnostic["catastrophe_probabilities"] = stage24_batch[
                             "catastrophe_probabilities"
                         ][row].detach().cpu().tolist()
+                    if stage37_jfi_active:
+                        diagnostic["joint_probabilities"] = stage24_batch[
+                            "joint_probabilities"
+                        ][row].detach().cpu().tolist()
+                        diagnostic["delta_quantiles"] = stage24_batch[
+                            "delta_quantiles"
+                        ][row].detach().cpu().tolist()
                     for name in (
                         "challenger_mode", "eligible", "risk_ucb", "delta_lcb",
                         "safety_delta_lcb", "ood_distance", "ood_rejected",
+                        "joint_mean", "joint_std", "joint_lcb", "q10",
+                        "candidate_pool_size", "calibration_collection",
                     ):
                         if name in stage24_batch:
                             diagnostic[name] = stage24_batch[name][
                                 row
                             ].detach().cpu().tolist()
-                    stage24_record = {"stage24_selector": diagnostic}
+                    stage24_record = {
+                        (
+                            "stage37_jfi_selector"
+                            if stage37_jfi_active else "stage24_selector"
+                        ): diagnostic
+                    }
                 records.append(
                     {
                         "token": token,
@@ -950,6 +1046,7 @@ def main() -> None:
         "reference_checkpoint": str(args.reference_checkpoint),
         "reference_checkpoint_sha256": agent._reference_checkpoint_sha256,
         "generation_policy_algorithm": args.generation_policy_algorithm,
+        "stage39_candidate_source": args.stage39_candidate_source,
         "evaluation_noise_namespace": args.evaluation_noise_namespace,
         "cache_path": str(args.cache_path),
         "metric_cache_path": str(args.metric_cache_path),
@@ -1111,6 +1208,45 @@ def main() -> None:
         summary[
             "stage25_selector" if is_stage25 else "stage24_selector"
         ] = selector_summary
+    if args.selector_logits_source == "joint_feasible_improvement_v1":
+        selector_records = [
+            record["stage37_jfi_selector"] for record in records
+        ]
+        switch_array = np.asarray(
+            [record["switched"] for record in selector_records], dtype=bool
+        )
+        delta_array = np.asarray(
+            [record["true_selected_minus_fallback"] for record in selector_records],
+            dtype=np.float64,
+        )
+        switched_delta = delta_array[switch_array]
+        pool = np.asarray([
+            float(record.get("candidate_pool_size", 1.0))
+            for record in selector_records
+        ], dtype=np.float64)
+        summary["stage37_jfi_selector"] = {
+            "checkpoint": str(args.stage37_jfi_checkpoint),
+            "checkpoint_sha256": agent._stage37_jfi_checkpoint_sha256,
+            "calibration_path": str(args.stage37_jfi_calibration or ""),
+            "calibration_sha256": agent._stage37_jfi_calibration_sha256,
+            "calibration_collection": bool(
+                args.stage37_jfi_collect_calibration
+            ),
+            "joint_threshold": float(args.stage37_jfi_joint_threshold),
+            "q10_floor": float(args.stage37_jfi_q10_floor),
+            "ood_threshold": float(args.stage24_selector_ood_threshold),
+            "max_candidates": int(args.stage37_jfi_max_candidates),
+            "mean_candidate_pool_size": float(pool.mean()),
+            "pdm_evaluation_outside_inference_graph": True,
+            "switch_count": int(switch_array.sum()),
+            "switch_rate": float(switch_array.mean()),
+            "selected_minus_fallback_mean": float(delta_array.mean()),
+            "harmful_switch_count": int((switched_delta < 0).sum()),
+            "catastrophic_switch_count": int((switched_delta <= -0.5).sum()),
+            "worst_switch_gain": (
+                float(switched_delta.min()) if switched_delta.size else 0.0
+            ),
+        }
     if args.collect_trust_calibration:
         for key in (
             "selected_reward",

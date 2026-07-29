@@ -15,6 +15,7 @@ TRUST_PROJECTION_POST_TOLERANCE = 1e-6
 INFERENCE_SELECTOR_SOURCES = (
     "current", "reference", "value_top2", "paired_tail_risk", "trajectory_oof",
     "trajectory_safety_value_v2", "trajectory_relative_harm_v3",
+    "joint_feasible_improvement_v1",
 )
 
 
@@ -25,7 +26,7 @@ def validate_inference_selector_source(source: str) -> str:
         raise ValueError(
             "inference_selector_source must be current, reference, value_top2, "
             "paired_tail_risk, trajectory_oof, trajectory_safety_value_v2, "
-            "or trajectory_relative_harm_v3; "
+            "trajectory_relative_harm_v3, or joint_feasible_improvement_v1; "
             f"got {source!r}"
         )
     return source
@@ -41,6 +42,7 @@ def select_inference_mode(
     if source in {
         "value_top2", "paired_tail_risk", "trajectory_oof",
         "trajectory_safety_value_v2", "trajectory_relative_harm_v3",
+        "joint_feasible_improvement_v1",
     }:
         raise ValueError(
             f"{source} requires trajectory-conditioned predictions and must be "

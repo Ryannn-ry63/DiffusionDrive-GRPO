@@ -36,6 +36,21 @@ from navsim.agents.diffusiondrive.stage36_contract import (
     STAGE36_ALLOWED_INITIAL_SHA256,
     STAGE36_ROUTE_EXPECTED,
 )
+from navsim.agents.diffusiondrive.stage37_contract import (
+    STAGE37_LEGACY_STAGE31_KEYS,
+    STAGE37_ALLOWED_INITIAL_SHA256,
+    STAGE37_ROUTE_EXPECTED,
+)
+from navsim.agents.diffusiondrive.stage38_contract import (
+    STAGE38_LEGACY_STAGE31_KEYS,
+    STAGE38_ALLOWED_INITIAL_SHA256,
+    STAGE38_ROUTE_EXPECTED,
+)
+from navsim.agents.diffusiondrive.stage39_contract import (
+    STAGE39_PUBLIC_SHA256,
+    STAGE39_ROUTE_EXPECTED,
+    STAGE39_TRAINING_MODES,
+)
 
 from navsim.agents.diffusiondrive.transfuser_model_v2 import V2TransfuserModel as TransfuserModel
 
@@ -90,6 +105,9 @@ STAGE33_GRPO_MODES = {"stage33_cdc_grpo"}
 STAGE34_GRPO_MODES = {"stage34_mode_aligned_frontier_grpo"}
 STAGE35_GRPO_MODES = {"stage35_nested_counterfactual_deployment_grpo"}
 STAGE36_GRPO_MODES = {"stage36_reference_gated_tail_ncd_grpo"}
+STAGE39_GRPO_MODES = STAGE39_TRAINING_MODES
+STAGE37_GRPO_MODES = {"stage37_bistate_projected_deployment_grpo"}
+STAGE38_GRPO_MODES = {"stage38_elite_set_counterfactual_repair_grpo"}
 STAGE32_PLAN_SHA256 = "5c5f3b148c8d03fe3c714558314ebd895a8f143b94fd10fb9bdf8c4ad61cefcd"
 STAGE32_SCF_OBJECTIVE_REVISION = "mean_normalized_bc_kl_v2"
 STAGE33_PLAN_SHA256 = "0ace8d8959360a15cfac8f45bc2c6e19898c09ad1a04aa7b5e5dcc2fb36283ff"
@@ -97,7 +115,7 @@ STAGE33_CDC_OBJECTIVE_REVISION = "cdc_deployment_credit_v1"
 SELECTED_SET_GRPO_MODES = (
     STAGE23_GRPO_MODES | STAGE27_GRPO_MODES | STAGE28_GRPO_MODES
     | STAGE29_GRPO_MODES | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES
-    | STAGE33_GRPO_MODES
+    | STAGE33_GRPO_MODES | STAGE39_GRPO_MODES
 )
 FORMAL_GRPO_MODES = (
     STAGE9_GRPO_MODES
@@ -109,13 +127,15 @@ FORMAL_GRPO_MODES = (
     | STAGE23_GRPO_MODES
     | STAGE27_GRPO_MODES
     | STAGE28_GRPO_MODES
+    | STAGE39_GRPO_MODES
     | STAGE29_GRPO_MODES
     | STAGE30_GRPO_MODES
     | STAGE31_GRPO_MODES
     | STAGE32_GRPO_MODES
     | STAGE33_GRPO_MODES
     | STAGE34_GRPO_MODES
-    | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES
+    | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES | STAGE37_GRPO_MODES
+    | STAGE38_GRPO_MODES
 )
 FORMAL_BASE_SHA256 = (
     "59a8de460cfd8b1266c5cdd393372273da5c2465fa6707da551c4ecb1fbd019d"
@@ -211,11 +231,51 @@ def validate_stage28_exploration_authorization(
         raise RuntimeError("Stage28 exploration authorization calibration mismatch")
 
 
+def _validate_stage39_config(config: TransfuserConfig) -> None:
+    """Validate Stage39 without inheriting legacy Stage31 keys."""
+    expected = {
+        "grpo_decoder_gradient_scope": "all_layers",
+        "grpo_reward_mode": "pdms",
+        "grpo_scene_weight_mode": "uniform",
+        "generation_policy_algorithm": "diffgrpo_non_destructive_challenger",
+        "generation_advantage_mode": "stage39_branch_objective",
+        "generation_mode_weighting": "uniform",
+        "generation_trust_projection_mode": "none",
+        "grpo_rollouts_per_mode": 1,
+        "grpo_old_policy_sync_steps": 32,
+        "generation_policy_loss_weight": 1.0,
+        "generation_kl_loss_weight": 0.0,
+        "generation_adaptive_kl_enabled": False,
+        "policy_loss_weight": 0.0,
+        "kl_loss_weight": 0.0,
+        "selection_entropy_weight": 0.0,
+        "selection_exploration_floor": 0.0,
+        "selection_rank_loss_weight": 0.0,
+        "selector_consistency_kl_weight": 0.0,
+        **STAGE39_ROUTE_EXPECTED,
+    }
+    if not str(getattr(config, "stage39_bucket_manifest_path", "")):
+        raise ValueError("formal Stage39 requires its bucket manifest")
+    for name, wanted in expected.items():
+        actual = getattr(config, name, None)
+        if isinstance(wanted, tuple) and actual is not None:
+            actual = tuple(actual)
+        matches = (
+            math.isclose(float(actual), wanted, rel_tol=0.0, abs_tol=1e-12)
+            if isinstance(wanted, float) else actual == wanted
+        )
+        if not matches:
+            raise ValueError(
+                f"formal Stage39 requires {name}={wanted!r}; got {actual!r}"
+            )
+
 def validate_formal_grpo_config(config: TransfuserConfig) -> None:
     """Fail closed if a registered Stage-9/10 objective drifts."""
     mode = str(getattr(config, "grpo_training_mode", ""))
     if mode not in FORMAL_GRPO_MODES:
         return
+    if mode in STAGE39_GRPO_MODES:
+        return _validate_stage39_config(config)
     expected = {
         "grpo_decoder_gradient_scope": "all_layers",
         "grpo_reward_mode": "pdms",
@@ -648,7 +708,10 @@ def validate_formal_grpo_config(config: TransfuserConfig) -> None:
         "stage30_public_mode_coverage_constrained"
         if mode in STAGE34_GRPO_MODES
         else "stage31_public_deployed_frontier"
-        if mode in (STAGE32_GRPO_MODES | STAGE33_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES)
+        if mode in (
+            STAGE32_GRPO_MODES | STAGE33_GRPO_MODES | STAGE35_GRPO_MODES
+            | STAGE36_GRPO_MODES | STAGE37_GRPO_MODES | STAGE38_GRPO_MODES | STAGE39_GRPO_MODES
+        )
         else mode
     ]
     if mode in STAGE34_GRPO_MODES:
@@ -663,14 +726,27 @@ def validate_formal_grpo_config(config: TransfuserConfig) -> None:
         for legacy_name in STAGE36_LEGACY_STAGE31_KEYS:
             route_expected.pop(legacy_name)
         route_expected.update(STAGE36_ROUTE_EXPECTED)
-    if mode in (SELECTED_SET_GRPO_MODES | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES):
+    if mode in STAGE37_GRPO_MODES:
+        for legacy_name in STAGE37_LEGACY_STAGE31_KEYS:
+            route_expected.pop(legacy_name)
+        route_expected.update(STAGE37_ROUTE_EXPECTED)
+    if mode in STAGE38_GRPO_MODES:
+        for legacy_name in STAGE38_LEGACY_STAGE31_KEYS:
+            route_expected.pop(legacy_name)
+        route_expected.update(STAGE38_ROUTE_EXPECTED)
+    if mode in (
+        SELECTED_SET_GRPO_MODES | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES
+        | STAGE36_GRPO_MODES | STAGE37_GRPO_MODES | STAGE38_GRPO_MODES | STAGE39_GRPO_MODES
+    ):
         selector_source = str(getattr(config, "inference_selector_source", ""))
         allowed_selector_sources = (
             {"trajectory_relative_harm_v3"}
             if mode in (
                 STAGE27_GRPO_MODES | STAGE28_GRPO_MODES | STAGE29_GRPO_MODES
                 | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES | STAGE34_GRPO_MODES
-                | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES)
+                | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES
+                | STAGE37_GRPO_MODES | STAGE38_GRPO_MODES | STAGE39_GRPO_MODES
+            )
             else {"trajectory_oof", "trajectory_relative_harm_v3"}
         )
         if selector_source not in allowed_selector_sources:
@@ -806,6 +882,14 @@ def validate_formal_grpo_config(config: TransfuserConfig) -> None:
         getattr(config, "stage36_bucket_manifest_path", "")
     ):
         raise ValueError("formal Stage36 requires its bucket manifest")
+    if mode in STAGE37_GRPO_MODES and not str(
+        getattr(config, "stage37_bucket_manifest_path", "")
+    ):
+        raise ValueError("formal Stage37 requires its bucket manifest")
+    if mode in STAGE38_GRPO_MODES and not str(
+        getattr(config, "stage38_bucket_manifest_path", "")
+    ):
+        raise ValueError("formal Stage38 requires its bucket manifest")
     for name, wanted in {**expected, **route_expected}.items():
         actual = getattr(config, name, None)
         if isinstance(wanted, tuple) and actual is not None:
@@ -833,6 +917,7 @@ def validate_formal_grpo_config(config: TransfuserConfig) -> None:
         | STAGE28_GRPO_MODES | STAGE29_GRPO_MODES | STAGE30_GRPO_MODES
         | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES | STAGE33_GRPO_MODES
         | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES
+        | STAGE37_GRPO_MODES | STAGE38_GRPO_MODES | STAGE39_GRPO_MODES
     ) and not math.isclose(
         layer0_lr_mult, 0.1, rel_tol=0.0, abs_tol=1e-12
     ):
@@ -850,7 +935,10 @@ def build_stage10_decoder_param_groups(
     for name, parameter in named_parameters:
         if not parameter.requires_grad:
             continue
-        if "_trajectory_head.diff_decoder.layers.0." in name:
+        if (
+            "_trajectory_head.diff_decoder.layers.0." in name
+            or "_trajectory_head.stage39_challenger_decoder.layers.0." in name
+        ):
             layer0.append(parameter)
         else:
             remaining.append(parameter)
@@ -911,7 +999,10 @@ class TransfuserAgent(AbstractAgent):
                     STAGE27_GRPO_MODES | STAGE28_GRPO_MODES
                     | STAGE29_GRPO_MODES | STAGE30_GRPO_MODES
                     | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES | STAGE33_GRPO_MODES
-                    | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES)
+                    | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES
+                    | STAGE36_GRPO_MODES | STAGE37_GRPO_MODES
+                    | STAGE38_GRPO_MODES | STAGE39_GRPO_MODES
+                )
                 else FORMAL_BASE_SHA256
             )
             if self._reference_checkpoint_sha256 != expected_base_sha:
@@ -928,6 +1019,21 @@ class TransfuserAgent(AbstractAgent):
                 if self._checkpoint_sha256 not in STAGE36_ALLOWED_INITIAL_SHA256:
                     raise RuntimeError(
                         "Stage36 current policy is not a frozen DPEL192 initializer"
+                    )
+            elif formal_mode in STAGE37_GRPO_MODES:
+                if self._checkpoint_sha256 not in STAGE37_ALLOWED_INITIAL_SHA256:
+                    raise RuntimeError(
+                        "Stage37 must initialize independently from public 88.1"
+                    )
+            elif formal_mode in STAGE38_GRPO_MODES:
+                if self._checkpoint_sha256 not in STAGE38_ALLOWED_INITIAL_SHA256:
+                    raise RuntimeError(
+                        "Stage38 must initialize from a fold-matched Stage36 RGT192 checkpoint"
+                    )
+            elif formal_mode in STAGE39_GRPO_MODES:
+                if self._checkpoint_sha256 != STAGE39_PUBLIC_SHA256:
+                    raise RuntimeError(
+                        "Stage39 must initialize its challenger from official public 88.1"
                     )
             elif self._checkpoint_sha256 != self._reference_checkpoint_sha256:
                 raise RuntimeError(
@@ -1170,7 +1276,8 @@ class TransfuserAgent(AbstractAgent):
             if formal_mode in (
                 STAGE29_GRPO_MODES | STAGE30_GRPO_MODES | STAGE31_GRPO_MODES
                 | STAGE32_GRPO_MODES | STAGE33_GRPO_MODES | STAGE34_GRPO_MODES
-                | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES
+                | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES | STAGE37_GRPO_MODES
+                | STAGE38_GRPO_MODES | STAGE39_GRPO_MODES
             ):
                 if (
                     self._stage25_selector_checkpoint_sha256
@@ -1218,6 +1325,66 @@ class TransfuserAgent(AbstractAgent):
             head._stage24_ood_variance.copy_(variance)
             head._stage24_calibration_loaded.fill_(True)
             self._stage25_calibration_sha256 = file_sha256(calibration_path)
+        self._stage37_jfi_checkpoint_sha256 = None
+        self._stage37_jfi_calibration_sha256 = None
+        stage37_jfi_active = (
+            str(getattr(config, "inference_selector_source", ""))
+            == "joint_feasible_improvement_v1"
+        )
+        stage37_jfi_checkpoint = str(getattr(
+            config, "stage37_jfi_checkpoint_path", ""
+        ))
+        if stage37_jfi_checkpoint:
+            self.load_stage37_jfi_checkpoint(stage37_jfi_checkpoint)
+        elif stage37_jfi_active:
+            raise ValueError("JFI deployment requires its frozen checkpoint")
+        if stage37_jfi_active and not bool(getattr(
+            config, "stage37_jfi_collect_calibration", False
+        )):
+            calibration_path = Path(str(getattr(
+                config, "stage37_jfi_calibration_path", ""
+            )))
+            if not calibration_path.is_file():
+                raise FileNotFoundError("JFI deployment calibration is missing")
+            calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+            if (
+                not calibration.get("passed")
+                or calibration.get("selector_checkpoint_sha256")
+                != self._stage37_jfi_checkpoint_sha256
+            ):
+                raise RuntimeError("JFI calibration/checkpoint SHA mismatch")
+            mean_pool = float(calibration.get("mean_candidate_pool_size", -1.0))
+            if not 2.0 <= mean_pool <= 4.0:
+                raise RuntimeError("JFI calibration pool is outside [2,4]")
+            expected = {
+                "stage37_jfi_joint_threshold": calibration["joint_threshold"],
+                "stage37_jfi_q10_floor": calibration["q10_floor"],
+                "stage24_selector_ood_threshold": calibration["ood_threshold"],
+            }
+            for name, wanted in expected.items():
+                if not math.isclose(
+                    float(getattr(config, name)), float(wanted),
+                    rel_tol=0.0, abs_tol=1e-12,
+                ):
+                    raise RuntimeError(f"JFI runtime calibration drifted for {name}")
+            ood = calibration.get("ood", {})
+            mean = torch.as_tensor(ood.get("mean", ()), dtype=torch.float32)
+            variance = torch.as_tensor(
+                ood.get("variance", ()), dtype=torch.float32
+            )
+            head = self._transfuser_model._trajectory_head
+            if (
+                mean.shape != head._stage24_ood_mean.shape
+                or variance.shape != head._stage24_ood_variance.shape
+                or not torch.isfinite(mean).all()
+                or not torch.isfinite(variance).all()
+                or not (variance > 0).all()
+            ):
+                raise RuntimeError("JFI calibration has invalid OOD state")
+            head._stage24_ood_mean.copy_(mean)
+            head._stage24_ood_variance.copy_(variance)
+            head._stage24_calibration_loaded.fill_(True)
+            self._stage37_jfi_calibration_sha256 = file_sha256(calibration_path)
         self._paired_risk_checkpoint_sha256 = None
         paired_risk_checkpoint = str(
             getattr(config, "paired_risk_checkpoint_path", "")
@@ -1262,8 +1429,14 @@ class TransfuserAgent(AbstractAgent):
             trajectory_head.stage24_selector.requires_grad_(True)
         elif training_mode == "stage25_relative_harm_selector":
             trajectory_head.stage25_selector.requires_grad_(True)
+        elif training_mode == "stage37_jfi_selector":
+            trajectory_head.stage37_jfi_selector.requires_grad_(True)
         elif training_mode == "paired_tail_risk_selector":
             trajectory_head.paired_risk_head.requires_grad_(True)
+        elif training_mode in STAGE39_GRPO_MODES:
+            trajectory_head.stage39_challenger_decoder.requires_grad_(True)
+            for layer in trajectory_head.stage39_challenger_decoder.layers:
+                layer.task_decoder.plan_cls_branch.requires_grad_(False)
         elif training_mode in {
             "generation", "generation_group", "generation_group_adaptive",
             "diffgrpo_full_chain", "diffgrpo_selected_anchor",
@@ -1272,7 +1445,8 @@ class TransfuserAgent(AbstractAgent):
             "stage27_public_diffgrpo_selected_set",
         } | STAGE28_GRPO_MODES | STAGE29_GRPO_MODES | STAGE30_GRPO_MODES \
                 | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES | STAGE33_GRPO_MODES \
-                | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES:
+                | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES \
+                | STAGE37_GRPO_MODES | STAGE38_GRPO_MODES | STAGE39_GRPO_MODES:
             trajectory_head.diff_decoder.requires_grad_(True)
             if training_mode in {
                 "generation", "generation_group", "generation_group_adaptive",
@@ -1282,7 +1456,8 @@ class TransfuserAgent(AbstractAgent):
                 "stage27_public_diffgrpo_selected_set",
             } | STAGE28_GRPO_MODES | STAGE29_GRPO_MODES | STAGE30_GRPO_MODES \
             | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES | STAGE33_GRPO_MODES \
-            | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES:
+            | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES \
+            | STAGE37_GRPO_MODES | STAGE38_GRPO_MODES | STAGE39_GRPO_MODES:
                 for layer in trajectory_head.diff_decoder.layers:
                     layer.task_decoder.plan_cls_branch.requires_grad_(False)
         elif training_mode in STAGE22_GRPO_MODES:
@@ -1314,8 +1489,11 @@ class TransfuserAgent(AbstractAgent):
                 "'stage34_mode_aligned_frontier_grpo', "
                 "'stage35_nested_counterfactual_deployment_grpo', "
                 "'stage36_reference_gated_tail_ncd_grpo', "
+                "'stage37_bistate_projected_deployment_grpo', "
+                "'stage38_elite_set_counterfactual_repair_grpo', "
                 "'value_selector', 'stage23_selector', 'stage24_selector', "
                 "'stage25_relative_harm_selector', "
+                "'stage37_jfi_selector', "
                 "'paired_tail_risk_selector'}; "
                 f"got {training_mode!r}"
             )
@@ -1369,7 +1547,11 @@ class TransfuserAgent(AbstractAgent):
             for parameter in self._transfuser_model.parameters()
             if parameter.requires_grad
         )
-        if training_mode in (SELECTED_SET_GRPO_MODES | STAGE30_GRPO_MODES | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES):
+        if training_mode in (
+            SELECTED_SET_GRPO_MODES | STAGE30_GRPO_MODES | STAGE34_GRPO_MODES
+            | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES | STAGE37_GRPO_MODES
+            | STAGE38_GRPO_MODES | STAGE39_GRPO_MODES
+        ):
             trainable_tensors = [
                 name for name, parameter in self._transfuser_model.named_parameters()
                 if parameter.requires_grad
@@ -1404,6 +1586,8 @@ class TransfuserAgent(AbstractAgent):
             (key[len("agent."):] if key.startswith("agent.") else key): value
             for key, value in checkpoint["state_dict"].items()
         }
+        stage39_prefix = "_transfuser_model._trajectory_head.stage39_challenger_decoder."
+        stage39_loaded = any(key.startswith(stage39_prefix) for key in state_dict)
         missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
         policy_snapshot_prefixes = (
             "_transfuser_model._trajectory_head.ref_policy.",
@@ -1434,6 +1618,9 @@ class TransfuserAgent(AbstractAgent):
             "_transfuser_model._trajectory_head._stage24_embedding_",
             "_transfuser_model._trajectory_head.stage25_selector.",
             "_transfuser_model._trajectory_head._stage25_selector_training_updates",
+            "_transfuser_model._trajectory_head.stage37_jfi_selector.",
+            "_transfuser_model._trajectory_head.stage39_challenger_decoder.",
+            "_transfuser_model._trajectory_head._stage37_jfi_training_updates",
             "_transfuser_model._trajectory_head.paired_risk_head.",
             "_transfuser_model._trajectory_head._paired_risk_training_updates",
         )
@@ -1446,6 +1633,12 @@ class TransfuserAgent(AbstractAgent):
         if unexpected_keys:
             print(f"Unexpected checkpoint keys: {unexpected_keys}")
         print(f"✓ Loaded pretrained checkpoint: {self._checkpoint_path}")
+        head = self._transfuser_model._trajectory_head
+        if head.stage39_challenger_decoder is not None and not stage39_loaded:
+            head.stage39_challenger_decoder.load_state_dict(
+                head.diff_decoder.state_dict(), strict=True
+            )
+        self._stage39_challenger_loaded = bool(stage39_loaded)
 
     def load_value_selector_checkpoint(self, checkpoint_path: str) -> None:
         """Load only the Stage-15 adapter so one selector serves every generator."""
@@ -1601,6 +1794,48 @@ class TransfuserAgent(AbstractAgent):
             raise RuntimeError("Stage25 checkpoint has invalid training provenance")
         self._stage25_selector_checkpoint_sha256 = file_sha256(path)
         print(f"✓ Loaded Stage25 relative-harm selector: {path}")
+
+    def load_stage37_jfi_checkpoint(self, checkpoint_path: str) -> None:
+        """Load the frozen Stage24 encoder and Stage37 JFI heads only."""
+        path = Path(checkpoint_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Stage37 JFI checkpoint is missing: {path}")
+        checkpoint = torch.load(path, map_location="cpu")
+        if "state_dict" not in checkpoint:
+            raise KeyError(f"Stage37 JFI checkpoint has no state_dict: {path}")
+        normalized = {
+            (key[len("agent."):] if key.startswith("agent.") else key): value
+            for key, value in checkpoint["state_dict"].items()
+        }
+        head = self._transfuser_model._trajectory_head
+        for module_name in ("stage24_selector", "stage37_jfi_selector"):
+            prefix = f"_transfuser_model._trajectory_head.{module_name}."
+            state = {
+                key[len(prefix):]: value for key, value in normalized.items()
+                if key.startswith(prefix)
+            }
+            if not state:
+                raise RuntimeError(f"JFI checkpoint lacks {module_name}: {path}")
+            getattr(head, module_name).load_state_dict(state, strict=True)
+        for name in (
+            "_stage24_selector_training_updates",
+            "_stage37_jfi_training_updates",
+            "_stage24_embedding_count",
+            "_stage24_embedding_sum",
+            "_stage24_embedding_sum_sq",
+        ):
+            key = f"_transfuser_model._trajectory_head.{name}"
+            if key not in normalized:
+                raise RuntimeError(f"JFI checkpoint lacks {name}")
+            getattr(head, name).copy_(normalized[key])
+        if (
+            int(head._stage24_selector_training_updates.item()) <= 0
+            or int(head._stage37_jfi_training_updates.item()) <= 0
+            or int(head._stage24_embedding_count.item()) <= 0
+        ):
+            raise RuntimeError("JFI checkpoint has invalid training provenance")
+        self._stage37_jfi_checkpoint_sha256 = file_sha256(path)
+        print(f"✓ Loaded Stage37 JFI selector: {path}")
     def load_paired_risk_checkpoint(self, checkpoint_path: str) -> None:
         """Load only the Stage-17 adapter and its update provenance."""
         path = Path(checkpoint_path)
@@ -1681,6 +1916,8 @@ class TransfuserAgent(AbstractAgent):
         model._trajectory_head.value_selector.eval()
         model._trajectory_head.stage23_selector.eval()
         model._trajectory_head.stage24_selector.eval()
+        model._trajectory_head.stage25_selector.eval()
+        model._trajectory_head.stage37_jfi_selector.eval()
         model._trajectory_head.paired_risk_head.eval()
         if (
             self.training
@@ -1700,6 +1937,12 @@ class TransfuserAgent(AbstractAgent):
             == "stage24_selector"
         ):
             model._trajectory_head.stage24_selector.train()
+        if (
+            self.training
+            and str(getattr(self._config, "grpo_training_mode", ""))
+            == "stage37_jfi_selector"
+        ):
+            model._trajectory_head.stage37_jfi_selector.train()
         if (
             self.training
             and str(getattr(self._config, "grpo_training_mode", ""))
@@ -1755,7 +1998,9 @@ class TransfuserAgent(AbstractAgent):
     def get_optimizers(self) -> Union[Optimizer, Dict[str, Union[Optimizer, LRScheduler]]]:
         """Inherited, see superclass."""
         if str(getattr(self._config, "grpo_training_mode", "")) in (
-            SELECTED_SET_GRPO_MODES | STAGE30_GRPO_MODES | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES
+            SELECTED_SET_GRPO_MODES | STAGE30_GRPO_MODES | STAGE34_GRPO_MODES
+            | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES | STAGE37_GRPO_MODES
+            | STAGE38_GRPO_MODES
         ):
             groups = build_stage10_decoder_param_groups(
                 self._transfuser_model.named_parameters(), 0.1
@@ -1816,7 +2061,8 @@ class TransfuserAgent(AbstractAgent):
             STAGE10_GRPO_MODES | STAGE21_GRPO_MODES | STAGE23_GRPO_MODES
             | STAGE27_GRPO_MODES | STAGE28_GRPO_MODES | STAGE29_GRPO_MODES
             | STAGE30_GRPO_MODES | STAGE31_GRPO_MODES | STAGE32_GRPO_MODES
-            | STAGE33_GRPO_MODES | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES | STAGE36_GRPO_MODES
+            | STAGE33_GRPO_MODES | STAGE34_GRPO_MODES | STAGE35_GRPO_MODES
+            | STAGE36_GRPO_MODES | STAGE37_GRPO_MODES | STAGE38_GRPO_MODES | STAGE39_GRPO_MODES
         ):
             stage10_param_groups = build_stage10_decoder_param_groups(
                 self._transfuser_model.named_parameters(),

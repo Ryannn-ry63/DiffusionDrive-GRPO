@@ -256,6 +256,79 @@ config:
   stage36_signal_retention_fraction_min: 0.01
   stage36_signal_tail_fraction_min: 0.005
   stage36_diagnostic_only: false
+  stage37_bucket_manifest_path: ""
+  stage37_plan_sha256: 4dc469dd0be4d2579796ff70ae7a09ed9fd8e4c92449cd057e42463d268bb5d8
+  stage37_objective_revision: bistate_projected_deployment_v1
+  stage37_active_pool_width: 4
+  stage37_selector_micro_batch_size: 16
+  stage37_frontier_width: 5
+  stage37_tail_elite_count: 2
+  stage37_frontier_regression_tolerance: 0.0001
+  stage37_tail_margin: 0.001
+  stage37_advantage_scale: 0.002
+  stage37_advantage_clip: 2.0
+  stage37_counterfactual_weight: 0.25
+  stage37_tail_weight: 0.25
+  stage37_frontier_weight: 0.25
+  stage37_projection_recovery_coefficient: 0.25
+  stage37_projection_epsilon: 1.0e-12
+  stage37_bc_weight: 0.1
+  stage37_kl_weight: 0.1
+  stage37_safety_kl_weight: 0.5
+  stage37_optimizer_steps_per_epoch: 48
+  stage37_gradient_accumulation: 8
+  stage37_global_bucket_composition: [2, 30, 8, 24]
+  stage37_diagnostic_only: false
+  stage37_jfi_num_members: 8
+  stage37_jfi_checkpoint_path: ""
+  stage37_jfi_calibration_path: ""
+  stage37_jfi_train_manifest_path: ""
+  stage37_jfi_candidate_bank_paths: []
+  stage37_jfi_focal_gamma: 2.0
+  stage37_jfi_positive_weight: 1.0
+  stage37_jfi_joint_threshold: -1.0
+  stage37_jfi_q10_floor: -1.0
+  stage37_jfi_max_candidates: 4
+  stage37_jfi_collect_calibration: false
+  stage38_bucket_manifest_path: ""
+  stage38_plan_sha256: "8cd826b6ab8a4376c6e4a4fdffc97e96fe00fba00a25a1029d5fa5bcf4a8b027"
+  stage38_objective_revision: "elite_set_counterfactual_repair_v1"
+  stage38_selector_micro_batch_size: 16
+  stage38_elite_width: 5
+  stage38_positive_challenger_width: 2
+  stage38_active_pool_width: 8
+  stage38_positive_margin: 0.001
+  stage38_negative_tolerance: 0.0001
+  stage38_advantage_scale: 0.002
+  stage38_advantage_clip: 2.0
+  stage38_mature_positive_multiplier: 0.25
+  stage38_bc_weight: 0.1
+  stage38_kl_weight: 0.1
+  stage38_safety_kl_weight: 0.5
+  stage38_step_discount: 0.6
+  stage38_optimizer_steps_per_epoch: 48
+  stage38_gradient_accumulation: 8
+  stage38_global_bucket_composition: [2, 30, 8, 24]
+  stage38_diagnostic_only: false
+  stage39_bucket_manifest_path: ""
+  stage39_plan_sha256: "7e1e6142412778524714a0b919f971edf1d2bf14138b0efcf21fc9dd7c4d6f1b"
+  stage39_objective_revision: "non_destructive_challenger_set_grpo_v1"
+  stage39_public_candidate_count: 20
+  stage39_challenger_candidate_count: 20
+  stage39_group_size: 8
+  stage39_elite_width: 5
+  stage39_positive_margin: 0.001
+  stage39_advantage_scale: 0.02
+  stage39_advantage_clip: 2.0
+  stage39_std_floor: 0.0001
+  stage39_kl_weight: 0.1
+  stage39_step_discount: 0.6
+  stage39_optimizer_steps_per_epoch: 48
+  stage39_gradient_accumulation: 8
+  stage39_global_bucket_composition: [2, 30, 8, 24]
+  stage39_candidate_source: "public20"
+  stage39_challenger_noise_offset: 390001
+  stage39_diagnostic_only: false
   diffgrpo_lora_rank: 8
   diffgrpo_lora_alpha: 8.0
   weight_decay: 0.0001

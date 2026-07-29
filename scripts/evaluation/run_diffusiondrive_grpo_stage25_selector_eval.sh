@@ -12,6 +12,7 @@ PYTHON_BIN="${PYTHON_BIN:-/root/miniconda3/envs/navsim/bin/python}"
 BASE_CHECKPOINT="${GRPO_BASE_CHECKPOINT:-/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_diffusiondrive_agent/2026.04.14.03.49.58/lightning_logs/version_0/checkpoints/eval_model}"
 TRAINING_CACHE="${NAVSIM_TRAINING_CACHE:-/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/training_cache}"
 METRIC_CACHE="${NAVSIM_METRIC_CACHE:-/inspire/hdd/global_user/wangcaojun-240208020180/nry/exp/metric_cache_trainval}"
+GENERATION_ALGORITHM="${GRPO_EVAL_GENERATION_ALGORITHM:-legacy_ppo}"
 
 [[ "$MODE" == collect || "$MODE" == deploy ]] || { echo "invalid mode"; exit 2; }
 for path in "$GENERATOR" "$SELECTOR" "$MANIFEST" "$BASE_CHECKPOINT"; do
@@ -55,6 +56,6 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON_BIN" \
   --tokens-file "$MANIFEST" --limit "$LIMIT" --log-split train \
   --batch-size 2 --num-workers 4 --device cuda:0 \
   --truncation-timestep 32 --roll-timesteps 32 24 16 8 0 \
-  --scheduler-num-inference-steps 125 --generation-policy-algorithm legacy_ppo \
+  --scheduler-num-inference-steps 125 --generation-policy-algorithm "$GENERATION_ALGORITHM" \
   --evaluation-noise-namespace "$NOISE" --generator-domain "$DOMAIN" \
   "${SELECTOR_ARGS[@]}" --output "$OUTPUT"
